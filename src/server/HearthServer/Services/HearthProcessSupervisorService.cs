@@ -16,9 +16,9 @@ namespace HearthServer.Services;
 /// "boot loop" and back off exponentially. After a stable run, exit codes
 /// reset the backoff.
 ///
-/// In the SurvivalServers panel-managed deploy the SS PowerShell owns the
-/// game lifecycle, so GameInstallRoot/GameExecutablePath are left EMPTY and
-/// this supervisor stays idle (it returns immediately from ExecuteAsync).
+/// In a panel-managed deploy the host's PowerShell owns the game lifecycle,
+/// so GameInstallRoot/GameExecutablePath are left EMPTY and this supervisor
+/// stays idle (it returns immediately from ExecuteAsync).
 /// </summary>
 public sealed class HearthProcessSupervisorService : BackgroundService
 {

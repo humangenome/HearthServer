@@ -106,10 +106,10 @@ public sealed class HearthServerOptions
     /// <summary>
     /// Take a snapshot zip of the SaveGames dir into <see cref="SaveDir"/>
     /// on every auto-save (via FileSystemWatcher). Useful for self-hosters
-    /// who want a rollback option. Hosting providers (e.g. SurvivalServers)
-    /// run their own backup chain and should set this to false to avoid
-    /// disk churn — a 1-per-minute snapshot rate produces ~1500 zips and
-    /// ~1 GB per gameserver per day.
+    /// who want a rollback option. Hosting providers that run their own
+    /// backup chain should set this to false to avoid disk churn — a
+    /// 1-per-minute snapshot rate produces ~1500 zips and ~1 GB per
+    /// instance per day.
     /// </summary>
     public bool SnapshotsEnabled { get; set; } = true;
 
