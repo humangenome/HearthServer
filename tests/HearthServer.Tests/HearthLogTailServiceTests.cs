@@ -32,7 +32,7 @@ public class HearthLogTailServiceTests
     [Fact]
     public async Task Tailer_ignores_existing_join_lines_then_counts_new_live_join()
     {
-        var root = Path.Combine(Path.GetTempPath(), "hearth-g2-tail-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(Path.GetTempPath(), "hearth-tail-" + Guid.NewGuid().ToString("N"));
         var logDir = Path.Combine(root, "Saved", "Logs");
         Directory.CreateDirectory(logDir);
         var logPath = Path.Combine(logDir, "Bellwright.log");
