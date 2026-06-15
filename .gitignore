@@ -76,6 +76,3 @@ dist/ue4ss-server/UE4SS.dll
 .codex-*
 .lkg-*/
 
-# CHANGELOG.md is internal commentary only — never push to GitHub. Lives
-# locally at ../hearth-internal/CHANGELOG.md (symlinked here for convenience).
-CHANGELOG.md
