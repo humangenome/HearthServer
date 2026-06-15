@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build HearthServer (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore NuGet
+        run: dotnet restore HearthServer.sln
+
+      - name: Build
+        run: dotnet build HearthServer.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test HearthServer.sln --configuration Release --no-build --verbosity normal
+
+      - name: Publish HearthServer (self-contained)
+        run: dotnet publish src/server/HearthServer/HearthServer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=false
+
+      - name: Stage release artifact
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $publish = "src/server/HearthServer/bin/Release/net8.0/win-x64/publish"
+          if (-not (Test-Path "$publish/HearthServer.exe")) { throw "server publish missing at $publish" }
+          Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/Hearth-Server-Windows-x64-$tag.zip"
+          Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
+            "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
+          } | Out-File -FilePath artifacts/checksums.txt -Encoding ascii
+
+      - name: Extract changelog section
+        id: changelog
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=\n## |\z)"
+          $match = [regex]::Match($content, $pattern)
+          if ($match.Success) { $notes = $match.Groups[1].Value.Trim() }
+          else { $notes = "See CHANGELOG.md for details." }
+          $hostingUrl = "https://www.survivalservers.com/games/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver-$version"
+          $hosting = "`n`n----`n### Official Hosting`n`nHearthServer is officially supported by [SurvivalServers.com]($hostingUrl) — managed Bellwright hosting with Hearth pre-installed and kept on the latest pinned release.`n"
+          $body = $notes + $hosting
+          $body | Out-File -FilePath release-body.md -Encoding utf8
+
+      - name: Create GitHub release (HearthServer)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/checksums.txt
+          body_path: release-body.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

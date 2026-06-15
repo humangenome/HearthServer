@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>HearthServer</RootNamespace>
+    <UserSecretsId>hearth-server-dev</UserSecretsId>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="HearthServer.Tests" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
+    <PackageReference Include="Serilog" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+    <PackageReference Include="Serilog.Formatting.Compact" />
+    <PackageReference Include="LiteNetLib" />
+    <PackageReference Include="MessagePack" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../shared/Hearth.Protocol/Hearth.Protocol.csproj" />
+    <ProjectReference Include="../../shared/Hearth.Abstractions/Hearth.Abstractions.csproj" />
+    <ProjectReference Include="../Hearth.SourceQuery/Hearth.SourceQuery.csproj" />
+    <ProjectReference Include="../Hearth.Rcon/Hearth.Rcon.csproj" />
+    <ProjectReference Include="../Hearth.Persistence/Hearth.Persistence.csproj" />
+  </ItemGroup>
+</Project>

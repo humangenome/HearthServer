@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Hearth.SourceQuery</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../shared/Hearth.Abstractions/Hearth.Abstractions.csproj" />
+  </ItemGroup>
+</Project>
