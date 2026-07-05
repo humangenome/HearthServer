@@ -77,6 +77,8 @@ public sealed class SourceQueryServer : IDisposable
             try { res = await _udp.ReceiveAsync(ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
+            catch (SocketException) when (!ct.IsCancellationRequested) { continue; }
+            catch (Exception) when (!ct.IsCancellationRequested) { continue; }
 
             try
             {
