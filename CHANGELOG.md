@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.47] - 2026-07-05
+
+- Fixed the Source Query (A2S) responder so transient UDP socket errors do not
+  stop the query loop while the server process remains alive.
+
 ## [0.1.42] - 2026-07-03
 
 Version-lockstep release with the Hearth v0.1.42 host performance update. No
