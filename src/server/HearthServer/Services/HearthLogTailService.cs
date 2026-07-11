@@ -8,7 +8,9 @@ using Microsoft.Extensions.Options;
 namespace HearthServer.Services;
 
 /// <summary>
-/// Tails the Bellwright host's UE log file (<c>{GameUserDir}/Saved/Logs/Bellwright.log</c>),
+/// Tails the Bellwright host's UE log file (<c>{GameUserDir}/bw-ue.log</c> on
+/// current builds, with the older <c>{GameUserDir}/Saved/Logs/Bellwright.log</c>
+/// path kept as a fallback),
 /// filters for operator-meaningful categories, and re-emits each line
 /// through Serilog with a <c>[Bellwright]</c> source prefix. Joins, leaves, chat,
 /// errors, save events, map travels — all show up interleaved with
@@ -49,11 +51,17 @@ public sealed class HearthLogTailService : BackgroundService
         @"(?:UNetConnection::Close|UNetConnection::Tick: Connection TIMED OUT|UChannel::Close|UChannel::CleanUp).*RemoteAddr:\s*(?<addr>[^\s,]+)|UNetDriver::RemoveClientConnection - Removed address\s+(?<addr2>[^\s,]+)",
         RegexOptions.Compiled);
     private static readonly Regex TravelRegex = new(@"UEngine::Browse Started Browse:\s*""(?<url>[^""]+)""",    RegexOptions.Compiled);
-    private static readonly Regex LoginRequestRegex = new(
-        @"LogNet:\s+Login request:\s+\?Name=(?<name>[^?\s]+).*?(?:\?PlayerId=(?<player>[^?\s]+))?",
+    private static readonly Regex LoginNameRegex = new(
+        @"LogNet:\s+Login request:\s+\?Name=(?<name>[^?\s]+)",
+        RegexOptions.Compiled);
+    private static readonly Regex LoginPlayerIdRegex = new(
+        @"(?:\?PlayerId=(?<id>[^?\s]+)|\suserId:\s*(?<id>[^\s]+))",
         RegexOptions.Compiled);
     private static readonly Regex JoinSucceededRegex = new(
         @"LogNet:\s+Join succeeded:\s*(?<name>.+?)\s*$",
+        RegexOptions.Compiled);
+    private static readonly Regex GeneratedHexNameRegex = new(
+        @"^[\w\-]+-[0-9A-Fa-f]{8,}$",
         RegexOptions.Compiled);
     private static readonly Regex GameplayJoinRegex = new(
         @"PlayerHasJoined.*INVTEXT\(""(?<name>[^""]+)""\)",
@@ -68,20 +76,30 @@ public sealed class HearthLogTailService : BackgroundService
     private readonly ILogger<HearthLogTailService> _log;
     private readonly HearthServerOptions _opts;
     private readonly PipeServerState _state;
-    private readonly Queue<string> _pendingAddresses = new();
+    // Address candidates from "accepted from" LogNet lines, stamped so stale
+    // entries (e.g. a NAT-flapping zombie connection's old ports) can never be
+    // paired with a later login — a stale pairing writes a wrong-address identity
+    // row that bw_host can't match.
+    private readonly Queue<(string Address, long SeenUnixMs)> _pendingAddresses = new();
+    private static readonly TimeSpan PendingAddressTtl = TimeSpan.FromSeconds(60);
     private readonly Dictionary<string, PendingLogin> _pendingLogins = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _playerIdByAddress = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _playerNameByAddress = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, LoginIdentity> _loginIdentitiesByAddress = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _playerGate = new();
+    private readonly string _loginIdentityCachePath;
     private long _position;
     private string? _lastBuildLogged;
     private bool _tailReadyForPlayerEvents;
+    private string? _activeLogPath;
+    private static readonly TimeSpan LoginIdentityCacheTtl = TimeSpan.FromMinutes(45);
 
     public HearthLogTailService(ILogger<HearthLogTailService> log, IOptions<HearthServerOptions> opts, PipeServerState state)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
+        _loginIdentityCachePath = ResolveLoginIdentityCachePath(_opts.LoginIdentityCachePath);
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -91,13 +109,27 @@ public sealed class HearthLogTailService : BackgroundService
             _log.LogInformation("[Bellwright] log tail idle: GameUserDir not configured");
             return;
         }
-        var logPath = Path.Combine(_opts.GameUserDir, "Saved", "Logs", "Bellwright.log");
-        _log.LogInformation("[Bellwright] log tail watching {Path}", logPath);
+        var logPaths = CandidateLogPaths(_opts.GameUserDir).ToArray();
+        _log.LogInformation("[Bellwright] log tail watching {Paths}", string.Join(", ", logPaths));
+        WriteLoginIdentityCache();
 
         while (!ct.IsCancellationRequested)
         {
             try
             {
+                var logPath = logPaths.FirstOrDefault(File.Exists);
+                if (string.IsNullOrWhiteSpace(logPath))
+                {
+                    await Task.Delay(2000, ct).ConfigureAwait(false);
+                    continue;
+                }
+                if (!string.Equals(_activeLogPath, logPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    _activeLogPath = logPath;
+                    _position = 0;
+                    _tailReadyForPlayerEvents = false;
+                    _log.LogInformation("[Bellwright] log tail active path {Path}", logPath);
+                }
                 if (!File.Exists(logPath))
                 {
                     await Task.Delay(2000, ct).ConfigureAwait(false);
@@ -194,10 +226,10 @@ public sealed class HearthLogTailService : BackgroundService
             _log.LogInformation("[Bellwright] player connection accepted from {Addr}", addr);
             return;
         }
-        var loginMatch = LoginRequestRegex.Match(line);
+        var loginMatch = LoginNameRegex.Match(line);
         if (trackPlayerEvents && loginMatch.Success)
         {
-            TrackLoginRequest(loginMatch.Groups["name"].Value, loginMatch.Groups["player"].Value);
+            TrackLoginRequest(loginMatch.Groups["name"].Value, ExtractLoginPlayerId(line));
         }
         var joinSucceededMatch = JoinSucceededRegex.Match(line);
         if (joinSucceededMatch.Success)
@@ -252,47 +284,67 @@ public sealed class HearthLogTailService : BackgroundService
         if (string.IsNullOrWhiteSpace(address)) return;
         lock (_playerGate)
         {
-            if (!_pendingAddresses.Contains(address, StringComparer.OrdinalIgnoreCase))
-                _pendingAddresses.Enqueue(address);
+            if (!_pendingAddresses.Any(p => string.Equals(p.Address, address, StringComparison.OrdinalIgnoreCase)))
+                _pendingAddresses.Enqueue((address, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
             while (_pendingAddresses.Count > 16) _pendingAddresses.Dequeue();
         }
     }
 
     private void TrackLoginRequest(string displayName, string playerId)
     {
-        displayName = CleanName(displayName);
-        if (displayName.Length == 0 || IsGeneratedPlayerName(displayName)) return;
-        var id = string.IsNullOrWhiteSpace(playerId) ? $"bw:{displayName}" : playerId.Trim();
+        var loginName = CleanName(Uri.UnescapeDataString(displayName));
+        if (loginName.Length == 0) return;
+        if (IsUnrealObjectIdentity(loginName)) return;
+        var visibleName = IsGeneratedPlayerName(loginName) ? "Player" : loginName;
+        var id = NormalizeLoginId(playerId, loginName);
         string? address = null;
         lock (_playerGate)
         {
-            if (_pendingAddresses.Count > 0) address = _pendingAddresses.Dequeue();
-            _pendingLogins[displayName] = new PendingLogin(id, displayName, address);
+            var staleBefore = DateTimeOffset.UtcNow.Subtract(PendingAddressTtl).ToUnixTimeMilliseconds();
+            while (_pendingAddresses.Count > 0 && _pendingAddresses.Peek().SeenUnixMs < staleBefore)
+                _pendingAddresses.Dequeue();
+            if (_pendingAddresses.Count > 0) address = _pendingAddresses.Dequeue().Address;
+            _pendingLogins[loginName] = new PendingLogin(id, visibleName, address, loginName);
             if (!string.IsNullOrWhiteSpace(address)) _playerIdByAddress[address] = id;
-            if (!string.IsNullOrWhiteSpace(address)) _playerNameByAddress[address] = displayName;
+            if (!string.IsNullOrWhiteSpace(address)) _playerNameByAddress[address] = visibleName;
+            // Always land an identity row: bw_host's recency-claim fallback needs a
+            // row even when no usable accept-address was captured for this login.
+            var identityKey = !string.IsNullOrWhiteSpace(address) ? address : $"pending:{loginName}";
+            UpsertLoginIdentityLocked(identityKey, id, loginName, visibleName);
         }
+        _state.UpsertLogPlayer(id, visibleName);
     }
 
     private void TrackPlayerJoined(string displayName)
     {
-        displayName = CleanName(displayName);
-        if (displayName.Length == 0 || IsGeneratedPlayerName(displayName)) return;
+        displayName = CleanName(Uri.UnescapeDataString(displayName));
         PendingLogin? pending = null;
         lock (_playerGate)
         {
-            if (_pendingLogins.TryGetValue(displayName, out pending))
+            if (displayName.Length > 0 && _pendingLogins.TryGetValue(displayName, out pending))
                 _pendingLogins.Remove(displayName);
+            else if (_pendingLogins.Count == 1)
+            {
+                var first = _pendingLogins.First();
+                pending = first.Value;
+                _pendingLogins.Remove(first.Key);
+            }
         }
+        if (pending is null && (displayName.Length == 0 || IsGeneratedPlayerName(displayName))) return;
+        var visibleName = pending?.DisplayName ?? displayName;
+        if (displayName.Length > 0 && !IsGeneratedPlayerName(displayName))
+            visibleName = displayName;
         var id = pending?.PlayerId ?? $"bw:{displayName}";
         if (!string.IsNullOrWhiteSpace(pending?.Address))
         {
             lock (_playerGate)
             {
                 _playerIdByAddress[pending.Address] = id;
-                _playerNameByAddress[pending.Address] = displayName;
+                _playerNameByAddress[pending.Address] = visibleName;
+                UpsertLoginIdentityLocked(pending.Address, id, pending.LoginName, visibleName);
             }
         }
-        _state.UpsertLogPlayer(id, displayName);
+        _state.UpsertLogPlayer(id, visibleName);
     }
 
     private void TrackPlayerLeftByDisplayName(string displayName)
@@ -315,7 +367,9 @@ public sealed class HearthLogTailService : BackgroundService
             {
                 _playerNameByAddress.Remove(addr);
                 _playerIdByAddress.Remove(addr);
+                _loginIdentitiesByAddress.Remove(addr);
             }
+            WriteLoginIdentityCache();
         }
         _state.RemoveLogPlayerByDisplayName(displayName);
     }
@@ -331,6 +385,8 @@ public sealed class HearthLogTailService : BackgroundService
                 _playerIdByAddress.Remove(address);
             if (_playerNameByAddress.TryGetValue(address, out displayName))
                 _playerNameByAddress.Remove(address);
+            _loginIdentitiesByAddress.Remove(address);
+            WriteLoginIdentityCache();
         }
         var removed = false;
         if (!string.IsNullOrWhiteSpace(id))
@@ -348,6 +404,124 @@ public sealed class HearthLogTailService : BackgroundService
     }
 
     private static string CleanName(string value) => value.Trim().Trim('"');
+
+    private static string ResolveLoginIdentityCachePath(string configuredPath)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredPath)) return configuredPath;
+        return Path.Combine(AppContext.BaseDirectory, "login-identities.tsv");
+    }
+
+    private void UpsertLoginIdentityLocked(string address, string hearthUserId, string loginName, string displayName)
+    {
+        if (string.IsNullOrWhiteSpace(address)) return;
+        var seed = NormalizeLoginSeedForCache(hearthUserId, loginName);
+        if (seed.Length == 0) return;
+        var uid = NormalizeLoginUidForCache(hearthUserId, seed);
+        var visibleName = CleanName(displayName);
+        if (visibleName.Length == 0 || IsGeneratedPlayerName(visibleName)) visibleName = "Player";
+
+        _loginIdentitiesByAddress[address] = new LoginIdentity(
+            address,
+            uid,
+            seed,
+            visibleName,
+            loginName,
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        WriteLoginIdentityCache();
+    }
+
+    private void WriteLoginIdentityCache()
+    {
+        try
+        {
+            var staleBefore = DateTimeOffset.UtcNow.Subtract(LoginIdentityCacheTtl).ToUnixTimeMilliseconds();
+            foreach (var address in _loginIdentitiesByAddress
+                         .Where(kv => kv.Value.UpdatedUnixMs < staleBefore)
+                         .Select(kv => kv.Key)
+                         .ToList())
+            {
+                _loginIdentitiesByAddress.Remove(address);
+            }
+
+            var dir = Path.GetDirectoryName(_loginIdentityCachePath);
+            if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);
+
+            if (_loginIdentitiesByAddress.Count == 0)
+            {
+                if (File.Exists(_loginIdentityCachePath)) File.Delete(_loginIdentityCachePath);
+                return;
+            }
+
+            var lines = _loginIdentitiesByAddress.Values
+                .OrderBy(identity => identity.Address, StringComparer.OrdinalIgnoreCase)
+                .Select(identity => string.Join('\t',
+                    identity.UpdatedUnixMs.ToString(),
+                    EncodeIdentityField(identity.Address),
+                    EncodeIdentityField(identity.HearthUserId),
+                    EncodeIdentityField(identity.Seed),
+                    EncodeIdentityField(identity.DisplayName),
+                    EncodeIdentityField(identity.LoginName)));
+
+            var tmp = _loginIdentityCachePath + ".tmp";
+            File.WriteAllLines(tmp, lines, Encoding.UTF8);
+            File.Move(tmp, _loginIdentityCachePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "[Bellwright] failed to write login identity cache");
+        }
+    }
+
+    private static string EncodeIdentityField(string value) => Uri.EscapeDataString(value ?? "");
+
+    private static string NormalizeLoginSeedForCache(string hearthUserId, string loginName)
+    {
+        var id = hearthUserId.Trim();
+        if (id.StartsWith("bw:", StringComparison.OrdinalIgnoreCase)) id = id[3..];
+        if (id.Length == 0 || id.Contains("...", StringComparison.Ordinal) || IsUnrealObjectIdentity(id))
+            id = loginName;
+        if (id.All(char.IsDigit) && id.Length is >= 15 and <= 20)
+            return "steam_" + id;
+        return Regex.Replace(id.Trim(), @"[^\w\-]", "_");
+    }
+
+    private static string NormalizeLoginUidForCache(string hearthUserId, string seed)
+    {
+        var id = hearthUserId.Trim();
+        if (seed.StartsWith("steam_", StringComparison.OrdinalIgnoreCase)) return seed;
+        if (id.StartsWith("bw:", StringComparison.OrdinalIgnoreCase)) return "bw:" + seed;
+        if (id.Length > 0 && !id.Contains("...", StringComparison.Ordinal) && !IsUnrealObjectIdentity(id))
+            return seed;
+        return "bw:" + seed;
+    }
+
+    internal static IReadOnlyList<string> CandidateLogPaths(string gameUserDir) =>
+        new[]
+        {
+            Path.Combine(gameUserDir, "bw-ue.log"),
+            Path.Combine(gameUserDir, "Saved", "Logs", "Bellwright.log"),
+        };
+
+    internal static string ExtractLoginPlayerId(string line)
+    {
+        var id = "";
+        foreach (Match match in LoginPlayerIdRegex.Matches(line))
+        {
+            var candidate = match.Groups["id"].Value.Trim();
+            if (candidate.Length == 0) continue;
+            id = candidate;
+            if (!candidate.Contains("...", StringComparison.Ordinal)) break;
+        }
+        return id;
+    }
+
+    private static string NormalizeLoginId(string playerId, string loginName)
+    {
+        var id = playerId.Trim();
+        if (id.Length == 0 || id.Contains("...", StringComparison.Ordinal) || IsUnrealObjectIdentity(id))
+            id = $"bw:{loginName}";
+        return id;
+    }
 
     internal static bool TryExtractAcceptedAddress(string line, out string address)
     {
@@ -369,9 +543,37 @@ public sealed class HearthLogTailService : BackgroundService
 
     private static bool IsGeneratedPlayerName(string value)
     {
-        return value.StartsWith("ns", StringComparison.OrdinalIgnoreCase)
-               || value.StartsWith("WIN-", StringComparison.OrdinalIgnoreCase);
+        return IsUnrealObjectIdentity(value)
+               || value.Equals("OfflineUser", StringComparison.OrdinalIgnoreCase)
+               || value.Equals("Player", StringComparison.OrdinalIgnoreCase)
+               || value.StartsWith("ns", StringComparison.OrdinalIgnoreCase)
+               || value.StartsWith("WIN-", StringComparison.OrdinalIgnoreCase)
+               || value.StartsWith("DESKTOP-", StringComparison.OrdinalIgnoreCase)
+               || GeneratedHexNameRegex.IsMatch(value);
     }
 
-    private sealed record PendingLogin(string PlayerId, string DisplayName, string? Address);
+    private static bool IsUnrealObjectIdentity(string value)
+    {
+        var trimmed = value.Trim();
+        var colon = trimmed.IndexOf(':');
+        if (colon <= 0) return false;
+        var prefix = trimmed[..colon];
+        return prefix.StartsWith("U", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Object", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Struct", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Class", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Function", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Property", StringComparison.OrdinalIgnoreCase)
+               || prefix.Contains("Package", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed record PendingLogin(string PlayerId, string DisplayName, string? Address, string LoginName);
+
+    private sealed record LoginIdentity(
+        string Address,
+        string HearthUserId,
+        string Seed,
+        string DisplayName,
+        string LoginName,
+        long UpdatedUnixMs);
 }
