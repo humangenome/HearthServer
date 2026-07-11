@@ -82,6 +82,12 @@ public sealed class HearthServerOptions
     public string SaveDir { get; set; } = @"C:\Hearth\saves";
 
     /// <summary>
+    /// Optional path for the Bellwright login identity cache consumed by
+    /// bw_host.lua. Empty writes login-identities.tsv next to HearthServer.exe.
+    /// </summary>
+    public string LoginIdentityCachePath { get; set; } = "";
+
+    /// <summary>
     /// Optional path to a single-line file containing the PID of the game
     /// process this HearthServer instance owns. Used by KillGame as a
     /// fallback when neither <see cref="GameInstallRoot"/> nor a command-line

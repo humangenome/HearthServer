@@ -4,6 +4,15 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.56] - 2026-07-11
+
+- Fixed login identity tracking when Bellwright exposes the connection address
+  and request URL as unreadable object proxies.
+- Added a recency-safe identity cache so simultaneous players retain separate,
+  stable identities instead of becoming invisible or unable to interact.
+- Stopped stale accepted connection addresses from being paired with later
+  logins.
+
 ## [0.1.47] - 2026-07-05
 
 - Fixed the Source Query (A2S) responder so transient UDP socket errors do not

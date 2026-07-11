@@ -27,7 +27,7 @@ namespace HearthServer.Services;
 ///   case the native and Lua paths could race and reproduce the Bellwright
 ///   crash loop, so we kill the game loudly with a CRITICAL log rather than
 ///   let a customer hit it. The expected steady-state is
-///   Configured=0 + HookReady=0 across the entire fleet.
+///   Configured=0 + HookReady=0 across standard installations.
 /// </summary>
 public sealed class HeartbeatWatchdogService : BackgroundService
 {
@@ -363,7 +363,7 @@ public sealed class HeartbeatWatchdogService : BackgroundService
     private void CheckServerPasswordReady()
     {
         // Steady-state under the Lua-only enforcement model is
-        // ServerPasswordConfigured=0 across the entire fleet. The native
+        // ServerPasswordConfigured=0 across standard installations. The native
         // ApproveLogin hook is intentionally disabled (plugin-config.json
         // always has an empty ServerPassword), so if the plugin EVER
         // reports Configured=1, something upstream is broken and we
