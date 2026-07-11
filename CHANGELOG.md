@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.58] - 2026-07-11
+
+- Keeps player join and visibility handling active when Bellwright briefly
+  returns incomplete connection data.
+- Prevents a later player from joining as an invisible or non-interactive
+  character.
+
 ## [0.1.57] - 2026-07-11
 
 Version-lockstep release with the Hearth v0.1.57 host update. No changes to
