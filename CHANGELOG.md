@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.57] - 2026-07-11
+
+Version-lockstep release with the Hearth v0.1.57 host update. No changes to
+the .NET server source in this repository; the in-game host mod now keeps
+player join and visibility handling active when Bellwright briefly returns
+incomplete connection data.
+
 ## [0.1.56] - 2026-07-11
 
 - Fixed login identity tracking when Bellwright exposes the connection address
