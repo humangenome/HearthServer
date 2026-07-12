@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.60] - 2026-07-12
+
+Version-lockstep release with Hearth v0.1.60. The bundled Bellwright host now
+uses the game's native persistent-player lifecycle for character restoration,
+possession, customization, inventory, quests, and interactions. There are no
+behavioral changes to the .NET server source in this repository.
+
 ## [0.1.59] - 2026-07-11
 
 - Fixes the first player after a server restart being treated as unidentified
