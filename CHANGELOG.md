@@ -4,6 +4,12 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.67] - 2026-07-13
+
+- Keeps the running Bellwright world online after repairing a regressed
+  automatic save, avoiding an autosave restart loop while preserving the
+  verified world rotation on disk.
+
 ## [0.1.66] - 2026-07-13
 
 - Publishes the Bellwright world-regression guard with matching 0.1.66 Windows
