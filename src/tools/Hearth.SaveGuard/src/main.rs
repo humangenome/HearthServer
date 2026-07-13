@@ -36,8 +36,12 @@ fn run() -> Result<(), String> {
     let ledger = ledger.ok_or_else(|| "--ledger is required".to_string())?;
     let outcome = protect(&save, &ledger).map_err(|e| e.to_string())?;
     println!(
-        "OK current={} ledger_updates={} restored={}",
-        outcome.current_records, outcome.ledger_updates, outcome.restored_records
+        "OK current={} ledger_updates={} restored={} world_records={} world_restored={}",
+        outcome.current_records,
+        outcome.ledger_updates,
+        outcome.restored_records,
+        outcome.world_records,
+        usize::from(outcome.world_restored)
     );
     Ok(())
 }

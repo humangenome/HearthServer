@@ -4,6 +4,15 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.65] - 2026-07-13
+
+- Protects complete Bellwright worlds when a crash or bad rotation falls back
+  to a starter-state save.
+- Repairs inconsistent rotating saves before launch and recycles the owned
+  game process after a live regression is recovered.
+- Resets save-protection state when a snapshot or imported world intentionally
+  replaces the current world.
+
 ## [0.1.64] - 2026-07-13
 
 - Keeps offline player records protected after every Bellwright automatic save,
@@ -30,7 +39,6 @@ Version-lockstep release with Hearth v0.1.61. The launcher now preserves
 existing Bellwright characters across Hearth updates and local-data cleanup,
 while keeping native character creation available for genuinely new players.
 There are no behavioral changes to the .NET server source in this repository.
-
 ## [0.1.60] - 2026-07-12
 
 Version-lockstep release with Hearth v0.1.60. The bundled Bellwright host now
