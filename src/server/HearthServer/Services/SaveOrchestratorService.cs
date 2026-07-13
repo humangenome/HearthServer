@@ -75,9 +75,9 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     }
 
     /// <summary>
-    /// Watch the game's SaveGames dir for auto-save writes. The game's host
-    /// process auto-saves savegame_0.sav every ~1 minute. When the file mtime
-    /// changes, debounce and trigger a Hearth snapshot. This is the "Hearth
+    /// Watch the game's SaveGames dir for auto-save writes. Bellwright versions
+    /// have used both savegame_N.sav and TEMP_auto*.sav names. When a supported
+    /// file changes, debounce and trigger a Hearth snapshot. This is the "Hearth
     /// snapshots, Bellwright owns the trigger" model — no save RPC needed.
     /// </summary>
     private void TryStartFileWatcher()
@@ -91,7 +91,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             }
             var sourceDir = Path.Combine(_opts.GameUserDir, "Saved", "SaveGames");
             Directory.CreateDirectory(sourceDir);
-            _watcher = new FileSystemWatcher(sourceDir, "savegame_*.sav")
+            _watcher = new FileSystemWatcher(sourceDir, "*")
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime,
                 IncludeSubdirectories = false,
@@ -100,7 +100,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             _watcher.Changed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
             _watcher.Created += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
             _watcher.Renamed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
-            _log.LogInformation("FileSystemWatcher armed on {Dir} (savegame_*.sav)", sourceDir);
+            _log.LogInformation("FileSystemWatcher armed on {Dir} (Bellwright save files)", sourceDir);
         }
         catch (Exception ex)
         {
@@ -141,6 +141,8 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
     private async Task OnSaveFileChangedAsync(string path)
     {
+        if (!IsRootSaveSlotPath(Path.GetFileName(path))) return;
+
         // Debounce: Bellwright may emit multiple write events per save (size, mtime,
         // last access). Only one snapshot per AutoSnapshotDebounce window.
         if (!await _autoLock.WaitAsync(0).ConfigureAwait(false)) return;
@@ -181,7 +183,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         {
             // If plugin is connected, request a SaveQuiesce so the game flushes
             // in-flight state. If not connected, fall through — Bellwright writes its
-            // own savegame_0.sav atomically (temp + rename), so a snapshot taken
+            // own save files atomically (temp + rename), so a snapshot taken
             // without quiesce is still self-consistent. This unblocks the
             // FileSystemWatcher auto-snapshot path which fires when Bellwright has just
             // finished writing the file.
@@ -274,10 +276,10 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         }
     }
 
-    private static bool IsRootSaveSlotPath(string relativePath) =>
+    internal static bool IsRootSaveSlotPath(string relativePath) =>
         System.Text.RegularExpressions.Regex.IsMatch(
             relativePath,
-            @"^savegame_\d+\.sav$",
+            @"^(?:savegame_\d+\.sav|TEMP_auto(?:_(?:today|yesterday))?\.sav(?:_backup\d+)?)$",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase |
             System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
@@ -317,7 +319,8 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     /// <summary>
     /// Restore from a freshly-uploaded zip on disk (e.g. an imported vanilla
     /// save or a cross-server transfer payload). The zip must contain the
-    /// contents of a SaveGames directory at its root (savegame_0.sav etc.).
+    /// contents of a SaveGames directory at its root (TEMP_auto.sav or a
+    /// legacy savegame_N.sav).
     /// Takes a pre-restore snapshot, kills the game, swaps in the new files, then
     /// releases the supervisor gate.
     /// </summary>
@@ -333,8 +336,8 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         using var _ = await _coordinator.BeginRestoreAsync(ct).ConfigureAwait(false);
 
         // 1. Stop Bellwright first. Taking a snapshot BEFORE the kill would
-        // capture whatever state Bellwright was mid-writing — which on a save
-        // tick is half a savegame_0.sav. Kill, wait for exit, then snap.
+        // capture whatever state Bellwright was mid-writing. Kill, wait for
+        // exit, then snap.
         _coordinator.KillGame(TimeSpan.FromSeconds(20));
 
         // 2. Snapshot the now-stable state so a bad restore is reversible.
@@ -359,19 +362,17 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             var prevDir = saveGamesDir + ".old-" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
             // Validate the zip BEFORE touching live SaveGames. A zip with no
-            // savegame_*.sav at the root is almost certainly a customer
+            // supported Bellwright save at the root is almost certainly a customer
             // zipping the wrong folder — refuse rather than wipe their world.
             try
             {
                 using var probe = System.IO.Compression.ZipFile.OpenRead(zipPath);
                 var hasSave = probe.Entries.Any(e =>
                     e.Length > 0 &&
-                    System.Text.RegularExpressions.Regex.IsMatch(
-                        e.FullName, @"^savegame_\d+\.sav$",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+                    IsRootSaveSlotPath(e.FullName));
                 if (!hasSave)
                 {
-                    _log.LogWarning("Restore rejected: zip {Path} contains no savegame_*.sav at the root", zipPath);
+                    _log.LogWarning("Restore rejected: zip {Path} contains no supported Bellwright save at the root", zipPath);
                     return false;
                 }
             }

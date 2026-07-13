@@ -66,7 +66,7 @@ public sealed class RconHostedService : IHostedService
         _log.LogDebug("RCON dispatch: cmd={Cmd} argLen={ArgLen}", head, rest.Length);
         return head switch
         {
-            "help"     => "commands: status, players, ping, save snapshot, save list, say <msg>, announce <msg>, motd [msg]",
+            "help"     => "commands: status, players, ping, save snapshot, save list, save restore <id>, say <msg>, announce <msg>, motd [msg]",
             "status"   => BuildStatus(),
             "players"  => BuildPlayers(),
             "ping"     => "pong",
@@ -100,8 +100,8 @@ public sealed class RconHostedService : IHostedService
 
     private async Task<string> HandleSaveAsync(string sub)
     {
-        var arg = sub.Trim().ToLowerInvariant();
-        if (string.IsNullOrEmpty(arg) || arg == "snapshot")
+        var arg = sub.Trim();
+        if (string.IsNullOrEmpty(arg) || arg.Equals("snapshot", StringComparison.OrdinalIgnoreCase))
         {
             // The game host auto-saves to <userdir>/Saved/SaveGames every ~60s.
             // We snapshot the on-disk save file directly; the plugin SaveQuiesce
@@ -114,7 +114,7 @@ public sealed class RconHostedService : IHostedService
                 ? "snapshot failed (check hearth log; save dir likely missing)"
                 : $"snapshot ok: {rec.SnapshotId} ({rec.SizeBytes} bytes, sha={rec.Sha256Hex[..16]})";
         }
-        if (arg == "list")
+        if (arg.Equals("list", StringComparison.OrdinalIgnoreCase))
         {
             var snaps = _saves.Database.ListSnapshots(20);
             if (snaps.Count == 0) return "no snapshots yet";
@@ -123,7 +123,16 @@ public sealed class RconHostedService : IHostedService
                 sb.AppendLine($"{s.SnapshotId}  {s.SizeBytes}B  age={(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - s.TakenUnix)}s  sha={s.Sha256Hex[..16]}");
             return sb.ToString().TrimEnd();
         }
-        return "usage: save snapshot | save list";
+        if (arg.StartsWith("restore ", StringComparison.OrdinalIgnoreCase))
+        {
+            var snapshotId = arg["restore ".Length..].Trim();
+            if (string.IsNullOrEmpty(snapshotId)) return "usage: save restore <id>";
+            var restored = await _saves.RestoreSnapshotAsync(snapshotId, "rcon").ConfigureAwait(false);
+            return restored
+                ? $"restore ok: {snapshotId}"
+                : $"restore failed: {snapshotId} (not found, missing, or invalid; check hearth log)";
+        }
+        return "usage: save snapshot | save list | save restore <id>";
     }
 
     private string BuildStatus()
