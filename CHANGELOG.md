@@ -4,6 +4,14 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.62] - 2026-07-13
+
+Version-lockstep release with Hearth v0.1.62. The host bundle prevents a
+Bellwright crash during asynchronous character mesh updates and protects
+existing character progress while persistent player data resolves after a
+join. There are no behavioral changes to the .NET server source in this
+repository.
+
 ## [0.1.61] - 2026-07-13
 
 Version-lockstep release with Hearth v0.1.61. The launcher now preserves
