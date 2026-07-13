@@ -14,18 +14,15 @@ public sealed class SaveProtectionService
 {
     private readonly ILogger<SaveProtectionService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly HearthRestartCoordinator _coordinator;
     private readonly string _guardPath;
     private readonly string _ledgerDir;
 
     public SaveProtectionService(
         ILogger<SaveProtectionService> log,
-        IOptions<HearthServerOptions> opts,
-        HearthRestartCoordinator coordinator)
+        IOptions<HearthServerOptions> opts)
     {
         _log = log;
         _opts = opts.Value;
-        _coordinator = coordinator;
         _guardPath = Path.Combine(AppContext.BaseDirectory, "HearthSaveGuard.exe");
         _ledgerDir = Path.Combine(AppContext.BaseDirectory, "data", "player-records");
     }
@@ -94,8 +91,7 @@ public sealed class SaveProtectionService
                 .Contains("world_restored=1", StringComparer.Ordinal))
             {
                 _log.LogWarning(
-                    "Bellwright world regression recovered; recycling the owned game process so it reloads the protected world");
-                _coordinator.KillGame(TimeSpan.FromSeconds(20));
+                    "Bellwright world regression recovered on disk; leaving the already-loaded world online to avoid an autosave restart loop");
             }
             return true;
         }
