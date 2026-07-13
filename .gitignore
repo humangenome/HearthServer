@@ -3,6 +3,7 @@ bin/
 obj/
 out/
 build/
+target/
 *.user
 *.suo
 *.userosscache
@@ -75,4 +76,3 @@ dist/ue4ss-server/UE4SS.dll
 # Codex scratch briefs (never published, never tracked)
 .codex-*
 .lkg-*/
-

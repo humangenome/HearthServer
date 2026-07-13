@@ -25,6 +25,9 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Restore NuGet
         run: dotnet restore HearthServer.sln
 
@@ -33,6 +36,13 @@ jobs:
 
       - name: Test
         run: dotnet test HearthServer.sln --configuration Release --no-build --verbosity normal
+
+      - name: Build and test Bellwright save guard
+        run: |
+          cargo test --manifest-path src/tools/Hearth.SaveGuard/Cargo.toml --release
+          if ($LASTEXITCODE -ne 0) { throw "save guard tests failed" }
+          cargo build --manifest-path src/tools/Hearth.SaveGuard/Cargo.toml --release
+          if ($LASTEXITCODE -ne 0) { throw "save guard build failed" }
 
       - name: Publish HearthServer (self-contained)
         run: dotnet publish src/server/HearthServer/HearthServer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=false
@@ -44,6 +54,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           $publish = "src/server/HearthServer/bin/Release/net8.0/win-x64/publish"
           if (-not (Test-Path "$publish/HearthServer.exe")) { throw "server publish missing at $publish" }
+          $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
+          if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
+          Copy-Item $saveGuard "$publish/HearthSaveGuard.exe" -Force
           Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/Hearth-Server-Windows-x64-$tag.zip"
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
