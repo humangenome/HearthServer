@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.63] - 2026-07-13
+
+- Preserves established offline player records when Bellwright rewrites an
+  idle world save.
+- Verifies the protected save before replacing the live file and refuses an
+  unsafe launch if protection cannot complete.
+
 ## [0.1.62] - 2026-07-13
 
 Version-lockstep release with Hearth v0.1.62. The host bundle prevents a

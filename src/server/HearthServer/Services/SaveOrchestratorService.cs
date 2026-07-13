@@ -22,6 +22,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     private readonly HearthServerOptions _opts;
     private readonly PipeServerState _state;
     private readonly HearthRestartCoordinator _coordinator;
+    private readonly SaveProtectionService _saveProtection;
     private readonly HearthDb _db;
     private readonly string _dbPath;
     private FileSystemWatcher? _watcher;
@@ -33,23 +34,29 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         ILogger<SaveOrchestratorService> log,
         IOptions<HearthServerOptions> opts,
         PipeServerState state,
-        HearthRestartCoordinator coordinator)
+        HearthRestartCoordinator coordinator,
+        SaveProtectionService saveProtection)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
         _coordinator = coordinator;
+        _saveProtection = saveProtection;
         _dbPath = Path.Combine(Path.GetDirectoryName(_opts.HmacKeyPath) ?? "data", "hearth.db");
         _db = new HearthDb(_dbPath);
     }
 
     public HearthDb Database => _db;
 
-    public Task StartAsync(CancellationToken _)
+    public async Task StartAsync(CancellationToken ct)
     {
         _log.LogInformation("Save orchestrator ready; db={Path}, save_dir={Dir}, snapshots_enabled={Enabled}",
             _dbPath, _opts.SaveDir, _opts.SnapshotsEnabled);
         TryNormalizeSaveSlots();
+        if (!await _saveProtection.ProtectCanonicalAsync(ct).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException("Bellwright save protection failed during Hearth startup");
+        }
         if (_opts.SnapshotsEnabled)
         {
             TryStartFileWatcher();
@@ -58,7 +65,6 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         {
             _log.LogInformation("Auto-snapshot FileSystemWatcher disabled by config (SnapshotsEnabled=false)");
         }
-        return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken _)
@@ -152,6 +158,11 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             if (now - _lastAutoSnapshotUtc < AutoSnapshotDebounce) return;
             // Wait briefly for Bellwright to finish its write
             await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+            if (!await _saveProtection.ProtectCanonicalAsync().ConfigureAwait(false))
+            {
+                _log.LogError("Auto-snapshot skipped because save protection failed");
+                return;
+            }
             var rec = await SnapshotAsync(requestedBy: "auto:filewatcher", CancellationToken.None).ConfigureAwait(false);
             if (rec is not null)
             {
@@ -194,6 +205,13 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                     new SaveQuiesceMessage(snapshotId, TimeoutSeconds: 30),
                     ct).ConfigureAwait(false);
                 await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+            }
+
+            // Protect the final, quiesced bytes immediately before archiving them.
+            if (!await _saveProtection.ProtectCanonicalAsync(ct).ConfigureAwait(false))
+            {
+                _log.LogError("Snapshot {Id} refused because save protection failed", snapshotId);
+                return null;
             }
 
             Directory.CreateDirectory(_opts.SaveDir);
