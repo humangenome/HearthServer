@@ -9,6 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BLOCK: usize = 131_072;
 const PACKAGE_FILE_TAG: [u8; 4] = [0xc1, 0x83, 0x2a, 0x9e];
 const MIN_RICH_RECORD_BYTES: usize = 512;
+const MIN_PROGRESSED_WORLD_RECORDS: usize = 20;
+const MAX_STARTER_WORLD_RECORDS: usize = 12;
+const WORLD_BASELINE_FILE: &str = "world-baseline.sav";
+const ROTATING_SAVE_NAMES: [&str; 4] = [
+    "TEMP_auto.sav",
+    "TEMP_auto.sav_backup0",
+    "TEMP_auto_today.sav",
+    "TEMP_auto_yesterday.sav",
+];
 
 #[derive(Debug)]
 pub enum Error {
@@ -40,6 +49,19 @@ pub struct Outcome {
     pub current_records: usize,
     pub ledger_updates: usize,
     pub restored_records: usize,
+    pub world_records: usize,
+    pub world_restored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorldMetrics {
+    progress_records: usize,
+}
+
+struct WorldRecovery {
+    save: SaveContainer,
+    original_hash: [u8; 32],
+    restored: bool,
 }
 
 #[derive(Clone)]
@@ -223,8 +245,10 @@ impl SaveContainer {
 pub fn protect(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
     fs::create_dir_all(ledger_dir).map_err(io_error)?;
     let _lock = DirectoryLock::acquire(ledger_dir)?;
-    let save = SaveContainer::load(save_path)?;
-    let original_hash = sha256(&save.raw);
+    let recovery = recover_world(save_path, ledger_dir)?;
+    let save = recovery.save;
+    let original_hash = recovery.original_hash;
+    let world = world_metrics(&save.decompressed)?;
     let current = player_records(&save.decompressed)?;
     let mut ledger = load_ledger(ledger_dir)?;
     let mut current_identities = BTreeSet::new();
@@ -256,7 +280,7 @@ pub fn protect(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
         .map(|(_, record)| record.clone())
         .collect();
 
-    if !missing.is_empty() {
+    let protected_bytes = if !missing.is_empty() {
         let output = save.append_player_records(&missing)?;
         let verified = SaveContainer::from_bytes(output.clone())?;
         let verified_records = player_records(&verified.decompressed)?;
@@ -277,13 +301,178 @@ pub fn protect(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
             return Err(Error::Race);
         }
         write_atomic(save_path, &output)?;
-    }
+        output
+    } else {
+        save.raw.clone()
+    };
+
+    write_atomic(&ledger_dir.join(WORLD_BASELINE_FILE), &protected_bytes)?;
 
     Ok(Outcome {
         current_records: current_identities.len(),
         ledger_updates,
         restored_records: missing.len(),
+        world_records: world.progress_records,
+        world_restored: recovery.restored,
     })
+}
+
+fn recover_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, Error> {
+    let canonical = SaveContainer::load(save_path)?;
+    let original_hash = sha256(&canonical.raw);
+    let canonical_metrics = world_metrics(&canonical.decompressed)?;
+    let baseline_path = ledger_dir.join(WORLD_BASELINE_FILE);
+
+    let baseline = if baseline_path.exists() {
+        Some(SaveContainer::load(&baseline_path)?)
+    } else {
+        None
+    };
+
+    let mut progressed = Vec::<(u8, SystemTime, SaveContainer)>::new();
+    let mut starter_present = canonical_metrics.progress_records <= MAX_STARTER_WORLD_RECORDS;
+    if canonical_metrics.progress_records >= MIN_PROGRESSED_WORLD_RECORDS {
+        progressed.push((
+            rotating_save_priority(save_path),
+            modified_or_epoch(save_path),
+            SaveContainer::from_bytes(canonical.raw.clone())?,
+        ));
+    }
+
+    if let Some(save_dir) = save_path.parent() {
+        for name in ROTATING_SAVE_NAMES {
+            let path = save_dir.join(name);
+            if paths_equal(&path, save_path) || !path.is_file() {
+                continue;
+            }
+            let Ok(candidate) = SaveContainer::load(&path) else {
+                continue;
+            };
+            let metrics = world_metrics(&candidate.decompressed)?;
+            if metrics.progress_records >= MIN_PROGRESSED_WORLD_RECORDS {
+                progressed.push((
+                    rotating_save_priority(&path),
+                    modified_or_epoch(&path),
+                    candidate,
+                ));
+            } else if metrics.progress_records <= MAX_STARTER_WORLD_RECORDS {
+                starter_present = true;
+            }
+        }
+    }
+
+    progressed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let rotation_recovery = starter_present && !progressed.is_empty();
+    let baseline_recovery = baseline.as_ref().is_some_and(|candidate| {
+        world_metrics(&candidate.decompressed)
+            .map(|metrics| catastrophic_regression(metrics, canonical_metrics))
+            .unwrap_or(false)
+    });
+
+    let selected = if baseline_recovery {
+        baseline
+    } else if rotation_recovery {
+        progressed.pop().map(|(_, _, candidate)| candidate)
+    } else {
+        None
+    };
+
+    let Some(selected) = selected else {
+        return Ok(WorldRecovery {
+            save: canonical,
+            original_hash,
+            restored: false,
+        });
+    };
+
+    let current_bytes = fs::read(save_path).map_err(io_error)?;
+    if sha256(&current_bytes) != original_hash {
+        return Err(Error::Race);
+    }
+    normalize_rotating_saves(save_path, &selected.raw)?;
+    let restored = SaveContainer::load(save_path)?;
+    Ok(WorldRecovery {
+        original_hash: sha256(&restored.raw),
+        save: restored,
+        restored: true,
+    })
+}
+
+fn normalize_rotating_saves(save_path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let Some(save_dir) = save_path.parent() else {
+        return Err(Error::Io("save target has no parent".into()));
+    };
+    write_atomic(save_path, bytes)?;
+    for name in ROTATING_SAVE_NAMES {
+        let path = save_dir.join(name);
+        if paths_equal(&path, save_path) || !path.exists() {
+            continue;
+        }
+        write_atomic(&path, bytes)?;
+    }
+    Ok(())
+}
+
+fn world_metrics(payload: &[u8]) -> Result<WorldMetrics, Error> {
+    let mut progress_records = 0usize;
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        let key = read_varint(payload, &mut pos)?;
+        let field = key >> 3;
+        match key & 7 {
+            0 => {
+                let _ = read_varint(payload, &mut pos)?;
+            }
+            1 => advance(&mut pos, 8, payload.len())?,
+            2 => {
+                let len = read_varint(payload, &mut pos)? as usize;
+                let end = pos
+                    .checked_add(len)
+                    .filter(|end| *end <= payload.len())
+                    .ok_or_else(|| {
+                        Error::Parse("length-delimited field overruns payload".into())
+                    })?;
+                if field == 11 {
+                    progress_records += 1;
+                }
+                pos = end;
+            }
+            5 => advance(&mut pos, 4, payload.len())?,
+            wire => {
+                return Err(Error::Parse(format!(
+                    "unsupported protobuf wire type {wire}"
+                )))
+            }
+        }
+    }
+    Ok(WorldMetrics { progress_records })
+}
+
+fn catastrophic_regression(baseline: WorldMetrics, current: WorldMetrics) -> bool {
+    baseline.progress_records >= MIN_PROGRESSED_WORLD_RECORDS
+        && current.progress_records <= MAX_STARTER_WORLD_RECORDS
+        && current.progress_records.saturating_mul(2) < baseline.progress_records
+}
+
+fn modified_or_epoch(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn rotating_save_priority(path: &Path) -> u8 {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name.eq_ignore_ascii_case("TEMP_auto.sav") => 4,
+        Some(name) if name.eq_ignore_ascii_case("TEMP_auto.sav_backup0") => 3,
+        Some(name) if name.eq_ignore_ascii_case("TEMP_auto_today.sav") => 2,
+        Some(name) if name.eq_ignore_ascii_case("TEMP_auto_yesterday.sav") => 1,
+        _ => 0,
+    }
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 fn player_records(payload: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
@@ -581,6 +770,21 @@ mod tests {
         out
     }
 
+    fn field11(fill: u8) -> Vec<u8> {
+        vec![0x5a, 0x01, fill]
+    }
+
+    fn world(progress_records: usize, players: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![0x08, 0x01];
+        for index in 0..progress_records {
+            out.extend(field11(index as u8));
+        }
+        for player in players {
+            out.extend(field3(player));
+        }
+        out
+    }
+
     fn player(identity: &str, fill: u8) -> Vec<u8> {
         let mut out = identity.as_bytes().to_vec();
         out.resize(700, fill);
@@ -670,5 +874,84 @@ mod tests {
         let parsed = SaveContainer::load(&save_path).unwrap();
         assert_eq!(parsed.chunks.len(), 2);
         assert!(parsed.decompressed.starts_with(&current));
+    }
+
+    #[test]
+    fn repairs_a_mixed_rotating_set_before_protection() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let george = player("NULL:Havlas-11111111111111111111111111111111", 0x41);
+        let progressed_today = synthetic_save(&world(76, std::slice::from_ref(&george)));
+        let progressed_yesterday = synthetic_save(&world(68, std::slice::from_ref(&george)));
+        let starter = synthetic_save(&world(9, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(&canonical, &starter).unwrap();
+        fs::write(save_dir.join("TEMP_auto.sav_backup0"), &starter).unwrap();
+        fs::write(save_dir.join("TEMP_auto_today.sav"), &progressed_today).unwrap();
+        fs::write(
+            save_dir.join("TEMP_auto_yesterday.sav"),
+            &progressed_yesterday,
+        )
+        .unwrap();
+
+        let outcome = protect(&canonical, &ledger).unwrap();
+
+        assert!(outcome.world_restored);
+        assert_eq!(outcome.world_records, 76);
+        for name in ROTATING_SAVE_NAMES {
+            assert_eq!(fs::read(save_dir.join(name)).unwrap(), progressed_today);
+        }
+        assert_eq!(
+            fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(),
+            progressed_today
+        );
+    }
+
+    #[test]
+    fn restores_the_full_world_from_the_protected_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let george = player("NULL:Havlas-11111111111111111111111111111111", 0x41);
+        let progressed = synthetic_save(&world(77, std::slice::from_ref(&george)));
+        let starter = synthetic_save(&world(9, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        for name in ROTATING_SAVE_NAMES {
+            fs::write(save_dir.join(name), &progressed).unwrap();
+        }
+        let seeded = protect(&canonical, &ledger).unwrap();
+        assert!(!seeded.world_restored);
+
+        for name in ROTATING_SAVE_NAMES {
+            fs::write(save_dir.join(name), &starter).unwrap();
+        }
+        let restored = protect(&canonical, &ledger).unwrap();
+
+        assert!(restored.world_restored);
+        assert_eq!(restored.world_records, 77);
+        for name in ROTATING_SAVE_NAMES {
+            assert_eq!(fs::read(save_dir.join(name)).unwrap(), progressed);
+        }
+    }
+
+    #[test]
+    fn accepts_an_intentional_starter_world_after_protection_state_is_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(&canonical, synthetic_save(&world(50, &[]))).unwrap();
+        protect(&canonical, &ledger).unwrap();
+
+        fs::remove_dir_all(&ledger).unwrap();
+        fs::write(&canonical, synthetic_save(&world(9, &[]))).unwrap();
+        let result = protect(&canonical, &ledger).unwrap();
+
+        assert!(!result.world_restored);
+        assert_eq!(result.world_records, 9);
     }
 }

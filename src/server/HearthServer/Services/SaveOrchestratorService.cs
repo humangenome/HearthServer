@@ -405,6 +405,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             }
 
             bool savesMovedAside = false;
+            bool incomingInstalled = false;
             try
             {
                 Directory.CreateDirectory(stagingDir);
@@ -419,6 +420,11 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                     savesMovedAside = true;
                 }
                 Directory.Move(stagingDir, saveGamesDir);
+                incomingInstalled = true;
+                if (!_saveProtection.ResetForWorldReplacement())
+                {
+                    throw new IOException("save protection state could not be reset for replacement world");
+                }
                 if (Directory.Exists(prevDir))
                 {
                     try { Directory.Delete(prevDir, recursive: true); } catch { /* best effort */ }
@@ -429,7 +435,25 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 // Rollback. If we already renamed the live SaveGames out to
                 // prevDir but couldn't get staging into place, restore the
                 // original so the customer doesn't end up with NO save dir.
-                if (savesMovedAside && Directory.Exists(prevDir) && !Directory.Exists(saveGamesDir))
+                if (incomingInstalled && savesMovedAside && Directory.Exists(prevDir))
+                {
+                    try
+                    {
+                        if (Directory.Exists(saveGamesDir))
+                        {
+                            Directory.Delete(saveGamesDir, recursive: true);
+                        }
+                        Directory.Move(prevDir, saveGamesDir);
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        _log.LogError(rollbackEx,
+                            "CRITICAL: rollback of SaveGames from {Prev} to {Live} failed after replacement error; " +
+                            "manual recovery may be required",
+                            prevDir, saveGamesDir);
+                    }
+                }
+                else if (savesMovedAside && Directory.Exists(prevDir) && !Directory.Exists(saveGamesDir))
                 {
                     try { Directory.Move(prevDir, saveGamesDir); }
                     catch (Exception rollbackEx)

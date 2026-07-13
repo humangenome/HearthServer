@@ -14,15 +14,18 @@ public sealed class SaveProtectionService
 {
     private readonly ILogger<SaveProtectionService> _log;
     private readonly HearthServerOptions _opts;
+    private readonly HearthRestartCoordinator _coordinator;
     private readonly string _guardPath;
     private readonly string _ledgerDir;
 
     public SaveProtectionService(
         ILogger<SaveProtectionService> log,
-        IOptions<HearthServerOptions> opts)
+        IOptions<HearthServerOptions> opts,
+        HearthRestartCoordinator coordinator)
     {
         _log = log;
         _opts = opts.Value;
+        _coordinator = coordinator;
         _guardPath = Path.Combine(AppContext.BaseDirectory, "HearthSaveGuard.exe");
         _ledgerDir = Path.Combine(AppContext.BaseDirectory, "data", "player-records");
     }
@@ -87,11 +90,52 @@ public sealed class SaveProtectionService
                 return false;
             }
             _log.LogInformation("Save protection complete: {Result}", Bounded(stdout));
+            if (stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Contains("world_restored=1", StringComparer.Ordinal))
+            {
+                _log.LogWarning(
+                    "Bellwright world regression recovered; recycling the owned game process so it reloads the protected world");
+                _coordinator.KillGame(TimeSpan.FromSeconds(20));
+            }
             return true;
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "Save protection helper failed");
+            return false;
+        }
+    }
+
+    public bool ResetForWorldReplacement()
+    {
+        var previous = _ledgerDir + ".replaced-" + Guid.NewGuid().ToString("N")[..8];
+        var moved = false;
+        try
+        {
+            if (Directory.Exists(_ledgerDir))
+            {
+                Directory.Move(_ledgerDir, previous);
+                moved = true;
+            }
+            Directory.CreateDirectory(_ledgerDir);
+            if (moved)
+            {
+                try { Directory.Delete(previous, recursive: true); } catch { }
+            }
+            _log.LogInformation("Save protection state reset for replacement world");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (moved && !Directory.Exists(_ledgerDir) && Directory.Exists(previous))
+                {
+                    Directory.Move(previous, _ledgerDir);
+                }
+            }
+            catch { }
+            _log.LogError(ex, "Save protection state could not be reset for replacement world");
             return false;
         }
     }
