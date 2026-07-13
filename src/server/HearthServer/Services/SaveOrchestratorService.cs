@@ -57,13 +57,10 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         {
             throw new InvalidOperationException("Bellwright save protection failed during Hearth startup");
         }
-        if (_opts.SnapshotsEnabled)
+        TryStartFileWatcher();
+        if (!_opts.SnapshotsEnabled)
         {
-            TryStartFileWatcher();
-        }
-        else
-        {
-            _log.LogInformation("Auto-snapshot FileSystemWatcher disabled by config (SnapshotsEnabled=false)");
+            _log.LogInformation("FileSystemWatcher is running in save-protection-only mode (SnapshotsEnabled=false)");
         }
     }
 
@@ -83,8 +80,9 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     /// <summary>
     /// Watch the game's SaveGames dir for auto-save writes. Bellwright versions
     /// have used both savegame_N.sav and TEMP_auto*.sav names. When a supported
-    /// file changes, debounce and trigger a Hearth snapshot. This is the "Hearth
-    /// snapshots, Bellwright owns the trigger" model — no save RPC needed.
+    /// file changes, debounce and protect the canonical save, then create a
+    /// snapshot when snapshots are enabled. Bellwright owns the trigger, so no
+    /// save RPC is needed for protection-only mode.
     /// </summary>
     private void TryStartFileWatcher()
     {
@@ -106,11 +104,11 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             _watcher.Changed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
             _watcher.Created += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
             _watcher.Renamed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
-            _log.LogInformation("FileSystemWatcher armed on {Dir} (Bellwright save files)", sourceDir);
+            _log.LogInformation("Save protection FileSystemWatcher armed on {Dir} (Bellwright save files)", sourceDir);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "FileSystemWatcher failed to start; auto-snapshots disabled");
+            _log.LogWarning(ex, "FileSystemWatcher failed to start; runtime save protection unavailable");
         }
     }
 
@@ -150,7 +148,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         if (!IsRootSaveSlotPath(Path.GetFileName(path))) return;
 
         // Debounce: Bellwright may emit multiple write events per save (size, mtime,
-        // last access). Only one snapshot per AutoSnapshotDebounce window.
+        // last access). Only one protection pass per AutoSnapshotDebounce window.
         if (!await _autoLock.WaitAsync(0).ConfigureAwait(false)) return;
         try
         {
@@ -160,7 +158,13 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
             if (!await _saveProtection.ProtectCanonicalAsync().ConfigureAwait(false))
             {
-                _log.LogError("Auto-snapshot skipped because save protection failed");
+                _log.LogError("FileSystemWatcher pass failed because save protection failed");
+                return;
+            }
+            if (!_opts.SnapshotsEnabled)
+            {
+                _lastAutoSnapshotUtc = now;
+                _log.LogInformation("Save protection fired from {Path}", path);
                 return;
             }
             var rec = await SnapshotAsync(requestedBy: "auto:filewatcher", CancellationToken.None).ConfigureAwait(false);
@@ -172,7 +176,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Auto-snapshot from FileSystemWatcher failed for {Path}", path);
+            _log.LogWarning(ex, "Save protection from FileSystemWatcher failed for {Path}", path);
         }
         finally
         {

@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.64] - 2026-07-13
+
+- Keeps offline player records protected after every Bellwright automatic save,
+  including installations where snapshot archives are disabled.
+
 ## [0.1.63] - 2026-07-13
 
 - Preserves established offline player records when Bellwright rewrites an
