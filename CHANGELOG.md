@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.74] - 2026-07-14
+
+- Makes Bellwright operator save requests retry safely when Unreal reflection
+  is temporarily unavailable and records the failure reason in the host log.
+
 ## [0.1.73] - 2026-07-14
 
 Version-lockstep release with Hearth v0.1.73. The launcher now verifies and
