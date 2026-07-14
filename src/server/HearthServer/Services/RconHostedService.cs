@@ -66,7 +66,7 @@ public sealed class RconHostedService : IHostedService
         _log.LogDebug("RCON dispatch: cmd={Cmd} argLen={ArgLen}", head, rest.Length);
         return head switch
         {
-            "help"     => "commands: status, players, ping, save snapshot, save list, save restore <id>, say <msg>, announce <msg>, motd [msg]",
+            "help"     => "commands: status, players, ping, save game, save snapshot, save list, save restore <id>, say <msg>, announce <msg>, motd [msg]",
             "status"   => BuildStatus(),
             "players"  => BuildPlayers(),
             "ping"     => "pong",
@@ -101,6 +101,8 @@ public sealed class RconHostedService : IHostedService
     private async Task<string> HandleSaveAsync(string sub)
     {
         var arg = sub.Trim();
+        if (arg.Equals("game", StringComparison.OrdinalIgnoreCase))
+            return RequestGameSave();
         if (string.IsNullOrEmpty(arg) || arg.Equals("snapshot", StringComparison.OrdinalIgnoreCase))
         {
             // The game host auto-saves to <userdir>/Saved/SaveGames every ~60s.
@@ -132,7 +134,38 @@ public sealed class RconHostedService : IHostedService
                 ? $"restore ok: {snapshotId}"
                 : $"restore failed: {snapshotId} (not found, missing, or invalid; check hearth log)";
         }
-        return "usage: save snapshot | save list | save restore <id>";
+        return "usage: save game | save snapshot | save list | save restore <id>";
+    }
+
+    private string RequestGameSave()
+    {
+        if (!OperatingSystem.IsWindows())
+            return "game save unavailable on this platform";
+
+        try
+        {
+            var windowsDirectory = Environment.GetEnvironmentVariable("WINDIR") ?? @"C:\Windows";
+            var markerPath = GameSaveMarkerPath(_opts.GameplayPort, windowsDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(markerPath)!);
+            File.WriteAllText(markerPath, DateTimeOffset.UtcNow.ToString("O"));
+            _log.LogInformation("Bellwright game save requested for gameplay port {Port}", _opts.GameplayPort);
+            return "game save requested";
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Bellwright game save request failed for gameplay port {Port}", _opts.GameplayPort);
+            return "game save request failed (check hearth log)";
+        }
+    }
+
+    internal static string GameSaveMarkerPath(int gameplayPort, string windowsDirectory)
+    {
+        if (gameplayPort is < 1 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(gameplayPort));
+        if (string.IsNullOrWhiteSpace(windowsDirectory))
+            throw new ArgumentException("Windows directory is required", nameof(windowsDirectory));
+
+        return Path.Combine(windowsDirectory, "Temp", $"hearth_force_save_{gameplayPort}.marker");
     }
 
     private string BuildStatus()
