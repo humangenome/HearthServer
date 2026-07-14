@@ -4,6 +4,14 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.75] - 2026-07-14
+
+- Invokes Bellwright operator saves through the already-validated component
+  after the game-thread handoff, avoiding a redundant reflected-object check
+  that could stall the callback.
+- Records game-thread callback entry while retaining the request marker until
+  the save invocation succeeds.
+
 ## [0.1.74] - 2026-07-14
 
 - Makes Bellwright operator save requests retry safely when Unreal reflection
