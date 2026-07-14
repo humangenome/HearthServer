@@ -51,6 +51,7 @@ pub struct Outcome {
     pub restored_records: usize,
     pub world_records: usize,
     pub world_restored: bool,
+    pub world_regression_detected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,7 @@ struct WorldRecovery {
     save: SaveContainer,
     original_hash: [u8; 32],
     restored: bool,
+    regression_detected: bool,
 }
 
 #[derive(Clone)]
@@ -243,13 +245,45 @@ impl SaveContainer {
 }
 
 pub fn protect(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
+    protect_with_mode(save_path, ledger_dir, true)
+}
+
+pub fn protect_live(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
+    protect_with_mode(save_path, ledger_dir, false)
+}
+
+fn protect_with_mode(
+    save_path: &Path,
+    ledger_dir: &Path,
+    allow_world_recovery: bool,
+) -> Result<Outcome, Error> {
     fs::create_dir_all(ledger_dir).map_err(io_error)?;
     let _lock = DirectoryLock::acquire(ledger_dir)?;
-    let recovery = recover_world(save_path, ledger_dir)?;
+    let recovery = if allow_world_recovery {
+        recover_world(save_path, ledger_dir)?
+    } else {
+        inspect_live_world(save_path, ledger_dir)?
+    };
     let save = recovery.save;
     let original_hash = recovery.original_hash;
     let world = world_metrics(&save.decompressed)?;
     let current = player_records(&save.decompressed)?;
+
+    if recovery.regression_detected {
+        let current_identities = current
+            .iter()
+            .filter_map(|record| record_identity(record).transpose())
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        return Ok(Outcome {
+            current_records: current_identities.len(),
+            ledger_updates: 0,
+            restored_records: 0,
+            world_records: world.progress_records,
+            world_restored: false,
+            world_regression_detected: true,
+        });
+    }
+
     let mut ledger = load_ledger(ledger_dir)?;
     let mut current_identities = BTreeSet::new();
     let mut ledger_updates = 0usize;
@@ -314,6 +348,27 @@ pub fn protect(save_path: &Path, ledger_dir: &Path) -> Result<Outcome, Error> {
         restored_records: missing.len(),
         world_records: world.progress_records,
         world_restored: recovery.restored,
+        world_regression_detected: false,
+    })
+}
+
+fn inspect_live_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, Error> {
+    let canonical = SaveContainer::load(save_path)?;
+    let original_hash = sha256(&canonical.raw);
+    let canonical_metrics = world_metrics(&canonical.decompressed)?;
+    let baseline_path = ledger_dir.join(WORLD_BASELINE_FILE);
+    let regression_detected = if baseline_path.exists() {
+        let baseline = SaveContainer::load(&baseline_path)?;
+        catastrophic_regression(world_metrics(&baseline.decompressed)?, canonical_metrics)
+    } else {
+        false
+    };
+
+    Ok(WorldRecovery {
+        save: canonical,
+        original_hash,
+        restored: false,
+        regression_detected,
     })
 }
 
@@ -382,6 +437,7 @@ fn recover_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, E
             save: canonical,
             original_hash,
             restored: false,
+            regression_detected: false,
         });
     };
 
@@ -395,6 +451,7 @@ fn recover_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, E
         original_hash: sha256(&restored.raw),
         save: restored,
         restored: true,
+        regression_detected: false,
     })
 }
 
@@ -906,6 +963,68 @@ mod tests {
         assert_eq!(
             fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(),
             progressed_today
+        );
+    }
+
+    #[test]
+    fn live_protection_detects_regression_without_rewriting_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let george = player("NULL:Havlas-11111111111111111111111111111111", 0x41);
+        let progressed = synthetic_save(&world(76, std::slice::from_ref(&george)));
+        let starter = synthetic_save(&world(9, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        for name in ROTATING_SAVE_NAMES {
+            fs::write(save_dir.join(name), &progressed).unwrap();
+        }
+        protect(&canonical, &ledger).unwrap();
+
+        fs::write(&canonical, &starter).unwrap();
+        fs::write(save_dir.join("TEMP_auto.sav_backup0"), &starter).unwrap();
+        let before: BTreeMap<&str, Vec<u8>> = ROTATING_SAVE_NAMES
+            .iter()
+            .map(|name| (*name, fs::read(save_dir.join(name)).unwrap()))
+            .collect();
+
+        let outcome = protect_live(&canonical, &ledger).unwrap();
+
+        assert!(outcome.world_regression_detected);
+        assert!(!outcome.world_restored);
+        for name in ROTATING_SAVE_NAMES {
+            assert_eq!(fs::read(save_dir.join(name)).unwrap(), before[name]);
+        }
+        assert_eq!(
+            fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(),
+            progressed
+        );
+    }
+
+    #[test]
+    fn live_protection_does_not_normalize_a_mixed_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let canonical_bytes = synthetic_save(&world(80, &[]));
+        let starter = synthetic_save(&world(9, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(&canonical, &canonical_bytes).unwrap();
+        fs::write(save_dir.join("TEMP_auto.sav_backup0"), &starter).unwrap();
+
+        let outcome = protect_live(&canonical, &ledger).unwrap();
+
+        assert!(!outcome.world_regression_detected);
+        assert!(!outcome.world_restored);
+        assert_eq!(fs::read(&canonical).unwrap(), canonical_bytes);
+        assert_eq!(
+            fs::read(save_dir.join("TEMP_auto.sav_backup0")).unwrap(),
+            starter
+        );
+        assert_eq!(
+            fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(),
+            canonical_bytes
         );
     }
 

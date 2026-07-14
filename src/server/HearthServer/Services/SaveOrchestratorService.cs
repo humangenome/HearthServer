@@ -27,8 +27,13 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     private readonly string _dbPath;
     private FileSystemWatcher? _watcher;
     private readonly System.Threading.SemaphoreSlim _autoLock = new(1, 1);
+    private readonly object _watcherGate = new();
+    private CancellationTokenSource? _watcherDebounceCts;
     private DateTime _lastAutoSnapshotUtc = DateTime.MinValue;
     private static readonly TimeSpan AutoSnapshotDebounce = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan SaveQuietSample = TimeSpan.FromSeconds(2);
+    private const int SaveQuietSamplesRequired = 2;
+    private const int SaveQuietSampleLimit = 15;
 
     public SaveOrchestratorService(
         ILogger<SaveOrchestratorService> log,
@@ -53,7 +58,8 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         _log.LogInformation("Save orchestrator ready; db={Path}, save_dir={Dir}, snapshots_enabled={Enabled}",
             _dbPath, _opts.SaveDir, _opts.SnapshotsEnabled);
         TryNormalizeSaveSlots();
-        if (!await _saveProtection.ProtectCanonicalAsync(ct).ConfigureAwait(false))
+        var allowWorldRecovery = !_coordinator.IsOwnedGameRunning();
+        if (!await _saveProtection.ProtectCanonicalAsync(allowWorldRecovery, ct).ConfigureAwait(false))
         {
             throw new InvalidOperationException("Bellwright save protection failed during Hearth startup");
         }
@@ -66,6 +72,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
     public Task StopAsync(CancellationToken _)
     {
+        CancelPendingWatcherPass();
         try { _watcher?.Dispose(); } catch { }
         _watcher = null;
         return Task.CompletedTask;
@@ -73,6 +80,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
     public void Dispose()
     {
+        CancelPendingWatcherPass();
         try { _watcher?.Dispose(); } catch { }
         try { _autoLock.Dispose(); } catch { }
     }
@@ -101,9 +109,9 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 IncludeSubdirectories = false,
                 EnableRaisingEvents = true,
             };
-            _watcher.Changed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
-            _watcher.Created += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
-            _watcher.Renamed += (_, e) => _ = OnSaveFileChangedAsync(e.FullPath);
+            _watcher.Changed += (_, e) => QueueSaveFileChanged(e.FullPath);
+            _watcher.Created += (_, e) => QueueSaveFileChanged(e.FullPath);
+            _watcher.Renamed += (_, e) => QueueSaveFileChanged(e.FullPath);
             _log.LogInformation("Save protection FileSystemWatcher armed on {Dir} (Bellwright save files)", sourceDir);
         }
         catch (Exception ex)
@@ -143,26 +151,45 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         }
     }
 
-    private async Task OnSaveFileChangedAsync(string path)
+    private void QueueSaveFileChanged(string path)
     {
         if (!IsRootSaveSlotPath(Path.GetFileName(path))) return;
 
-        // Debounce: Bellwright may emit multiple write events per save (size, mtime,
-        // last access). Only one protection pass per AutoSnapshotDebounce window.
-        if (!await _autoLock.WaitAsync(0).ConfigureAwait(false)) return;
+        var next = new CancellationTokenSource();
+        CancellationTokenSource? previous;
+        lock (_watcherGate)
+        {
+            previous = _watcherDebounceCts;
+            _watcherDebounceCts = next;
+        }
+        try { previous?.Cancel(); } catch { }
+        _ = OnSaveFilesQuietAsync(path, next);
+    }
+
+    private async Task OnSaveFilesQuietAsync(string path, CancellationTokenSource debounce)
+    {
+        var lockHeld = false;
         try
         {
-            var now = DateTime.UtcNow;
-            if (now - _lastAutoSnapshotUtc < AutoSnapshotDebounce) return;
-            // Wait briefly for Bellwright to finish its write
-            await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-            if (!await _saveProtection.ProtectCanonicalAsync().ConfigureAwait(false))
+            var sourceDir = Path.GetDirectoryName(path);
+            if (string.IsNullOrWhiteSpace(sourceDir) ||
+                !await WaitForSaveSetQuietAsync(sourceDir, debounce.Token).ConfigureAwait(false))
             {
-                _log.LogError("FileSystemWatcher pass failed because save protection failed");
+                _log.LogWarning("Save protection skipped because Bellwright's rotating saves did not settle");
                 return;
             }
+
+            await _autoLock.WaitAsync(debounce.Token).ConfigureAwait(false);
+            lockHeld = true;
+            var now = DateTime.UtcNow;
+            if (now - _lastAutoSnapshotUtc < AutoSnapshotDebounce) return;
             if (!_opts.SnapshotsEnabled)
             {
+                if (!await _saveProtection.ProtectCanonicalAsync(false, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _log.LogError("FileSystemWatcher pass failed because save protection failed");
+                    return;
+                }
                 _lastAutoSnapshotUtc = now;
                 _log.LogInformation("Save protection fired from {Path}", path);
                 return;
@@ -174,14 +201,83 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 _log.LogInformation("Auto-snapshot {Id} fired from {Path}", rec.SnapshotId, path);
             }
         }
+        catch (OperationCanceledException) when (debounce.IsCancellationRequested)
+        {
+        }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Save protection from FileSystemWatcher failed for {Path}", path);
         }
         finally
         {
-            _autoLock.Release();
+            if (lockHeld) _autoLock.Release();
+            lock (_watcherGate)
+            {
+                if (ReferenceEquals(_watcherDebounceCts, debounce))
+                {
+                    _watcherDebounceCts = null;
+                }
+            }
+            debounce.Dispose();
         }
+    }
+
+    private static async Task<bool> WaitForSaveSetQuietAsync(string sourceDir, CancellationToken ct)
+    {
+        var previous = CaptureRootSaveSet(sourceDir);
+        var stable = 0;
+        for (var sample = 0; sample < SaveQuietSampleLimit; sample++)
+        {
+            await Task.Delay(SaveQuietSample, ct).ConfigureAwait(false);
+            var current = CaptureRootSaveSet(sourceDir);
+            if (current is not null && current == previous)
+            {
+                stable++;
+                if (stable >= SaveQuietSamplesRequired) return true;
+            }
+            else
+            {
+                stable = 0;
+            }
+            previous = current;
+        }
+        return false;
+    }
+
+    private static string? CaptureRootSaveSet(string sourceDir)
+    {
+        try
+        {
+            var entries = Directory.EnumerateFiles(sourceDir, "*", SearchOption.TopDirectoryOnly)
+                .Where(path => IsRootSaveSlotPath(Path.GetFileName(path)))
+                .Select(path =>
+                {
+                    var info = new FileInfo(path);
+                    return $"{info.Name.ToUpperInvariant()}:{info.Length}:{info.LastWriteTimeUtc.Ticks}";
+                })
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToArray();
+            return entries.Length == 0 ? null : string.Join('|', entries);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private void CancelPendingWatcherPass()
+    {
+        CancellationTokenSource? pending;
+        lock (_watcherGate)
+        {
+            pending = _watcherDebounceCts;
+            _watcherDebounceCts = null;
+        }
+        try { pending?.Cancel(); } catch { }
     }
 
     /// <summary>
@@ -212,7 +308,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             }
 
             // Protect the final, quiesced bytes immediately before archiving them.
-            if (!await _saveProtection.ProtectCanonicalAsync(ct).ConfigureAwait(false))
+            if (!await _saveProtection.ProtectCanonicalAsync(false, ct).ConfigureAwait(false))
             {
                 _log.LogError("Snapshot {Id} refused because save protection failed", snapshotId);
                 return null;

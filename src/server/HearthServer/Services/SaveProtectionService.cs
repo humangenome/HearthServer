@@ -27,7 +27,9 @@ public sealed class SaveProtectionService
         _ledgerDir = Path.Combine(AppContext.BaseDirectory, "data", "player-records");
     }
 
-    public async Task<bool> ProtectCanonicalAsync(CancellationToken ct = default)
+    public async Task<bool> ProtectCanonicalAsync(
+        bool allowWorldRecovery,
+        CancellationToken ct = default)
     {
         var savePath = CanonicalSavePath();
         if (savePath is null)
@@ -54,6 +56,10 @@ public sealed class SaveProtectionService
         start.ArgumentList.Add(savePath);
         start.ArgumentList.Add("--ledger");
         start.ArgumentList.Add(_ledgerDir);
+        if (!allowWorldRecovery)
+        {
+            start.ArgumentList.Add("--live");
+        }
 
         try
         {
@@ -92,6 +98,12 @@ public sealed class SaveProtectionService
             {
                 _log.LogWarning(
                     "Bellwright world regression recovered on disk; leaving the already-loaded world online to avoid an autosave restart loop");
+            }
+            if (stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Contains("world_regression_detected=1", StringComparer.Ordinal))
+            {
+                _log.LogError(
+                    "Bellwright world regression detected during a live save; preserving the protected baseline without rewriting the active rotation");
             }
             return true;
         }
