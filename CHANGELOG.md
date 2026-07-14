@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.72] - 2026-07-14
+
+- Makes the authenticated Bellwright `save game` command reliably reach the live game-thread save function.
+- Keeps failed save requests pending with a clear host-log reason instead of silently losing the callback.
+
 ## [0.1.71] - 2026-07-14
 
 - Writes native Bellwright save-request markers beside the managed game PID
