@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.70] - 2026-07-14
+
+- Adds authenticated RCON `save game` to request a port-scoped native
+  Bellwright save for recovery verification.
+
 ## [0.1.69] - 2026-07-14
 
 - Waits for Bellwright's rotating save set to settle before live protection
