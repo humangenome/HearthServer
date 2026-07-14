@@ -4,6 +4,14 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.69] - 2026-07-14
+
+- Waits for Bellwright's rotating save set to settle before live protection
+  reads it.
+- Detects a live world regression without rewriting files that the game is
+  actively rotating, while preserving the verified offline baseline for the
+  next safe startup recovery.
+
 ## [0.1.68] - 2026-07-14
 
 Version-lockstep release with Hearth v0.1.68. The bundled Bellwright host now
