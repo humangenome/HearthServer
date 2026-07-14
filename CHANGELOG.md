@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.71] - 2026-07-14
+
+- Writes native Bellwright save-request markers beside the managed game PID
+  file so the live UE4SS host can consume them reliably.
+
 ## [0.1.70] - 2026-07-14
 
 - Adds authenticated RCON `save game` to request a port-scoped native
