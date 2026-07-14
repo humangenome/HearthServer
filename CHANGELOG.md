@@ -4,6 +4,12 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.73] - 2026-07-14
+
+Version-lockstep release with Hearth v0.1.73. The launcher now verifies and
+repairs stale, missing, or damaged HearthConnect files before joining. There
+are no behavioral changes to the .NET server source in this repository.
+
 ## [0.1.72] - 2026-07-14
 
 - Makes the authenticated Bellwright `save game` command reliably reach the live game-thread save function.
