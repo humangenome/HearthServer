@@ -145,7 +145,7 @@ public sealed class RconHostedService : IHostedService
         try
         {
             var windowsDirectory = Environment.GetEnvironmentVariable("WINDIR") ?? @"C:\Windows";
-            var markerPath = GameSaveMarkerPath(_opts.GameplayPort, windowsDirectory);
+            var markerPath = GameSaveMarkerPath(_opts.GameplayPort, _opts.GamePidFile, windowsDirectory);
             Directory.CreateDirectory(Path.GetDirectoryName(markerPath)!);
             File.WriteAllText(markerPath, DateTimeOffset.UtcNow.ToString("O"));
             _log.LogInformation("Bellwright game save requested for gameplay port {Port}", _opts.GameplayPort);
@@ -158,14 +158,24 @@ public sealed class RconHostedService : IHostedService
         }
     }
 
-    internal static string GameSaveMarkerPath(int gameplayPort, string windowsDirectory)
+    internal static string GameSaveMarkerPath(int gameplayPort, string gamePidFile, string windowsDirectory)
     {
         if (gameplayPort is < 1 or > 65535)
             throw new ArgumentOutOfRangeException(nameof(gameplayPort));
-        if (string.IsNullOrWhiteSpace(windowsDirectory))
-            throw new ArgumentException("Windows directory is required", nameof(windowsDirectory));
+        if (string.IsNullOrWhiteSpace(gamePidFile) && string.IsNullOrWhiteSpace(windowsDirectory))
+            throw new ArgumentException("Windows directory is required when no game PID file is configured", nameof(windowsDirectory));
 
-        return Path.Combine(windowsDirectory, "Temp", $"hearth_force_save_{gameplayPort}.marker");
+        var markerDirectory = Path.Combine(windowsDirectory, "Temp");
+        if (!string.IsNullOrWhiteSpace(gamePidFile))
+        {
+            var normalizedPidFile = gamePidFile.Trim();
+            var separator = Math.Max(normalizedPidFile.LastIndexOf('\\'), normalizedPidFile.LastIndexOf('/'));
+            markerDirectory = separator > 0 ? normalizedPidFile[..separator] : "";
+        }
+        if (string.IsNullOrWhiteSpace(markerDirectory))
+            throw new ArgumentException("A marker directory could not be resolved", nameof(gamePidFile));
+
+        return Path.Combine(markerDirectory, $"hearth_force_save_{gameplayPort}.marker");
     }
 
     private string BuildStatus()
