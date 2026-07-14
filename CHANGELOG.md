@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.68] - 2026-07-14
+
+Version-lockstep release with Hearth v0.1.68. The bundled Bellwright host now
+guards optional game fields during player and world-object cleanup, preventing
+server crashes during joins, disconnects, and garbage collection. There are no
+behavioral changes to the .NET server source in this repository.
+
 ## [0.1.67] - 2026-07-13
 
 - Keeps the running Bellwright world online after repairing a regressed
