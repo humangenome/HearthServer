@@ -4,6 +4,12 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.76] - 2026-07-16
+
+Version-lockstep release with Hearth v0.1.76. The bundled Bellwright host and
+client runtime now support Bellwright Steam build 24204729. There are no
+behavioral changes to the public .NET server source in this repository.
+
 ## [0.1.75] - 2026-07-14
 
 - Invokes Bellwright operator saves through the already-validated component
