@@ -4,12 +4,18 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.78] - 2026-07-17
+
+Version-lockstep release with Hearth v0.1.78. The bundled Bellwright host now
+uses the game's targeted fast-travel icon path for completed Travel Signs while
+keeping map fog disabled on headless servers. There are no behavioral changes
+to the public .NET server source in this repository.
+
 ## [0.1.77] - 2026-07-17
 
-Version-lockstep release with Hearth v0.1.77. The bundled Bellwright host now
-keeps map discovery active on headless servers so completed Travel Signs appear
-as fast-travel destinations. There are no behavioral changes to the public
-.NET server source in this repository.
+Superseded by v0.1.78. This version's broader map-fog approach was not retained
+because it was unsafe on null-rendering headless hosts. There were no behavioral
+changes to the public .NET server source in this repository.
 
 ## [0.1.76] - 2026-07-16
 
