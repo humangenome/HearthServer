@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.77] - 2026-07-17
+
+Version-lockstep release with Hearth v0.1.77. The bundled Bellwright host now
+keeps map discovery active on headless servers so completed Travel Signs appear
+as fast-travel destinations. There are no behavioral changes to the public
+.NET server source in this repository.
+
 ## [0.1.76] - 2026-07-16
 
 Version-lockstep release with Hearth v0.1.76. The bundled Bellwright host and
