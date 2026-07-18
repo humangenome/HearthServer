@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.81] - 2026-07-17
+
+Version-lockstep release with Hearth v0.1.81. The bundled Bellwright host makes
+Travel Signs available immediately when they are completed during an active
+multiplayer session. There are no behavioral changes to the .NET server source
+in this repository.
+
 ## [0.1.80] - 2026-07-17
 
 Version-lockstep release with Hearth v0.1.80. The bundled Bellwright host now
