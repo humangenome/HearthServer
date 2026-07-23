@@ -48,6 +48,7 @@ public static class Program
             builder.Services.AddSingleton<PipeServerState>();
             builder.Services.AddSingleton<HearthRestartCoordinator>();
             builder.Services.AddSingleton<SaveProtectionService>();
+            builder.Services.AddSingleton<AdminJoinTicketService>();
 
             builder.Services.AddSingleton<SaveOrchestratorService>();
             builder.Services.AddSingleton<ChatService>();

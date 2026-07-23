@@ -46,6 +46,7 @@ public sealed class HearthHttpService : BackgroundService
     private readonly PipeServerState _pipeState;
     private readonly InstanceIdentityProvider _identity;
     private readonly ChatService _chat;
+    private readonly AdminJoinTicketService _adminJoinTickets;
     private readonly byte[] _authKey;
     private readonly SemaphoreSlim _requestLimiter = new(MaxConcurrentRequests, MaxConcurrentRequests);
     // Sliding window of signatures we've already accepted, so a captured
@@ -62,7 +63,8 @@ public sealed class HearthHttpService : BackgroundService
         SaveOrchestratorService saves,
         PipeServerState pipeState,
         InstanceIdentityProvider identity,
-        ChatService chat)
+        ChatService chat,
+        AdminJoinTicketService adminJoinTickets)
     {
         _log = log;
         _opts = opts.Value;
@@ -71,6 +73,7 @@ public sealed class HearthHttpService : BackgroundService
         _pipeState = pipeState;
         _identity = identity;
         _chat = chat;
+        _adminJoinTickets = adminJoinTickets;
         // The HTTP API auth secret is SHA256(RconPassword). Same trust tier
         // as RCON — if the customer has set an RCON password, they already
         // expose admin control of the world. Deriving from RconPassword
@@ -484,6 +487,34 @@ public sealed class HearthHttpService : BackgroundService
                     gameplay_port = _opts.GameplayPort,
                     query_port = _opts.QueryPort,
                     max_players = _opts.MaxPlayers,
+                });
+                return;
+            }
+
+            if (method == "POST" && path == "/api/v1/admin/join-ticket")
+            {
+                var ticketRequest = await ParseJsonBodyAsync<AdminJoinTicketRequest>(body, ct).ConfigureAwait(false);
+                body.Dispose();
+                if (ticketRequest is null
+                    || !AdminJoinTicketService.IsValidSteam64(ticketRequest.SteamId))
+                {
+                    await WriteJsonAsync(res, 400, new { error = "valid steam_id required" });
+                    return;
+                }
+
+                var ticket = _adminJoinTickets.Issue(
+                    ticketRequest.SteamId,
+                    req.RemoteEndPoint?.Address?.ToString());
+                if (ticket is null)
+                {
+                    await WriteJsonAsync(res, 403, new { error = "steam_id is not a configured admin" });
+                    return;
+                }
+
+                await WriteJsonAsync(res, 200, new
+                {
+                    token = ticket.Token,
+                    expires_unix = ticket.ExpiresUnix,
                 });
                 return;
             }
@@ -976,6 +1007,11 @@ public sealed class HearthHttpService : BackgroundService
     private sealed class MotdRequest
     {
         public string? Msg { get; set; }
+    }
+
+    private sealed class AdminJoinTicketRequest
+    {
+        public string SteamId { get; set; } = "";
     }
 
     private sealed class ChatPlayerRequest

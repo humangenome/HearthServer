@@ -4,6 +4,20 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.83] - 2026-07-23
+
+- Adds RCON-authenticated, short-lived admin join tickets bound to a configured
+  Steam64 ID and connection address.
+- Grants Bellwright's native host-player gameplay-settings authority only after
+  the host overlay consumes a matching one-use ticket.
+- Redacts join passwords and admin tickets from HearthServer's mirrored game logs.
+
+## [0.1.82] - 2026-07-22
+
+Version-lockstep release with Hearth v0.1.82. This release hardened launcher
+resource use and version checks; there were no behavioral changes to the public
+.NET server source in this repository.
+
 ## [0.1.81] - 2026-07-17
 
 Version-lockstep release with Hearth v0.1.81. The bundled Bellwright host makes
