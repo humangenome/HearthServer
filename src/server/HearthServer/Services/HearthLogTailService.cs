@@ -72,6 +72,9 @@ public sealed class HearthLogTailService : BackgroundService
     private static readonly Regex LogoutRegex = new(
         @"LogUWE:\s+Logout : Player .* is exiting",
         RegexOptions.Compiled);
+    private static readonly Regex CredentialQueryRegex = new(
+        @"(?<prefix>[?&](?:HearthKey|HearthAdminTicket)=)[^?&\s""]+",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private readonly ILogger<HearthLogTailService> _log;
     private readonly HearthServerOptions _opts;
@@ -266,17 +269,20 @@ public sealed class HearthLogTailService : BackgroundService
         var travelMatch = TravelRegex.Match(line);
         if (travelMatch.Success)
         {
-            _log.LogInformation("[Bellwright] travel -> {Url}", travelMatch.Groups["url"].Value);
+            _log.LogInformation(
+                "[Bellwright] travel -> {Url}",
+                RedactCredentialQueryValues(travelMatch.Groups["url"].Value));
             return;
         }
 
         // Default: pass through with [Bellwright] prefix and category as info.
-        if (line.Contains("Error", StringComparison.OrdinalIgnoreCase))
-            _log.LogError("[Bellwright] {Line}", line);
-        else if (line.Contains("Warning", StringComparison.OrdinalIgnoreCase))
-            _log.LogWarning("[Bellwright] {Line}", line);
+        var safeLine = RedactCredentialQueryValues(line);
+        if (safeLine.Contains("Error", StringComparison.OrdinalIgnoreCase))
+            _log.LogError("[Bellwright] {Line}", safeLine);
+        else if (safeLine.Contains("Warning", StringComparison.OrdinalIgnoreCase))
+            _log.LogWarning("[Bellwright] {Line}", safeLine);
         else
-            _log.LogInformation("[Bellwright] {Line}", line);
+            _log.LogInformation("[Bellwright] {Line}", safeLine);
     }
 
     private void TrackAcceptedAddress(string address)
@@ -501,6 +507,9 @@ public sealed class HearthLogTailService : BackgroundService
             Path.Combine(gameUserDir, "bw-ue.log"),
             Path.Combine(gameUserDir, "Saved", "Logs", "Bellwright.log"),
         };
+
+    internal static string RedactCredentialQueryValues(string line) =>
+        CredentialQueryRegex.Replace(line, "${prefix}<redacted>");
 
     internal static string ExtractLoginPlayerId(string line)
     {

@@ -110,6 +110,20 @@ public sealed class HearthServerOptions
     public int MaxPlayers { get; set; } = 4;
 
     /// <summary>
+    /// Steam64 IDs allowed to use Bellwright's host-only gameplay settings.
+    /// The host overlay validates each ID again before granting authority.
+    /// </summary>
+    public List<string> AdminSteamIds { get; set; } = [];
+
+    /// <summary>
+    /// Server-local registry of short-lived, one-use admin join tickets.
+    /// HearthServer writes it after RCON-authenticated launcher requests;
+    /// the UE4SS host overlay consumes it while admitting the matching
+    /// Steam64 identity. Keep this outside customer saves.
+    /// </summary>
+    public string AdminJoinTicketPath { get; set; } = "data/admin-join-tickets.tsv";
+
+    /// <summary>
     /// Take a snapshot zip of the SaveGames dir into <see cref="SaveDir"/>
     /// on every auto-save (via FileSystemWatcher). Useful for self-hosters
     /// who want a rollback option. Hosting providers that run their own

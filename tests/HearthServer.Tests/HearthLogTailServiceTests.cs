@@ -27,6 +27,22 @@ public class HearthLogTailServiceTests
         HearthLogTailService.ExtractLoginPlayerId(line).Should().Be(expected);
     }
 
+    [Fact]
+    public void RedactCredentialQueryValues_removes_join_password_and_admin_ticket()
+    {
+        var line = "Login ?Name=Player?HearthKey=join-secret?HearthAdminTicket="
+            + new string('a', 64)
+            + "?PlayerId=76561197971106764";
+
+        var redacted = HearthLogTailService.RedactCredentialQueryValues(line);
+
+        redacted.Should().Contain("?HearthKey=<redacted>");
+        redacted.Should().Contain("?HearthAdminTicket=<redacted>");
+        redacted.Should().Contain("?PlayerId=76561197971106764");
+        redacted.Should().NotContain("join-secret");
+        redacted.Should().NotContain(new string('a', 64));
+    }
+
     [Theory]
     [InlineData("[2026.05.22-19.54.11:411][123]LogNet: NotifyAcceptingConnection accepted from: 1.2.3.4:5555", "1.2.3.4:5555")]
     [InlineData("[2026.05.22-19.54.11:411][123]LogNet: Server accepting post-challenge connection from: 1.2.3.4:5555", "1.2.3.4:5555")]

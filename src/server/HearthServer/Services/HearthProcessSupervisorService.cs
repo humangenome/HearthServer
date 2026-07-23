@@ -144,6 +144,12 @@ public sealed class HearthProcessSupervisorService : BackgroundService
             WorkingDirectory = Path.GetDirectoryName(exe)!,
         };
         psi.EnvironmentVariables["HEARTH_INSTANCE"] = _opts.InstanceId;
+        psi.EnvironmentVariables["HEARTH_ADMIN_STEAM_IDS"] = string.Join(',', _opts.AdminSteamIds ?? []);
+        psi.EnvironmentVariables["HEARTH_ADMIN_TICKET_FILE"] = Path.GetFullPath(
+            string.IsNullOrWhiteSpace(_opts.AdminJoinTicketPath)
+                ? "data/admin-join-tickets.tsv"
+                : _opts.AdminJoinTicketPath,
+            AppContext.BaseDirectory);
         return Process.Start(psi) ?? throw new InvalidOperationException("Process.Start returned null");
     }
 
