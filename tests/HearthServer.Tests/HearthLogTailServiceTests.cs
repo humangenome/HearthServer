@@ -79,10 +79,7 @@ public class HearthLogTailServiceTests
         }));
 
         var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
-        var service = new HearthLogTailService(
-            NullLogger<HearthLogTailService>.Instance,
-            Options.Create(new HearthServerOptions { GameUserDir = root }),
-            state);
+        var service = CreateTailer(root, state);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -119,10 +116,7 @@ public class HearthLogTailServiceTests
         await File.WriteAllTextAsync(logPath, "");
 
         var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
-        var service = new HearthLogTailService(
-            NullLogger<HearthLogTailService>.Instance,
-            Options.Create(new HearthServerOptions { GameUserDir = root, LoginIdentityCachePath = identityPath }),
-            state);
+        var service = CreateTailer(root, state, identityPath);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -146,6 +140,7 @@ public class HearthLogTailServiceTests
             cache.Seed.Should().Be("DESKTOP-6UOAG27-B2FB9B014B553C1441850E80D9E14755");
             cache.DisplayName.Should().Be("Player");
             cache.LoginName.Should().Be("DESKTOP-6UOAG27-B2FB9B014B553C1441850E80D9E14755");
+            cache.AdminTicket.Should().BeEmpty();
         }
         finally
         {
@@ -164,10 +159,7 @@ public class HearthLogTailServiceTests
         await File.WriteAllTextAsync(logPath, "");
 
         var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
-        var service = new HearthLogTailService(
-            NullLogger<HearthLogTailService>.Instance,
-            Options.Create(new HearthServerOptions { GameUserDir = root, LoginIdentityCachePath = identityPath }),
-            state);
+        var service = CreateTailer(root, state, identityPath);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -191,6 +183,7 @@ public class HearthLogTailServiceTests
             cache.Seed.Should().Be("Havlas-43076A5D46EDB90453951599838B94B8");
             cache.DisplayName.Should().Be("George");
             cache.LoginName.Should().Be("Havlas-43076A5D46EDB90453951599838B94B8");
+            cache.AdminTicket.Should().BeEmpty();
         }
         finally
         {
@@ -208,10 +201,7 @@ public class HearthLogTailServiceTests
         await File.WriteAllTextAsync(logPath, "");
 
         var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
-        var service = new HearthLogTailService(
-            NullLogger<HearthLogTailService>.Instance,
-            Options.Create(new HearthServerOptions { GameUserDir = root }),
-            state);
+        var service = CreateTailer(root, state);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -236,6 +226,64 @@ public class HearthLogTailServiceTests
         }
     }
 
+    [Fact]
+    public async Task Tailer_validates_admin_ticket_and_carries_it_in_the_login_identity_cache()
+    {
+        const string steamId = "76561197971106764";
+        var root = Path.Combine(Path.GetTempPath(), "hearth-admin-tail-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var logPath = Path.Combine(root, "bw-ue.log");
+        var identityPath = Path.Combine(root, "login-identities.tsv");
+        var ticketPath = Path.Combine(root, "admin-tickets.tsv");
+        await File.WriteAllTextAsync(logPath, "");
+
+        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var options = Options.Create(new HearthServerOptions
+        {
+            GameUserDir = root,
+            LoginIdentityCachePath = identityPath,
+            AdminJoinTicketPath = ticketPath,
+            AdminSteamIds = [steamId],
+        });
+        var tickets = new AdminJoinTicketService(
+            options,
+            NullLogger<AdminJoinTicketService>.Instance);
+        var issued = tickets.Issue(steamId, "203.0.113.42");
+        issued.Should().NotBeNull();
+        var service = new HearthLogTailService(
+            NullLogger<HearthLogTailService>.Instance,
+            options,
+            state,
+            tickets);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            await Task.Delay(250);
+            await File.AppendAllTextAsync(logPath, string.Join(Environment.NewLine, new[]
+            {
+                "[2026.07.25-18.07.10:858][930]LogNet: NotifyAcceptingConnection accepted from: 203.0.113.42:53583",
+                $"[2026.07.25-18.07.11:058][936]LogNet: Login request: ?Name=steam_{steamId}?PlayerId={steamId}?PlatformUserId={steamId}?PlatformProvider=STEAM?HearthDisplayName=Sayne?HearthAdminTicket={issued!.Token} userId: NULL:steam...6764 platform: NULL",
+                "[2026.07.25-18.07.14:437][ 37]LogNet: Join succeeded: Sayne",
+                ""
+            }));
+
+            await WaitUntilAsync(
+                () => File.Exists(identityPath)
+                    && File.ReadAllText(identityPath).Contains(issued.Token, StringComparison.Ordinal),
+                TimeSpan.FromSeconds(5));
+            var cache = await ReadLoginIdentityCacheAsync(identityPath);
+            cache.HearthUserId.Should().Be("steam_" + steamId);
+            cache.AdminTicket.Should().Be(issued.Token);
+            File.ReadAllText(ticketPath).Trim().Split('\t')[4].Should().Be("1");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;
@@ -248,19 +296,41 @@ public class HearthLogTailServiceTests
         condition().Should().BeTrue();
     }
 
+    private static HearthLogTailService CreateTailer(
+        string root,
+        PipeServerState state,
+        string? identityPath = null)
+    {
+        var options = Options.Create(new HearthServerOptions
+        {
+            GameUserDir = root,
+            LoginIdentityCachePath = identityPath ?? Path.Combine(root, "login-identities.tsv"),
+            AdminJoinTicketPath = Path.Combine(root, "admin-tickets.tsv"),
+        });
+        var tickets = new AdminJoinTicketService(
+            options,
+            NullLogger<AdminJoinTicketService>.Instance);
+        return new HearthLogTailService(
+            NullLogger<HearthLogTailService>.Instance,
+            options,
+            state,
+            tickets);
+    }
+
     private static async Task<LoginIdentityCacheEntry> ReadLoginIdentityCacheAsync(string path)
     {
         await WaitUntilAsync(() => File.Exists(path), TimeSpan.FromSeconds(5));
         var line = (await File.ReadAllLinesAsync(path)).Single();
         var fields = line.Split('\t');
-        fields.Should().HaveCount(6);
+        fields.Should().HaveCount(7);
         return new LoginIdentityCacheEntry(
             fields[0],
             Uri.UnescapeDataString(fields[1]),
             Uri.UnescapeDataString(fields[2]),
             Uri.UnescapeDataString(fields[3]),
             Uri.UnescapeDataString(fields[4]),
-            Uri.UnescapeDataString(fields[5]));
+            Uri.UnescapeDataString(fields[5]),
+            Uri.UnescapeDataString(fields[6]));
     }
 
     private sealed record LoginIdentityCacheEntry(
@@ -269,5 +339,6 @@ public class HearthLogTailServiceTests
         string HearthUserId,
         string Seed,
         string DisplayName,
-        string LoginName);
+        string LoginName,
+        string AdminTicket);
 }

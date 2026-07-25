@@ -75,10 +75,14 @@ public sealed class HearthLogTailService : BackgroundService
     private static readonly Regex CredentialQueryRegex = new(
         @"(?<prefix>[?&](?:HearthKey|HearthAdminTicket)=)[^?&\s""]+",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex AdminTicketRegex = new(
+        @"[?&]HearthAdminTicket=(?<token>[0-9a-f]{64})(?:[?&\s""]|$)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly ILogger<HearthLogTailService> _log;
     private readonly HearthServerOptions _opts;
     private readonly PipeServerState _state;
+    private readonly AdminJoinTicketService _adminJoinTickets;
     // Address candidates from "accepted from" LogNet lines, stamped so stale
     // entries (e.g. a NAT-flapping zombie connection's old ports) can never be
     // paired with a later login — a stale pairing writes a wrong-address identity
@@ -97,11 +101,16 @@ public sealed class HearthLogTailService : BackgroundService
     private string? _activeLogPath;
     private static readonly TimeSpan LoginIdentityCacheTtl = TimeSpan.FromMinutes(45);
 
-    public HearthLogTailService(ILogger<HearthLogTailService> log, IOptions<HearthServerOptions> opts, PipeServerState state)
+    public HearthLogTailService(
+        ILogger<HearthLogTailService> log,
+        IOptions<HearthServerOptions> opts,
+        PipeServerState state,
+        AdminJoinTicketService adminJoinTickets)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
+        _adminJoinTickets = adminJoinTickets;
         _loginIdentityCachePath = ResolveLoginIdentityCachePath(_opts.LoginIdentityCachePath);
     }
 
@@ -232,7 +241,10 @@ public sealed class HearthLogTailService : BackgroundService
         var loginMatch = LoginNameRegex.Match(line);
         if (trackPlayerEvents && loginMatch.Success)
         {
-            TrackLoginRequest(loginMatch.Groups["name"].Value, ExtractLoginPlayerId(line));
+            TrackLoginRequest(
+                loginMatch.Groups["name"].Value,
+                ExtractLoginPlayerId(line),
+                ExtractAdminJoinTicket(line));
         }
         var joinSucceededMatch = JoinSucceededRegex.Match(line);
         if (joinSucceededMatch.Success)
@@ -296,7 +308,7 @@ public sealed class HearthLogTailService : BackgroundService
         }
     }
 
-    private void TrackLoginRequest(string displayName, string playerId)
+    private void TrackLoginRequest(string displayName, string playerId, string adminTicket)
     {
         var loginName = CleanName(Uri.UnescapeDataString(displayName));
         if (loginName.Length == 0) return;
@@ -310,13 +322,21 @@ public sealed class HearthLogTailService : BackgroundService
             while (_pendingAddresses.Count > 0 && _pendingAddresses.Peek().SeenUnixMs < staleBefore)
                 _pendingAddresses.Dequeue();
             if (_pendingAddresses.Count > 0) address = _pendingAddresses.Dequeue().Address;
-            _pendingLogins[loginName] = new PendingLogin(id, visibleName, address, loginName);
+            var validatedAdminTicket = _adminJoinTickets.ValidatePresented(adminTicket, id, address)
+                ? adminTicket
+                : "";
+            _pendingLogins[loginName] = new PendingLogin(
+                id,
+                visibleName,
+                address,
+                loginName,
+                validatedAdminTicket);
             if (!string.IsNullOrWhiteSpace(address)) _playerIdByAddress[address] = id;
             if (!string.IsNullOrWhiteSpace(address)) _playerNameByAddress[address] = visibleName;
             // Always land an identity row: bw_host's recency-claim fallback needs a
             // row even when no usable accept-address was captured for this login.
             var identityKey = !string.IsNullOrWhiteSpace(address) ? address : $"pending:{loginName}";
-            UpsertLoginIdentityLocked(identityKey, id, loginName, visibleName);
+            UpsertLoginIdentityLocked(identityKey, id, loginName, visibleName, validatedAdminTicket);
         }
         _state.UpsertLogPlayer(id, visibleName);
     }
@@ -347,7 +367,12 @@ public sealed class HearthLogTailService : BackgroundService
             {
                 _playerIdByAddress[pending.Address] = id;
                 _playerNameByAddress[pending.Address] = visibleName;
-                UpsertLoginIdentityLocked(pending.Address, id, pending.LoginName, visibleName);
+                UpsertLoginIdentityLocked(
+                    pending.Address,
+                    id,
+                    pending.LoginName,
+                    visibleName,
+                    pending.AdminTicket);
             }
         }
         _state.UpsertLogPlayer(id, visibleName);
@@ -417,7 +442,12 @@ public sealed class HearthLogTailService : BackgroundService
         return Path.Combine(AppContext.BaseDirectory, "login-identities.tsv");
     }
 
-    private void UpsertLoginIdentityLocked(string address, string hearthUserId, string loginName, string displayName)
+    private void UpsertLoginIdentityLocked(
+        string address,
+        string hearthUserId,
+        string loginName,
+        string displayName,
+        string adminTicket)
     {
         if (string.IsNullOrWhiteSpace(address)) return;
         var seed = NormalizeLoginSeedForCache(hearthUserId, loginName);
@@ -432,6 +462,7 @@ public sealed class HearthLogTailService : BackgroundService
             seed,
             visibleName,
             loginName,
+            adminTicket,
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         WriteLoginIdentityCache();
     }
@@ -466,7 +497,8 @@ public sealed class HearthLogTailService : BackgroundService
                     EncodeIdentityField(identity.HearthUserId),
                     EncodeIdentityField(identity.Seed),
                     EncodeIdentityField(identity.DisplayName),
-                    EncodeIdentityField(identity.LoginName)));
+                    EncodeIdentityField(identity.LoginName),
+                    EncodeIdentityField(identity.AdminTicket)));
 
             var tmp = _loginIdentityCachePath + ".tmp";
             File.WriteAllLines(tmp, lines, Encoding.UTF8);
@@ -524,6 +556,12 @@ public sealed class HearthLogTailService : BackgroundService
         return id;
     }
 
+    internal static string ExtractAdminJoinTicket(string line)
+    {
+        var match = AdminTicketRegex.Match(line);
+        return match.Success ? match.Groups["token"].Value : "";
+    }
+
     private static string NormalizeLoginId(string playerId, string loginName)
     {
         var id = playerId.Trim();
@@ -576,7 +614,12 @@ public sealed class HearthLogTailService : BackgroundService
                || prefix.Contains("Package", StringComparison.OrdinalIgnoreCase);
     }
 
-    private sealed record PendingLogin(string PlayerId, string DisplayName, string? Address, string LoginName);
+    private sealed record PendingLogin(
+        string PlayerId,
+        string DisplayName,
+        string? Address,
+        string LoginName,
+        string AdminTicket);
 
     private sealed record LoginIdentity(
         string Address,
@@ -584,5 +627,6 @@ public sealed class HearthLogTailService : BackgroundService
         string Seed,
         string DisplayName,
         string LoginName,
+        string AdminTicket,
         long UpdatedUnixMs);
 }

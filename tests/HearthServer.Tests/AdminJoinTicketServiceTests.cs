@@ -25,11 +25,46 @@ public sealed class AdminJoinTicketServiceTests
             Assert.Matches("^[0-9a-f]{64}$", issued!.Token);
             Assert.InRange(issued.ExpiresUnix, before + 175, before + 185);
             var row = File.ReadAllText(path).Trim().Split('\t');
-            Assert.Equal(4, row.Length);
+            Assert.Equal(5, row.Length);
             Assert.Equal(issued.Token, row[0]);
             Assert.Equal(AllowedSteamId, row[1]);
             Assert.Equal(issued.ExpiresUnix.ToString(), row[2]);
             Assert.Equal("203.0.113.42", row[3]);
+            Assert.Equal("0", row[4]);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ValidatePresentedRequiresExactTicketIdentityAndSourceAddress()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "hearth-admin-ticket-tests", Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(root, "tickets.tsv");
+        try
+        {
+            var service = Create(path, AllowedSteamId);
+            var issued = service.Issue(AllowedSteamId, "203.0.113.42");
+            Assert.NotNull(issued);
+
+            Assert.False(service.ValidatePresented(
+                issued!.Token,
+                AllowedSteamId,
+                "203.0.113.43:50000"));
+            Assert.True(service.ValidatePresented(
+                issued.Token,
+                AllowedSteamId,
+                "203.0.113.42:50000"));
+            Assert.False(service.ValidatePresented(
+                issued.Token,
+                AllowedSteamId,
+                "203.0.113.42:50000"));
+
+            var row = File.ReadAllText(path).Trim().Split('\t');
+            Assert.Equal("1", row[4]);
         }
         finally
         {

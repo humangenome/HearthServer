@@ -21,6 +21,9 @@ public sealed class AdminJoinTicketService
     private static readonly Regex Steam64Regex = new(
         @"^7656119[0-9]{10}$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex TicketRegex = new(
+        @"^[0-9a-f]{64}$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly ILogger<AdminJoinTicketService> _log;
     private readonly HashSet<string> _allowedSteamIds;
@@ -70,7 +73,8 @@ public sealed class AdminJoinTicketService
                 token,
                 normalizedSteamId,
                 checked(now + TicketLifetimeSeconds),
-                normalizedAddress);
+                normalizedAddress,
+                Presented: false);
             _tickets.Add(record);
             WriteRegistry();
 
@@ -78,6 +82,50 @@ public sealed class AdminJoinTicketService
                 "Issued one-use Bellwright admin join ticket for configured Steam64 ending {Suffix}",
                 normalizedSteamId[^4..]);
             return new IssuedTicket(record.Token, record.ExpiresUnix);
+        }
+    }
+
+    public bool ValidatePresented(
+        string? token,
+        string? steamId,
+        string? remoteAddress)
+    {
+        var normalizedToken = (token ?? "").Trim();
+        var normalizedSteamId = (steamId ?? "").Trim();
+        var normalizedAddress = NormalizePeerAddress(remoteAddress);
+        if (!TicketRegex.IsMatch(normalizedToken)
+            || !IsValidSteam64(normalizedSteamId)
+            || normalizedAddress is null)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            _tickets.RemoveAll(t => t.ExpiresUnix <= now);
+            var index = _tickets.FindIndex(t =>
+                string.Equals(t.Token, normalizedToken, StringComparison.Ordinal));
+            if (index < 0)
+            {
+                WriteRegistry();
+                return false;
+            }
+
+            var record = _tickets[index];
+            if (record.Presented
+                || !string.Equals(record.SteamId, normalizedSteamId, StringComparison.Ordinal)
+                || !string.Equals(record.RemoteAddress, normalizedAddress, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _tickets[index] = record with { Presented = true };
+            WriteRegistry();
+            _log.LogInformation(
+                "Validated one-use Bellwright admin join ticket for configured Steam64 ending {Suffix}",
+                normalizedSteamId[^4..]);
+            return true;
         }
     }
 
@@ -93,6 +141,18 @@ public sealed class AdminJoinTicketService
         if (address.IsIPv4MappedToIPv6)
             address = address.MapToIPv4();
         return address.ToString().ToLowerInvariant();
+    }
+
+    private static string? NormalizePeerAddress(string? value)
+    {
+        var normalized = NormalizeAddress(value);
+        if (normalized is not null)
+            return normalized;
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        return IPEndPoint.TryParse(value, out var endpoint)
+            ? NormalizeAddress(endpoint.Address.ToString())
+            : null;
     }
 
     private string ResolvePath(string? configured)
@@ -111,7 +171,8 @@ public sealed class AdminJoinTicketService
 
         var content = string.Join(
             "\r\n",
-            _tickets.Select(t => $"{t.Token}\t{t.SteamId}\t{t.ExpiresUnix}\t{t.RemoteAddress}"));
+            _tickets.Select(t =>
+                $"{t.Token}\t{t.SteamId}\t{t.ExpiresUnix}\t{t.RemoteAddress}\t{(t.Presented ? "1" : "0")}"));
         if (content.Length > 0)
             content += "\r\n";
 
@@ -138,5 +199,6 @@ public sealed class AdminJoinTicketService
         string Token,
         string SteamId,
         long ExpiresUnix,
-        string RemoteAddress);
+        string RemoteAddress,
+        bool Presented);
 }

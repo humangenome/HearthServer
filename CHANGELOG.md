@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.84] - 2026-07-25
+
+- Validates a presented Bellwright admin ticket against the configured Steam64
+  ID and accepted source address in the server's raw login stream.
+- Carries only the validated one-use grant through the server-local identity
+  cache when the host mod cannot reflect Bellwright's connection URL.
+
 ## [0.1.83] - 2026-07-23
 
 - Adds RCON-authenticated, short-lived admin join tickets bound to a configured
