@@ -44,7 +44,7 @@ dotnet publish src/server/HearthServer/HearthServer.csproj \
 ```
 
 Tagged releases (`vX.Y.Z`) build, test, publish, and attach
-`Hearth-Server-Windows-x64-<tag>.zip` automatically via GitHub Actions.
+`HearthServer-Supervisor-Windows-x64-<tag>.zip` automatically via GitHub Actions.
 
 ## Layout
 
@@ -61,16 +61,20 @@ tests/                           xUnit suites for the protocol, server, and save
 
 ## What this repository ships
 
-`Hearth-Server-Windows-x64-<tag>.zip` on this repo's release page is the
-self-contained **supervisor** build: `HearthServer.exe`, its .NET runtime, and
-`HearthSaveGuard.exe`. Extract it and run `HearthServer.exe` from the extracted
-folder.
+`HearthServer-Supervisor-Windows-x64-<tag>.zip` on this repo's release page is
+the self-contained **supervisor** build and nothing else: `HearthServer.exe`,
+its .NET runtime, and `HearthSaveGuard.exe`. Extract it and run
+`HearthServer.exe` from the extracted folder.
+
+The name matters. Releases before v0.1.85 called this archive
+`Hearth-Server-Windows-x64-<tag>.zip`, which is also the name of the complete
+host package on the Hearth launcher release line — a different archive with
+different contents. Anything published from this repository is the supervisor.
 
 It does not include Bellwright itself, and it does not include Hearth's
 host-side UE4SS runtime or Engine.ini templates — those ship with the host
 package that comes with the launcher distribution. Running a Hearth server that
 players can join needs both halves.
-
 
 ## Official hosting
 

@@ -9,9 +9,62 @@ permissions:
   contents: write
 
 jobs:
+  # Cheap Linux gate that runs before the Windows build. Both failures it
+  # catches are permanent once a release publishes: a tag whose binaries report
+  # a different version from /api/v1/info (v0.1.82 shipped 0.1.81, v0.1.65
+  # shipped 0.1.64), and a release body that does not meet the standard.
+  guard:
+    name: Guard release preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check the tag matches the version stamp
+        run: bash scripts/check-version-stamp.sh "${{ github.ref_name }}"
+
+      - name: Build the release body from the changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          # Fail rather than publish the old "See CHANGELOG.md for details."
+          # placeholder. check-version-stamp.sh already requires the section;
+          # this is the belt-and-braces read.
+          notes="$(awk -v v="## [$version]" '
+            index($0, v) == 1 { grab = 1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md)"
+          notes="$(printf '%s\n' "$notes" | sed -e '/./,$!d')"
+          if [[ -z "${notes//[[:space:]]/}" ]]; then
+            echo "CHANGELOG.md has no '## [$version]' section" >&2
+            exit 1
+          fi
+          url="https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver"
+          {
+            printf '%s\n' "$notes"
+            printf '\n---\n\n'
+            printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"
+          } > release-body.md
+          cat release-body.md
+
+      - name: Lint the release body
+        run: bash scripts/lint-release-notes.sh --profile body release-body.md
+
+      - name: Upload the release body
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-body
+          path: release-body.md
+          retention-days: 7
+
   build:
     name: Build HearthServer (windows-latest)
     runs-on: windows-latest
+    needs: guard
     timeout-minutes: 20
 
     steps:
@@ -47,6 +100,16 @@ jobs:
       - name: Publish HearthServer (self-contained)
         run: dotnet publish src/server/HearthServer/HearthServer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=false
 
+      - name: Verify the published binary reports the tag version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $publish = "src/server/HearthServer/bin/Release/net8.0/win-x64/publish"
+          $exe = [Diagnostics.FileVersionInfo]::GetVersionInfo("$publish/HearthServer.exe")
+          if ($exe.FileVersion -ne "$version.0" -or -not $exe.ProductVersion.StartsWith($version)) {
+            throw "tag $version does not match HearthServer.exe FileVersion=$($exe.FileVersion), ProductVersion=$($exe.ProductVersion)"
+          }
+
       - name: Stage release artifact
         shell: pwsh
         run: |
@@ -57,33 +120,29 @@ jobs:
           $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
           if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
           Copy-Item $saveGuard "$publish/HearthSaveGuard.exe" -Force
-          Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/Hearth-Server-Windows-x64-$tag.zip"
+          # Named for what it is: the standalone supervisor built from this
+          # repository. The complete host package published on the Hearth
+          # launcher release line is a different archive and keeps its own name.
+          Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
           } | Out-File -FilePath artifacts/checksums.txt -Encoding ascii
 
-      - name: Extract changelog section
-        id: changelog
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          $content = Get-Content CHANGELOG.md -Raw
-          $pattern = "(?ms)## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=\n## |\z)"
-          $match = [regex]::Match($content, $pattern)
-          if ($match.Success) { $notes = $match.Groups[1].Value.Trim() }
-          else { $notes = "See CHANGELOG.md for details." }
-          $hostingUrl = "https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver-$version"
-          $hosting = "`n`n----`n### Official Hosting`n`nHearthServer is officially supported by [SurvivalServers.com]($hostingUrl) — managed Bellwright hosting with Hearth pre-installed and kept on the latest pinned release.`n"
-          $body = $notes + $hosting
-          $body | Out-File -FilePath release-body.md -Encoding utf8
+      - name: Download the release body
+        uses: actions/download-artifact@v4
+        with:
+          name: release-body
 
       - name: Create GitHub release (HearthServer)
         uses: softprops/action-gh-release@v2
         with:
+          name: HearthServer ${{ github.ref_name }}
           files: |
             artifacts/*.zip
             artifacts/checksums.txt
           body_path: release-body.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # Author as HumanGenome rather than github-actions[bot] when the PAT
+          # is available; falls back to the default token otherwise.
+          token: ${{ secrets.HUMANGENOME_PAT || secrets.GITHUB_TOKEN }}
