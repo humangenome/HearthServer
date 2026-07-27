@@ -46,6 +46,8 @@ jobs:
           url="https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver"
           {
             printf '%s\n' "$notes"
+            printf '\n## Downloads\n\n'
+            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the standalone supervisor: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. It does not contain Bellwright, the host UE4SS runtime, or the Engine.ini templates."
             printf '\n---\n\n'
             printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"
           } > release-body.md
