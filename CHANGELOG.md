@@ -160,6 +160,7 @@ Version-lockstep release with Hearth v0.1.61. The launcher now preserves
 existing Bellwright characters across Hearth updates and local-data cleanup,
 while keeping native character creation available for genuinely new players.
 There are no behavioral changes to the .NET server source in this repository.
+
 ## [0.1.60] - 2026-07-12
 
 Version-lockstep release with Hearth v0.1.60. The bundled Bellwright host now

@@ -192,12 +192,30 @@ public sealed class HearthProcessSupervisorService : BackgroundService
         AllowPeerVoice=false
         bClampListenServerTickRate=true
         NetServerMaxTickRate=60
-        MaxClientRate=15000
-        MaxInternetClientRate=10000
-        NetConnectionTimeout=60
-        InitialConnectTimeout=300.0
-        ConnectionTimeout=60.0
+        MaxClientRate=2097152
+        MaxInternetClientRate=2097152
+        ServerDesiredSocketReceiveBufferBytes=4194304
+        ServerDesiredSocketSendBufferBytes=4194304
+        ClientDesiredSocketReceiveBufferBytes=2097152
+        ClientDesiredSocketSendBufferBytes=2097152
+        NetConnectionTimeout=600
+        InitialConnectTimeout=600.0
+        ConnectionTimeout=600.0
         ServerTravelPause=4
+
+        [/Script/Engine.Player]
+        ConfiguredInternetSpeed=2097152
+        ConfiguredLanSpeed=2097152
+
+        [/Script/Engine.GameNetworkManager]
+        TotalNetBandwidth=16777216
+        MaxDynamicBandwidth=2097152
+        MinDynamicBandwidth=524288
+
+        [ConsoleVariables]
+        net.UseAdaptiveNetUpdateFrequency=1
+        net.TrackQueuedActorThreshold=1
+        net.TrackQueuedActorThresholdOwner=1
 
         [URL]
         Port={_opts.GameplayPort}

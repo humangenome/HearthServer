@@ -73,7 +73,7 @@ jobs:
           $match = [regex]::Match($content, $pattern)
           if ($match.Success) { $notes = $match.Groups[1].Value.Trim() }
           else { $notes = "See CHANGELOG.md for details." }
-          $hostingUrl = "https://www.survivalservers.com/games/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver-$version"
+          $hostingUrl = "https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=release&utm_campaign=hearthserver-$version"
           $hosting = "`n`n----`n### Official Hosting`n`nHearthServer is officially supported by [SurvivalServers.com]($hostingUrl) — managed Bellwright hosting with Hearth pre-installed and kept on the latest pinned release.`n"
           $body = $notes + $hosting
           $body | Out-File -FilePath release-body.md -Encoding utf8

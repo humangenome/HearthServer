@@ -55,13 +55,28 @@ src/server/Hearth.SourceQuery    A2S responder
 src/server/Hearth.Rcon           Source RCON server
 src/server/Hearth.Persistence    SQLite store (bans/schedule/audit)
 src/server/HearthServer          the supervisor host (entry point)
+src/tools/Hearth.SaveGuard       Rust save-protection helper (HearthSaveGuard.exe)
+tests/                           xUnit suites for the protocol, server, and save paths
 ```
+
+## What this repository ships
+
+`Hearth-Server-Windows-x64-<tag>.zip` on this repo's release page is the
+self-contained **supervisor** build: `HearthServer.exe`, its .NET runtime, and
+`HearthSaveGuard.exe`. Extract it and run `HearthServer.exe` from the extracted
+folder.
+
+It does not include Bellwright itself, and it does not include Hearth's
+host-side UE4SS runtime or Engine.ini templates — those ship with the host
+package that comes with the launcher distribution. Running a Hearth server that
+players can join needs both halves.
+
 
 ## Official hosting
 
 HearthServer is officially supported by
-[SurvivalServers.com](https://www.survivalservers.com/games/bellwright/) —
-managed Bellwright hosting with Hearth pre-installed and kept on the latest
+[SurvivalServers.com](https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=readme&utm_campaign=hearthserver)
+— managed Bellwright hosting with Hearth pre-installed and kept on the latest
 pinned release. Self-hosting is fully supported from this source.
 
 ## License
