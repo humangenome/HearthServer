@@ -47,6 +47,8 @@ from pathlib import Path
 profile, *paths = sys.argv[1:]
 
 COMPONENTS = ("Server", "Client")
+# One optional trailing section, for saying plainly what each archive contains.
+TRAILING_SECTIONS = ("Downloads",)
 CHANGE_TYPES = ["Added", "Changed", "Fixed", "Removed"]
 HOSTING_PATH = "survivalservers.com/services/game_servers/bellwright/"
 FOOTER_RE = re.compile(
@@ -135,7 +137,10 @@ for path in paths:
                 "no component section — the body must group changes under "
                 "'## Server' and/or '## Client'"
             )
-        extra = [(i, name) for i, name in component_headings if name not in COMPONENTS]
+        extra = [
+            (i, name) for i, name in component_headings
+            if name not in COMPONENTS and name not in TRAILING_SECTIONS
+        ]
         if comps and extra:
             first_comp = comps[0][0]
             for i, name in extra:
@@ -154,8 +159,15 @@ for path in paths:
                 problems.append(f"line {i+1}: duplicate '## {name}' section")
             seen.add(name)
 
-        # change-type subheadings, per component
-        bounds = [i for i, _ in comps] + [len(lines)]
+        # change-type subheadings, per component. A trailing section ends the
+        # last component, so it bounds the final slice.
+        trailing = [i for i, name in component_headings if name in TRAILING_SECTIONS]
+        if trailing and comps and min(trailing) < max(i for i, _ in comps):
+            problems.append(
+                f"line {min(trailing)+1}: "
+                f"{'/'.join(TRAILING_SECTIONS)} must come after every component section"
+            )
+        bounds = [i for i, _ in comps] + [min(trailing) if trailing else len(lines)]
         for idx, (start, name) in enumerate(comps):
             end = bounds[idx + 1]
             body = lines[start + 1:end]
