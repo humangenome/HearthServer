@@ -47,7 +47,7 @@ jobs:
           {
             printf '%s\n' "$notes"
             printf '\n## Downloads\n\n'
-            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the standalone supervisor: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. It does not contain Bellwright, the host UE4SS runtime, or the Engine.ini templates."
+            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the supervisor build: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. It does not contain Bellwright or the host-side UE4SS mod, so on its own it supervises a Bellwright process that no Hearth client can join. See the repository README."
             printf '\n---\n\n'
             printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"
           } > release-body.md
@@ -122,9 +122,9 @@ jobs:
           $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
           if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
           Copy-Item $saveGuard "$publish/HearthSaveGuard.exe" -Force
-          # Named for what it is: the standalone supervisor built from this
-          # repository. The complete host package published on the Hearth
-          # launcher release line is a different archive and keeps its own name.
+          # Named for what it is: the supervisor built from this repository.
+          # The complete host package is a different archive, is not published,
+          # and keeps its own name.
           Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
