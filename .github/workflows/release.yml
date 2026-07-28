@@ -126,6 +126,16 @@ jobs:
           # The complete host package is a different archive, is not published,
           # and keeps its own name.
           Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
+
+          # For 73 published releases this archive went out under the complete
+          # host package's asset name, so anyone following the download
+          # instructions got a supervisor and a server nobody could join. A
+          # checksum cannot catch that -- every one of those zips was internally
+          # consistent and correctly checksummed, just the wrong thing under the
+          # wrong name. Assert the name and the layout.
+          python scripts/verify-supervisor-archive.py "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
+          if ($LASTEXITCODE -ne 0) { throw "supervisor archive failed verification - refusing to publish" }
+
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
           } | Out-File -FilePath artifacts/checksums.txt -Encoding ascii
@@ -148,3 +158,27 @@ jobs:
           # Author as HumanGenome rather than github-actions[bot] when the PAT
           # is available; falls back to the default token otherwise.
           token: ${{ secrets.HUMANGENOME_PAT || secrets.GITHUB_TOKEN }}
+
+      # Backstop on the published page rather than the build directory. Nothing
+      # on this release may carry the complete host package's asset name: that
+      # name promises the UE4SS runtime and the host mod, which this repository
+      # does not publish.
+      - name: Check the release does not claim to be the host package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          names="$(gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name')"
+          echo "$names"
+          if printf '%s\n' "$names" | grep -q '^Hearth-Server-Windows-x64-'; then
+            echo "::error::$TAG publishes an asset named like the complete host package." >&2
+            echo "        This repository builds the supervisor only. Publish it as" >&2
+            echo "        HearthServer-Supervisor-Windows-x64-<tag>.zip." >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$names" | grep -qx "HearthServer-Supervisor-Windows-x64-${TAG}.zip"; then
+            echo "::error::$TAG has no HearthServer-Supervisor-Windows-x64-${TAG}.zip" >&2
+            exit 1
+          fi
