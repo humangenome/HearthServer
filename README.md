@@ -109,9 +109,10 @@ its .NET runtime, and `HearthSaveGuard.exe`. Extract it and run
 `HearthServer.exe` from the extracted folder.
 
 The name matters. Releases before v0.1.85 called this archive
-`Hearth-Server-Windows-x64-<tag>.zip`, which is also the name of the complete
-host package on the Hearth launcher release line — a different archive with
-different contents. Anything published from this repository is the supervisor.
+`Hearth-Server-Windows-x64-<tag>.zip`, which is also the name of a larger
+archive built on a private release line: the complete host package, supervisor
+plus host runtime, which is not published. Anything published from this
+repository is the supervisor.
 
 It does not include Bellwright itself, and it does not include the host-side
 UE4SS runtime — see
