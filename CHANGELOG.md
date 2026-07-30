@@ -4,6 +4,12 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.85] - 2026-07-30
+
+- Rebuild of the v0.1.84 server package with no functional change. The binaries no
+  longer carry the build machine's directory layout or a debug link back to where they
+  were compiled, and the build now fails if either comes back.
+
 ## [0.1.84] - 2026-07-25
 
 - Validates a presented Bellwright admin ticket against the configured Steam64
