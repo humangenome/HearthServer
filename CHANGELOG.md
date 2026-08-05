@@ -4,6 +4,13 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.88] - 2026-08-05
+
+Version-lockstep release with Hearth v0.1.88. The bundled Bellwright host now
+binds map updates to connected players, bounds its startup discovery work, and
+isolates recoverable game-thread callback errors. There are no behavioral
+changes to the public .NET supervisor source in this repository.
+
 ## [0.1.87] - 2026-07-31
 
 Version-lockstep release with Hearth v0.1.87. The bundled Bellwright host now
