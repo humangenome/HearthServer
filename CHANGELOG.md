@@ -4,6 +4,15 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.89] - 2026-09-01
+
+Version-lockstep release with Hearth v0.1.89. The bundled Bellwright host is
+re-cut for Bellwright's 2026-09-01 Steam build (24840601): the build-specific
+UE4SS signature and the startup memory-address checks behind the host's
+safeguards are re-derived, and the server-authoritative gameplay settings module
+is re-verified against the new executable. There are no behavioral changes to the
+public .NET supervisor source in this repository.
+
 ## [0.1.88] - 2026-08-05
 
 Version-lockstep release with Hearth v0.1.88. The bundled Bellwright host now
