@@ -11,6 +11,19 @@ public static class Program
 {
     public static int Main(string[] args)
     {
+        // Compiled host-side injection verb. When invoked as
+        //   HearthServer.exe inject --pid <pid> --dll <path> [--patch-tickworldtravel <rva>]
+        // we do the CreateRemoteThread(LoadLibraryW) UE4SS inject and/or the
+        // UEngine::TickWorldTravel no-GPU ret-stub patch, print a parseable
+        // OK/ERR line, and exit — WITHOUT starting the supervisor host. A
+        // compiled verb is used instead of inline PowerShell reflection so the
+        // host launch path is not subject to script-scanning interference.
+        // See InjectVerb.
+        if (args.Length > 0 && string.Equals(args[0], "inject", StringComparison.Ordinal))
+        {
+            return Services.InjectVerb.Run(args);
+        }
+
         // Verbose toggle: Hearth:Verbose (config / appsettings.json) OR the
         // HEARTH_VERBOSE env var. When on, the minimum log level drops to Debug
         // so the RCON / A2S / HTTP / heartbeat instrumentation is emitted. Off by

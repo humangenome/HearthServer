@@ -1,0 +1,2 @@
+bw_host : 1
+bw_fog : 1
