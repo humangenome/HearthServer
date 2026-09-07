@@ -8,6 +8,14 @@ on:
 permissions:
   contents: write
 
+env:
+  # The host-side UE4SS core is vendored at vendor/ue4ss/server/UE4SS.dll and
+  # SHA-verified here instead of being pulled from UE4SS-RE's floating
+  # experimental-latest tag. To move the pin: replace the vendored DLL, update
+  # this hash, and validate start, join, disconnect, reconnect and forced GC on
+  # a real host first.
+  UE4SS_SERVER_SHA256: 2ad348bf2025bd26b2aa63b478d9813afbd4e656c9bcfb3fdf6752c4d285f298
+
 jobs:
   # Cheap Linux gate that runs before the Windows build. Both failures it
   # catches are permanent once a release publishes: a tag whose binaries report
@@ -47,7 +55,8 @@ jobs:
           {
             printf '%s\n' "$notes"
             printf '\n## Downloads\n\n'
-            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the supervisor build: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. It does not contain Bellwright or the host-side UE4SS mod, so on its own it supervises a Bellwright process that no Hearth client can join. See the repository README."
+            printf '%s\n' "- \`HearthServer-Host-Windows-x64-$tag.zip\` — the complete host package: the supervisor, the UE4SS runtime with the \`bw_host\` and \`bw_fog\` mods and their signature packs, the Engine.ini templates and \`host-instance.ps1\`. Extract it, point the script at a Bellwright install, and you have a joinable server. See the repository README."
+            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the supervisor only: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. For people who already have the host runtime and only want the RCON / query / admin-API sidecar."
             printf '\n---\n\n'
             printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"
           } > release-body.md
@@ -122,9 +131,8 @@ jobs:
           $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
           if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
           Copy-Item $saveGuard "$publish/HearthSaveGuard.exe" -Force
-          # Named for what it is: the supervisor built from this repository.
-          # The complete host package is a different archive, is not published,
-          # and keeps its own name.
+          # Named for what it is: the supervisor only. The complete host
+          # package is built below under its own name.
           Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
 
           # For 73 published releases this archive went out under the complete
@@ -135,6 +143,41 @@ jobs:
           # wrong name. Assert the name and the layout.
           python scripts/verify-supervisor-archive.py "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
           if ($LASTEXITCODE -ne 0) { throw "supervisor archive failed verification - refusing to publish" }
+
+          # ----- Complete host package -----
+          # The artifact that runs a joinable server. Same layout the managed
+          # fleet pins; scripts/verify-server-bundle.py asserts it below.
+          $ue4ss = "vendor/ue4ss/server/UE4SS.dll"
+          if (-not (Test-Path $ue4ss)) { throw "vendored server UE4SS.dll missing at $ue4ss" }
+          $sha = (Get-FileHash $ue4ss -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne "${{ env.UE4SS_SERVER_SHA256 }}") { throw "server UE4SS.dll sha256 mismatch: got $sha, pinned ${{ env.UE4SS_SERVER_SHA256 }}" }
+          Write-Host "UE4SS server core pinned + verified: sha256=$sha"
+
+          New-Item -ItemType Directory -Force -Path stage/HearthServer, stage/ue4ss, stage/engine-ini, stage/redist | Out-Null
+          Copy-Item -Recurse -Force "$publish/*" stage/HearthServer/
+          Copy-Item $ue4ss stage/ue4ss/UE4SS.dll
+          foreach ($required in @("dist/ue4ss-server/UE4SS-settings.ini", "dist/ue4ss-server/Mods", "dist/ue4ss-server/UE4SS_Signatures", "dist/engine-ini", "dist/redist", "dist/steam_appid.txt", "scripts/host-instance.ps1")) {
+            if (-not (Test-Path $required)) { throw "$required missing - refusing to build a host package short its runtime" }
+          }
+          Copy-Item dist/ue4ss-server/UE4SS-settings.ini stage/ue4ss/
+          Copy-Item -Recurse -Force dist/ue4ss-server/Mods stage/ue4ss/
+          # UE4SS treats mixed LF/CRLF mods.txt inconsistently: rewrite it as
+          # fully CRLF-terminated ASCII so the load list is exactly as declared.
+          $serverMods = "stage/ue4ss/Mods/mods.txt"
+          $lines = @(Get-Content $serverMods | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($lines.Count -eq 0) { throw "stage/ue4ss/Mods/mods.txt enables nothing" }
+          [System.IO.File]::WriteAllBytes($serverMods, [System.Text.ASCIIEncoding]::ASCII.GetBytes(($lines -join "`r`n") + "`r`n"))
+          # The 5 PDB-derived AOB signatures are mandatory on UE5.7: without them
+          # UE4SS falls back to its built-in scanner and hangs at "Waiting for
+          # object construction".
+          Copy-Item -Recurse -Force dist/ue4ss-server/UE4SS_Signatures stage/ue4ss/
+          Copy-Item -Recurse -Force dist/engine-ini/* stage/engine-ini/
+          Copy-Item -Recurse -Force dist/redist/* stage/redist/
+          Copy-Item dist/steam_appid.txt stage/
+          Copy-Item scripts/host-instance.ps1 stage/
+          Compress-Archive -Path stage/* -DestinationPath "artifacts/HearthServer-Host-Windows-x64-$tag.zip"
+          python scripts/verify-server-bundle.py "artifacts/HearthServer-Host-Windows-x64-$tag.zip"
+          if ($LASTEXITCODE -ne 0) { throw "host package failed verification - refusing to publish" }
 
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
@@ -158,27 +201,3 @@ jobs:
           # Author as HumanGenome rather than github-actions[bot] when the PAT
           # is available; falls back to the default token otherwise.
           token: ${{ secrets.HUMANGENOME_PAT || secrets.GITHUB_TOKEN }}
-
-      # Backstop on the published page rather than the build directory. Nothing
-      # on this release may carry the complete host package's asset name: that
-      # name promises the UE4SS runtime and the host mod, which this repository
-      # does not publish.
-      - name: Check the release does not claim to be the host package
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ github.ref_name }}"
-          names="$(gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name')"
-          echo "$names"
-          if printf '%s\n' "$names" | grep -q '^Hearth-Server-Windows-x64-'; then
-            echo "::error::$TAG publishes an asset named like the complete host package." >&2
-            echo "        This repository builds the supervisor only. Publish it as" >&2
-            echo "        HearthServer-Supervisor-Windows-x64-<tag>.zip." >&2
-            exit 1
-          fi
-          if ! printf '%s\n' "$names" | grep -qx "HearthServer-Supervisor-Windows-x64-${TAG}.zip"; then
-            echo "::error::$TAG has no HearthServer-Supervisor-Windows-x64-${TAG}.zip" >&2
-            exit 1
-          fi

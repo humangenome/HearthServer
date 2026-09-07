@@ -4,6 +4,18 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.90] - 2026-09-07
+
+The whole server side is now open source and published here. This release adds
+the complete host package, `HearthServer-Host-Windows-x64-v0.1.90.zip`: the
+supervisor, the UE4SS runtime with the `bw_host` and `bw_fog` mods and their
+signature packs, the native gameplay-settings and map-fog helpers, the Engine.ini
+templates and `host-instance.ps1`, which stages UE4SS, launches Bellwright
+headless, applies the native crash guards and supervises the process. Extract it,
+point the script at a Bellwright install, and players can join through the
+Hearth app. The supervisor-only archive is still published for anyone who only
+wants the sidecar. The player app stays closed source.
+
 ## [0.1.89] - 2026-09-01
 
 Version-lockstep release with Hearth v0.1.89. The bundled Bellwright host is

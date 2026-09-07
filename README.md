@@ -12,61 +12,81 @@ server with the operational plumbing a real host needs: process supervision,
 crash recovery, server query, RCON, persistence, and a local admin API the
 Hearth launcher drives.
 
-This repository is the **server source**. The player-facing launcher and the
-packaged installer are distributed from [HumanGenome/Hearth](https://github.com/HumanGenome/Hearth).
+This repository is the **whole server side**: the supervisor, the host-side
+UE4SS mods (`bw_host`, `bw_fog`), their native helpers, the signature packs and
+the launch script. Its release page ships a complete host package you can run.
+The player-facing app is closed source and is distributed from
+[HumanGenome/Hearth](https://github.com/HumanGenome/Hearth).
 
 ## What it does
 
-- **Process supervisor + watchdog** — launches the Bellwright dedicated server,
-  watches its heartbeat, and recovers it on crash or hang.
-- **Source Query (A2S)** — answers A2S so the server is visible to clients and to
-  the hosting panel's status checks.
+- **Host runtime** — `bw_host`, a UE4SS mod that swaps Bellwright's net driver
+  to Unreal's `IpNetDriver` at runtime and opens the world as a direct-IP
+  listen server, with no GPU, no Steam client and no host login.
+- **Process supervisor + watchdog** — `host-instance.ps1` launches Bellwright
+  headless, injects UE4SS, applies the build-locked native crash guards, waits
+  for the gameplay port and relaunches on crash.
+- **Source Query (A2S)** — answers A2S so the server is visible to clients and
+  to any server-list tool.
 - **Source RCON** — standard Source RCON for remote console and admin commands.
 - **Persistence** — SQLite-backed bans, scheduled tasks, and an audit log.
-- **Local admin API** — a loopback-only control plane the Hearth launcher uses to
+- **Save protection** — `HearthSaveGuard.exe` keeps a baseline of the world and
+  the offline-player ledger so a bad write cannot roll a settlement back.
+- **Local admin API** — a loopback-only control plane the Hearth app uses to
   start/stop, configure, and query the server.
 
-## What it cannot do on its own
+## Run your own server
 
-The supervisor does not make Bellwright joinable, and this repository does not
-publish the piece that does.
+You need a Windows 10/11 or Windows Server box (no GPU required) and a copy of
+Bellwright. Players connect with the free [Hearth app](https://github.com/HumanGenome/Hearth);
+stock Bellwright cannot connect to a Hearth server directly.
 
-Bellwright's packaged build ships `SteamSocketsNetDriver` as its only net
-driver and ignores an `Engine.ini` override of it. The swap to Unreal's
-`IpNetDriver`, and the call that opens the world as a direct-IP listen server,
-both happen at runtime inside a host-side UE4SS mod (`bw_host`). That mod is
-not in this repository and is not published anywhere else either, and neither
-are the AOB signature files UE4SS needs to resolve the engine internals of that
-build.
+1. **Install Bellwright on the box.** Use SteamCMD with a Steam account that
+   owns the game (`+login <account> +app_update 1812450 validate`), or copy the
+   `Bellwright` folder out of your own Steam library. The game files are never
+   modified.
+2. **Download `HearthServer-Host-Windows-x64-<tag>.zip`** from the
+   [latest release](https://github.com/HumanGenome/HearthServer/releases/latest)
+   and extract it somewhere outside the game folder, for example `D:\HearthHost`.
+3. **Edit `HearthServer\appsettings.json`.** Set `ServerName`, `RconPassword`,
+   `MaxPlayers` and the ports. Leave `GameInstallRoot` empty; the script owns
+   the game process. Put your Steam64 id in `AdminSteamIds` to be able to open
+   Bellwright's gameplay settings from inside the game.
+4. **Start it** from an elevated PowerShell (elevation lets the script add the
+   firewall rules; otherwise add them yourself):
 
-Point the published archive at a Bellwright dedicated install and you get a
-working supervisor wrapped around a game process that never opens a joinable
-world. RCON answers, A2S answers, the admin API answers, saves are protected,
-crashes are recovered — and no Hearth client can connect.
+   ```powershell
+   Set-ExecutionPolicy -Scope Process Bypass
+   .\host-instance.ps1 -GameRoot "D:\Bellwright"
+   ```
 
-So, plainly: **you cannot build a joinable Bellwright server out of what is
-published here.** Nothing has been stripped out of the supervisor to force
-that. The supervisor is complete, it builds from this source, and its tests
-pass; the host mod is a separate component that stays private.
+   The first boot takes a minute or two. The script logs to `Logs\host.log`
+   and prints `Bellwright host UP` once the gameplay UDP port is bound.
+5. **Join** from the Hearth app with `<your ip>:<GameplayPort>`.
 
-Closing the gap yourself means writing your own UE4SS host mod for Bellwright —
-rewrite `NetDriverDefinitions[GameNetDriver]` to
-`/Script/OnlineSubsystemUtils.IpNetDriver` at runtime, then open the stock map
-with a `listen` URL on your gameplay port.
-[UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) is open source and that is a
-legitimate route, but it is reverse-engineering work against a shipping UE5.7
-title rather than a build step, and it has to be redone when the game's layout
-moves.
+`.\host-instance.ps1 -Stop` stops everything; `-Restart` recycles the game
+process and keeps the supervisor up. Gameplay settings (raids, spoilage, damage,
+village needs and so on) live in `HearthServer\data\gameplay-settings.cfg`; a
+template is written on first run, set `managed=1` to enforce it. Ports, RCON,
+worlds and snapshots are covered in [docs/ADMIN.md](docs/ADMIN.md).
 
-This section replaces a line that used to sit at the bottom of this page:
-"Self-hosting is fully supported from this source." That was not accurate, and
-it stayed here through v0.1.84.
+Several instances on one box: give each its own package folder and gameplay port
+(7777, 7877, 7977, ...) and pass `-CoresPerInstance 2` so each one is pinned to
+a disjoint set of cores.
+
+Bellwright pins its engine internals per Steam build, so the signature packs,
+the native patches and the gameplay-settings helper are re-derived for each
+game update. A release always targets the current Steam build; after a game
+patch, wait for the next release before hosting.
 
 ## Build
 
 Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 `HearthSaveGuard.exe` is written in Rust, so building the full release payload
-also needs a [Rust toolchain](https://rustup.rs/).
+also needs a [Rust toolchain](https://rustup.rs/). The native host helpers
+(`HearthGameplaySettings.dll`, `HearthFogReveal.dll`) are C++ built with
+MinGW-w64 via CMake; the prebuilt DLLs are tracked under `dist/ue4ss-server`
+and the sources under `src/native`.
 
 ```bash
 dotnet restore HearthServer.sln
@@ -83,41 +103,40 @@ dotnet publish src/server/HearthServer/HearthServer.csproj \
 cargo build --manifest-path src/tools/Hearth.SaveGuard/Cargo.toml --release
 ```
 
-Release CI copies the built `HearthSaveGuard.exe` next to the published
-`HearthServer.exe` before zipping. Tagged releases (`vX.Y.Z`) build, test,
-publish, and attach `HearthServer-Supervisor-Windows-x64-<tag>.zip`
-automatically via GitHub Actions.
+Tagged releases (`vX.Y.Z`) build, test, publish and attach both archives
+automatically via GitHub Actions, and every archive is layout-checked before
+it is uploaded.
 
 ## Layout
 
 ```
-src/shared/Hearth.Protocol       wire types shared with the launcher
-src/shared/Hearth.Abstractions   shared interfaces
-src/server/Hearth.SourceQuery    A2S responder
-src/server/Hearth.Rcon           Source RCON server
-src/server/Hearth.Persistence    SQLite store (bans/schedule/audit)
-src/server/HearthServer          the supervisor host (entry point)
-src/tools/Hearth.SaveGuard       Rust save-protection helper (HearthSaveGuard.exe)
-tests/                           xUnit suites for the protocol, server, and save paths
+src/shared/Hearth.Protocol           wire types shared with the launcher
+src/shared/Hearth.Abstractions       shared interfaces
+src/server/Hearth.SourceQuery        A2S responder
+src/server/Hearth.Rcon               Source RCON server
+src/server/Hearth.Persistence        SQLite store (bans/schedule/audit)
+src/server/HearthServer              the supervisor host (entry point)
+src/native/Hearth.GameplaySettings   server-authoritative gameplay settings (C++)
+src/native/Hearth.FogReveal          software map-fog reveal for the headless host (C++)
+src/tools/Hearth.SaveGuard           Rust save-protection helper (HearthSaveGuard.exe)
+dist/ue4ss-server                    the UE4SS host layout: settings, signatures, bw_host, bw_fog
+dist/engine-ini                      Engine.ini reference templates
+dist/redist                          dormant WARP fallback
+vendor/ue4ss                         the pinned UE4SS core (SHA-verified at release)
+scripts/host-instance.ps1            the host launcher
+scripts/verify-server-bundle.py      the host package layout gate
+tests/                               xUnit suites for the protocol, server, and save paths
 ```
 
 ## What this repository ships
 
-`HearthServer-Supervisor-Windows-x64-<tag>.zip` on this repo's release page is
-the self-contained **supervisor** build and nothing else: `HearthServer.exe`,
-its .NET runtime, and `HearthSaveGuard.exe`. Extract it and run
-`HearthServer.exe` from the extracted folder.
+- `HearthServer-Host-Windows-x64-<tag>.zip` — the complete host package
+  described above. This is the one to download.
+- `HearthServer-Supervisor-Windows-x64-<tag>.zip` — the supervisor only
+  (`HearthServer.exe`, its .NET runtime, `HearthSaveGuard.exe`), for anyone who
+  already runs the host runtime and only wants the sidecar.
 
-The name matters. Releases before v0.1.85 called this archive
-`Hearth-Server-Windows-x64-<tag>.zip`, which is also the name of a larger
-archive built on a private release line: the complete host package, supervisor
-plus host runtime, which is not published. Anything published from this
-repository is the supervisor.
-
-It does not include Bellwright itself, and it does not include the host-side
-UE4SS runtime — see
-[What it cannot do on its own](#what-it-cannot-do-on-its-own) for what that
-means in practice.
+Neither archive contains Bellwright itself.
 
 ## Official hosting
 

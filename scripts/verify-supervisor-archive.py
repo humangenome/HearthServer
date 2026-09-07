@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Verify the archive this repository publishes is exactly what it claims to be.
 
-This repository builds the SUPERVISOR ONLY. That is a deliberate product
-decision, not an accident: the host-side UE4SS runtime is not published, so the
-archive here supervises Bellwright but cannot produce a joinable server. The
-README says so plainly and it must keep saying so.
+This archive is the SUPERVISOR ONLY. The complete host package (supervisor plus
+the UE4SS host runtime) is a separate artifact with its own name and its own
+gate (verify-server-bundle.py); this one must never be mistaken for it.
 
 The defect this guard exists to stop is the NAME, not the contents. For 73
 published releases this archive went out as `Hearth-Server-Windows-x64-<tag>.zip`
@@ -14,8 +13,9 @@ and a server no one could join. The archive is now named
 `HearthServer-Supervisor-Windows-x64-<tag>.zip`, and this check refuses to let
 it drift back.
 
-It also fails if the host runtime ever appears in here. A `ue4ss/` tree in this
-archive means the unpublished host mod leaked into a public artifact.
+It also fails if the host runtime appears in here. A `ue4ss/` tree in this
+archive means the supervisor zip and the host package got mixed up; the host
+package is a separate, verified artifact (`HearthServer-Host-Windows-x64-*`).
 
     python3 scripts/verify-supervisor-archive.py <archive.zip>
 
