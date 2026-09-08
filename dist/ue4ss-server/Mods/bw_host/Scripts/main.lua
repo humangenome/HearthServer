@@ -1,4 +1,28 @@
--- bw_host v0.18.50: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.53: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.53: flush spline dormancy BEFORE the game edits replicated points.
+--              Waking afterward can initialize the replication comparison from
+--              the already-modified state and lose the update. Request the net
+--              update after the edit; combining splines handles both actors.
+--   v0.18.52: wake the wall/road actor after every server-side spline edit.
+--              v0.18.51's log proved the mechanism: the server accepts each
+--              segment (points 1->2->3, versions match) but the spline actor
+--              is DORM_DormantAll and AddPoints never flushes dormancy, so the
+--              new points never reach a remote player. Their game, still
+--              holding a one-point copy, cancels the placement and asks the
+--              server to remove "the lone post" (rejected: stale version), and
+--              the wall they placed is invisible until they rejoin. A listen
+--              host never sees this (it reads server state directly). Now the
+--              post-hook of every spline edit RPC calls FlushNetDormancy +
+--              ForceNetUpdate on the actor, the engine's own idiom for a
+--              dormant actor that just changed.
+--   v0.18.51: Splineworks (palisade wall / road) server-side diagnostics. A
+--              remote player's wall preview vanishes on confirm and the game
+--              logs nothing. The server's ServerExtendSpline rejects an edit
+--              when the version the client sends differs from the actor's
+--              replicated EditVersion, or when the segment cannot be crafted
+--              (walls cost nothing, so only the version gate applies). Every
+--              spline RPC is now logged with both versions and the actor's
+--              replication settings. Log-only, pcall-wrapped, no handles kept.
 --   v0.18.50: stop holding UObject handles across ticks. Three host crashes
 --              (one server: 2026-08-29, 2026-09-05, 2026-09-06) symbolized against
 --              the pinned UE4SS b50986bd PDB: two access violations inside the
@@ -310,7 +334,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.50  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.53  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -3558,3 +3582,185 @@ LoopAsync(250, function()
     if not ok then return false end
     return retire and true or false
 end)
+
+-- Splineworks (palisade wall / road) replication and server-side diagnostics.
+-- Each RegisterHook callback runs on the game thread inside the RPC and touches
+-- only its own parameters; nothing is stored past the call. The game's edit
+-- version, crafting and placement checks remain authoritative.
+-- Scoped in a do-block: the main chunk is at Lua's 200-active-locals limit.
+do
+local sw = { installed = false, calls = 0, lines = 0, spawns = 0, maxLines = 400 }
+-- one local only: every helper hangs off `sw` (200-active-locals limit)
+sw.swLog = function(s)
+    if sw.lines >= sw.maxLines then return end
+    sw.lines = sw.lines + 1
+    log("splineworks: " .. tostring(s))
+end
+sw.swField = function(obj, key)
+    local v = nil
+    pcall(function() v = obj[key] end)
+    if v == nil then return "?" end
+    local s = nil
+    pcall(function()
+        if type(v) == "userdata" then
+            if v.GetArrayNum then s = "n=" .. tostring(v:GetArrayNum())
+            elseif v.GetFullName then s = v:GetFullName()
+            elseif v.ToString then s = v:ToString() end
+        end
+    end)
+    return s or tostring(v)
+end
+sw.swActor = function(actor)
+    if not (actor and actor.IsValid and actor:IsValid()) then return "nil" end
+    local parts = {}
+    for _, k in ipairs({ "EditVersion", "Points", "bClosedLoop", "NetDormancy", "NetUpdateFrequency",
+                         "bReplicates", "bOnlyRelevantToOwner", "bAlwaysRelevant", "bNetUseOwnerRelevancy", "Owner" }) do
+        parts[#parts + 1] = k .. "=" .. sw.swField(actor, k)
+    end
+    return objFullName(actor) .. " " .. table.concat(parts, " ")
+end
+sw.swParam = function(p)
+    local v = nil
+    pcall(function() v = p:get() end)
+    return v
+end
+sw.swVec = function(p)
+    local v = sw.swParam(p)
+    local s = "?"
+    pcall(function() s = string.format("%.0f,%.0f,%.0f", v.X, v.Y, v.Z) end)
+    if s == "?" then pcall(function() s = tostring(v) end) end
+    return s
+end
+sw.swOwner = function(ctx)
+    local s = "?"
+    pcall(function() s = objFullName(ctx:get():GetOuter()) end)
+    return s
+end
+sw.swNum = function(v)
+    local n = nil
+    pcall(function() n = tonumber(v) end)
+    return n
+end
+sw.beforeEdit = function(actor, why)
+    -- Flush before mutation so the replication baseline still contains the old
+    -- points. A post-only flush can baseline the new points and lose the delta.
+    if not (actor and actor.IsValid and actor:IsValid()) then return end
+    local flushed = pcall(function() actor:FlushNetDormancy() end)
+    sw.swLog(string.format("#%d %s: before edit flush=%s", sw.calls, tostring(why), tostring(flushed)))
+end
+sw.afterEdit = function(actor, why)
+    -- A remove/combine can destroy an actor; never call into it afterward.
+    if not (actor and actor.IsValid and actor:IsValid()) then return end
+    local forced = pcall(function() actor:ForceNetUpdate() end)
+    sw.swLog(string.format("#%d %s: after edit force=%s", sw.calls, tostring(why), tostring(forced)))
+end
+sw.census = function()
+    pcall(function()
+        local arr = safeFindAll("MistSplineworksActor")
+        local byClass = {}
+        for _, a in ipairs(arr) do
+            local cn = "?"
+            pcall(function() cn = a:GetClass():GetFName():ToString() end)
+            byClass[cn] = (byClass[cn] or 0) + 1
+        end
+        local parts = {}
+        for cn, n in pairs(byClass) do parts[#parts + 1] = cn .. "=" .. tostring(n) end
+        table.sort(parts)
+        sw.swLog("census: " .. tostring(#arr) .. " spline actors in the world at install (" .. table.concat(parts, " ") .. ")")
+        for i = 1, math.min(#arr, 6) do
+            sw.swLog("census[" .. i .. "] " .. sw.swActor(arr[i]))
+        end
+    end)
+end
+sw.install = function()
+    if sw.installed then return end
+    sw.installed = true
+    local base = "/Script/Mist.MistBuildingComponent:"
+    local function reg(fn, pre, post)
+        local ok, err = pcall(function() RegisterHook(base .. fn, pre, post or function() end) end)
+        log("splineworks hook " .. fn .. " install ok=" .. tostring(ok) .. (ok and "" or (" err=" .. tostring(err))))
+    end
+    reg("ServerCreateSpline", function(ctx, inPosition, inTemplate)
+        pcall(function()
+            sw.calls = sw.calls + 1
+            sw.swLog(string.format("#%d ServerCreateSpline owner=%s template=%s pos=%s",
+                sw.calls, sw.swOwner(ctx), objFullName(sw.swParam(inTemplate)), sw.swVec(inPosition)))
+        end)
+    end)
+    reg("ServerExtendSpline", function(ctx, splineActor, splineVersion, inPosition, bExtendFromStart, inTemplate)
+        pcall(function()
+            sw.calls = sw.calls + 1
+            local actor = sw.swParam(splineActor)
+            sw.beforeEdit(actor, "ServerExtendSpline")
+            local cv = sw.swNum(sw.swParam(splineVersion))
+            local ev = nil
+            pcall(function() ev = sw.swNum(actor.EditVersion) end)
+            local verdict = "version ok"
+            if ev == nil or cv == nil then verdict = "version unreadable"
+            elseif ev ~= cv then verdict = "VERSION MISMATCH (client " .. tostring(cv) .. " vs server " .. tostring(ev) .. ") -> the game rejects this edit" end
+            sw.swLog(string.format("#%d ServerExtendSpline owner=%s clientVersion=%s fromStart=%s template=%s pos=%s | %s | actor %s",
+                sw.calls, sw.swOwner(ctx), tostring(cv), tostring(sw.swParam(bExtendFromStart)),
+                objFullName(sw.swParam(inTemplate)), sw.swVec(inPosition), verdict, sw.swActor(actor)))
+        end)
+    end, function(ctx, splineActor)
+        pcall(function()
+            local actor = sw.swParam(splineActor)
+            local ev, np = nil, nil
+            pcall(function() ev = actor.EditVersion end)
+            pcall(function() np = actor.Points:GetArrayNum() end)
+            sw.swLog(string.format("#%d ServerExtendSpline done: actor EditVersion=%s points=%s (unchanged = rejected)",
+                sw.calls, tostring(ev), tostring(np)))
+            sw.afterEdit(actor, "ServerExtendSpline")
+        end)
+    end)
+    for _, fn in ipairs({ "ServerCloseSpline", "ServerRemoveSplineSegment", "ServerRemoveSpline" }) do
+        reg(fn, function(ctx, splineActor, splineVersion)
+            pcall(function()
+                sw.calls = sw.calls + 1
+                sw.beforeEdit(sw.swParam(splineActor), fn)
+                sw.swLog(string.format("#%d %s owner=%s clientVersion=%s | actor %s",
+                    sw.calls, fn, sw.swOwner(ctx), tostring(sw.swParam(splineVersion)), sw.swActor(sw.swParam(splineActor))))
+            end)
+        end, function(ctx, splineActor)
+            pcall(function() sw.afterEdit(sw.swParam(splineActor), fn) end)
+        end)
+    end
+    reg("ServerCombineSplines", function(ctx, splineActor1, splineVersion1, bExtendFromStart1, splineActor2, splineVersion2)
+        pcall(function()
+            sw.calls = sw.calls + 1
+            sw.beforeEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
+            sw.beforeEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
+            sw.swLog(string.format("#%d ServerCombineSplines owner=%s clientVersions=%s,%s | first %s | second %s",
+                sw.calls, sw.swOwner(ctx), tostring(sw.swParam(splineVersion1)), tostring(sw.swParam(splineVersion2)),
+                sw.swActor(sw.swParam(splineActor1)), sw.swActor(sw.swParam(splineActor2))))
+        end)
+    end, function(ctx, splineActor1, splineVersion1, bExtendFromStart1, splineActor2)
+        pcall(function()
+            sw.afterEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
+            sw.afterEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
+        end)
+    end)
+    pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistSplineworksActor", function(obj)
+            sw.spawns = sw.spawns + 1
+            if sw.spawns <= 40 then pcall(function() sw.swLog("spawned " .. objFullName(obj) .. " (" .. tostring(sw.spawns) .. ")") end) end
+        end)
+    end)
+    sw.census()
+end
+LoopAsync(5000, function()
+    local ok, done = pcall(function()
+        if sw.installed then return true end
+        if not (up and upT and (t - upT) > 5) then return false end
+        if type(ExecuteInGameThread) ~= "function" then sw.install(); return true end
+        sw.installed = true
+        ExecuteInGameThread(function()
+            sw.installed = false
+            pcall(sw.install)
+            sw.installed = true
+        end)
+        return true
+    end)
+    return (ok and done) and true or false
+end)
+end
