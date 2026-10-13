@@ -72,7 +72,7 @@ HearthServer answers Source A2S on the query port, so any standard server-list t
 
 Use `host-instance.ps1` to launch. It reads `HearthServer\appsettings.json`, checks the save, stages UE4SS beside the game, emits the per-instance Engine.ini, starts the supervisor, launches Bellwright headless with `-nullrhi`, injects UE4SS, applies the build-locked native patches, waits for the gameplay port to bind and then supervises the process, relaunching the game if it exits.
 
-`-Stop` and `-Restart` signal a running instance. Both have the game save the world first and wait for the save to land (up to about 30 seconds) before the game is closed; `Logs\host.log` says `save before stop: confirmed` when it did. Pass `-CoresPerInstance N` to pin each instance to its own set of cores when running several on one machine. The repository README has the step-by-step guide.
+`-Stop` and `-Restart` signal a running instance. Both ask the game to save the world first and wait up to 20 seconds for the save to land before the game is closed; `Logs\host.log` says `save before stop: confirmed` when it landed. The game sometimes skips a save requested right after its own autosave (it autosaves about every two minutes), so at most the last couple of minutes can be lost. Pass `-CoresPerInstance N` to pin each instance to its own set of cores when running several on one machine. The repository README has the step-by-step guide.
 
 ### When a start refuses
 
