@@ -17,6 +17,7 @@ local env = setmetatable({
     end,
     NotifyOnNewObject = function() end,
     ExecuteInGameThread = function(callback) callback() end,
+    executeInGameThreadSafe = function(_, callback) callback(); return true end,
     LoopAsync = function(_, callback) callback() end,
 }, { __index = _G })
 assert(load(source:sub(start), "spline hooks", "t", env))()

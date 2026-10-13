@@ -4305,11 +4305,13 @@ LoopAsync(5000, function()
         if not (up and upT and (t - upT) > 5) then return false end
         if type(ExecuteInGameThread) ~= "function" then sw.install(); return true end
         sw.installed = true
-        ExecuteInGameThread(function()
+        -- v0.18.58: through the protected helper like every other queued callback
+        local queued = executeInGameThreadSafe("splineworks-install", function()
             sw.installed = false
             pcall(sw.install)
             sw.installed = true
         end)
+        if not queued then sw.installed = false; return false end
         return true
     end)
     return (ok and done) and true or false
