@@ -373,7 +373,11 @@ fn inspect_live_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecove
 }
 
 fn recover_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, Error> {
-    let canonical = SaveContainer::load(save_path)?;
+    let raw = fs::read(save_path).map_err(io_error)?;
+    if is_torn(&raw) {
+        return recover_torn_canonical(save_path, ledger_dir, raw.len());
+    }
+    let canonical = SaveContainer::from_bytes(raw)?;
     let original_hash = sha256(&canonical.raw);
     let canonical_metrics = world_metrics(&canonical.decompressed)?;
     let baseline_path = ledger_dir.join(WORLD_BASELINE_FILE);
@@ -453,6 +457,105 @@ fn recover_world(save_path: &Path, ledger_dir: &Path) -> Result<WorldRecovery, E
         restored: true,
         regression_detected: false,
     })
+}
+
+/// A save the game never finished writing: empty, or every byte zero. A power loss in the
+/// middle of an autosave leaves exactly this on NTFS: the file at full length with none of
+/// its data on disk (seen 2026-09-15: TEMP_auto.sav and TEMP_auto.sav_backup0
+/// 100% zero). Anything else that fails to parse is left alone; a save from a newer game
+/// build must never be swapped for an older copy.
+fn is_torn(raw: &[u8]) -> bool {
+    raw.iter().all(|byte| *byte == 0)
+}
+
+/// Pre-launch only. The canonical save is torn (see `is_torn`), so the game cannot load
+/// it and the server would never start. Take the newest intact copy among the other
+/// rotation slots and the protected baseline (a progressed world before a starter one),
+/// move the torn file aside as `<name>.torn-<unix time>` (and any other torn slot), and
+/// put the intact copy in its place. Intact slots are left exactly as they are. With no
+/// intact copy anywhere the original error stands.
+fn recover_torn_canonical(
+    save_path: &Path,
+    ledger_dir: &Path,
+    torn_len: usize,
+) -> Result<WorldRecovery, Error> {
+    let mut candidates = Vec::<(bool, SystemTime, u8, SaveContainer)>::new();
+    let mut torn_slots = Vec::<PathBuf>::new();
+    if let Some(save_dir) = save_path.parent() {
+        for name in ROTATING_SAVE_NAMES {
+            let path = save_dir.join(name);
+            if paths_equal(&path, save_path) || !path.is_file() {
+                continue;
+            }
+            let Ok(raw) = fs::read(&path) else { continue };
+            if is_torn(&raw) {
+                torn_slots.push(path);
+                continue;
+            }
+            let Ok(candidate) = SaveContainer::from_bytes(raw) else { continue };
+            let Ok(metrics) = world_metrics(&candidate.decompressed) else { continue };
+            candidates.push((
+                metrics.progress_records >= MIN_PROGRESSED_WORLD_RECORDS,
+                modified_or_epoch(&path),
+                rotating_save_priority(&path),
+                candidate,
+            ));
+        }
+    }
+    let baseline_path = ledger_dir.join(WORLD_BASELINE_FILE);
+    if baseline_path.is_file() {
+        if let Ok(candidate) = SaveContainer::load(&baseline_path) {
+            if let Ok(metrics) = world_metrics(&candidate.decompressed) {
+                candidates.push((
+                    metrics.progress_records >= MIN_PROGRESSED_WORLD_RECORDS,
+                    modified_or_epoch(&baseline_path),
+                    5,
+                    candidate,
+                ));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let Some((_, _, _, selected)) = candidates.pop() else {
+        return Err(Error::BadFile(format!(
+            "missing VSWB magic (the save is {torn_len} zero bytes and no intact copy was found)"
+        )));
+    };
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    park_torn(save_path, stamp)?;
+    for path in &torn_slots {
+        park_torn(path, stamp)?;
+    }
+    write_atomic(save_path, &selected.raw)?;
+    let restored = SaveContainer::load(save_path)?;
+    if restored.raw != selected.raw {
+        return Err(Error::Parse("recovered save did not read back".into()));
+    }
+    Ok(WorldRecovery {
+        original_hash: sha256(&restored.raw),
+        save: restored,
+        restored: true,
+        regression_detected: false,
+    })
+}
+
+fn park_torn(path: &Path, stamp: u64) -> Result<(), Error> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(Error::Io("torn save has no file name".into()));
+    };
+    let parked = path.with_file_name(format!("{name}.torn-{stamp}"));
+    if parked.exists() {
+        return Err(Error::Io(format!("{} already exists", parked.display())));
+    }
+    fs::rename(path, &parked).map_err(io_error)
 }
 
 fn normalize_rotating_saves(save_path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -964,6 +1067,121 @@ mod tests {
             fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(),
             progressed_today
         );
+    }
+
+    fn parked(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix) && name.contains(".torn-"))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_zeroed_canonical_after_a_power_loss_is_replaced_by_the_newest_intact_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let george = player("NULL:Havlas-11111111111111111111111111111111", 0x41);
+        let yesterday = synthetic_save(&world(68, std::slice::from_ref(&george)));
+        let today = synthetic_save(&world(76, std::slice::from_ref(&george)));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(save_dir.join("TEMP_auto_yesterday.sav"), &yesterday).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(save_dir.join("TEMP_auto_today.sav"), &today).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&canonical, vec![0u8; 5_165_369]).unwrap();
+        fs::write(save_dir.join("TEMP_auto.sav_backup0"), vec![0u8; 5_152_696]).unwrap();
+
+        let outcome = protect(&canonical, &ledger).unwrap();
+
+        assert!(outcome.world_restored);
+        assert_eq!(outcome.world_records, 76);
+        assert_eq!(fs::read(&canonical).unwrap(), today);
+        // intact slots untouched, torn ones parked beside them, nothing deleted
+        assert_eq!(fs::read(save_dir.join("TEMP_auto_today.sav")).unwrap(), today);
+        assert_eq!(fs::read(save_dir.join("TEMP_auto_yesterday.sav")).unwrap(), yesterday);
+        assert!(!save_dir.join("TEMP_auto.sav_backup0").exists());
+        let torn_canonical = parked(&save_dir, "TEMP_auto.sav.torn-");
+        assert_eq!(torn_canonical.len(), 1);
+        assert_eq!(fs::read(&torn_canonical[0]).unwrap().len(), 5_165_369);
+        assert_eq!(parked(&save_dir, "TEMP_auto.sav_backup0.torn-").len(), 1);
+        assert_eq!(fs::read(ledger.join(WORLD_BASELINE_FILE)).unwrap(), today);
+    }
+
+    #[test]
+    fn a_zeroed_canonical_prefers_a_progressed_world_over_a_newer_starter() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let progressed = synthetic_save(&world(70, &[]));
+        let starter = synthetic_save(&world(9, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(save_dir.join("TEMP_auto_yesterday.sav"), &progressed).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(save_dir.join("TEMP_auto_today.sav"), &starter).unwrap();
+        fs::write(&canonical, vec![0u8; 4096]).unwrap();
+
+        let outcome = protect(&canonical, &ledger).unwrap();
+
+        assert!(outcome.world_restored);
+        assert_eq!(fs::read(&canonical).unwrap(), progressed);
+    }
+
+    #[test]
+    fn a_zeroed_canonical_with_no_intact_copy_still_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(&canonical, vec![0u8; 4096]).unwrap();
+        fs::write(save_dir.join("TEMP_auto.sav_backup0"), vec![0u8; 4096]).unwrap();
+
+        let error = protect(&canonical, &ledger).unwrap_err();
+
+        assert!(error.to_string().contains("missing VSWB magic"), "{error}");
+        assert_eq!(fs::read(&canonical).unwrap(), vec![0u8; 4096]);
+        assert!(parked(&save_dir, "TEMP_auto.sav").is_empty());
+    }
+
+    #[test]
+    fn a_canonical_that_is_not_zeroed_but_will_not_parse_is_never_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let older = synthetic_save(&world(70, &[]));
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(save_dir.join("TEMP_auto_today.sav"), &older).unwrap();
+        let mut unknown = vec![0u8; 4096];
+        unknown[0..4].copy_from_slice(b"VSWC");
+        fs::write(&canonical, &unknown).unwrap();
+
+        assert!(protect(&canonical, &ledger).is_err());
+        assert_eq!(fs::read(&canonical).unwrap(), unknown);
+    }
+
+    #[test]
+    fn live_protection_never_repairs_a_zeroed_canonical() {
+        let temp = tempfile::tempdir().unwrap();
+        let save_dir = temp.path().join("SaveGames");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&save_dir).unwrap();
+        let canonical = save_dir.join("TEMP_auto.sav");
+        fs::write(save_dir.join("TEMP_auto_today.sav"), synthetic_save(&world(70, &[]))).unwrap();
+        fs::write(&canonical, vec![0u8; 4096]).unwrap();
+
+        assert!(protect_live(&canonical, &ledger).is_err());
+        assert_eq!(fs::read(&canonical).unwrap(), vec![0u8; 4096]);
     }
 
     #[test]

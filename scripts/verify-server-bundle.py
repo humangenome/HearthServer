@@ -45,6 +45,10 @@ REQUIRED_ENTRIES = (
     # bw_fog: the software map-fog reveal (isolated mod, switched on in mods.txt).
     "ue4ss/Mods/bw_fog/HearthFogReveal.dll",
     "ue4ss/Mods/bw_fog/Scripts/main.lua",
+    # bw_seat4: world data for the player the game has no data seat for
+    # (isolated mod, switched on in mods.txt).
+    "ue4ss/Mods/bw_seat4/HearthFourthSeat.dll",
+    "ue4ss/Mods/bw_seat4/Scripts/main.lua",
     # The 5 PDB-derived AOB signatures are mandatory on UE5.7. Without them
     # UE4SS falls back to its built-in scanner, hits the GUObjectArray trap and
     # hangs at "Waiting for object construction".
@@ -155,6 +159,8 @@ def verify(path):
              "HearthGameplaySettings.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
             ("ue4ss/mods/bw_fog/hearthfogreveal.dll",
              "HearthFogReveal.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
+            ("ue4ss/mods/bw_seat4/hearthfourthseat.dll",
+             "HearthFourthSeat.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
             ("redist/d3d10warp.dll", "redist/d3d10warp.dll", MIN_WARP_BYTES),
             ("host-instance.ps1", "host-instance.ps1", MIN_HOST_SCRIPT_BYTES),
         )

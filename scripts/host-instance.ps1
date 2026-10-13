@@ -52,12 +52,13 @@
   disjoint tile keyed off its gameplay port (base 7777, stride 100).
 
 .PARAMETER Stop
-  Ask a running instance to stop (writes the stop marker, ends the supervisor and
-  the game process), then exit.
+  Ask a running instance to stop: writes the stop marker, ends the supervisor, has
+  the game save the world (waits up to about 30 s), then ends the game and
+  HearthServer.
 
 .PARAMETER Restart
   Ask a running instance to recycle its game process (the supervisor and
-  HearthServer stay up), then exit.
+  HearthServer stay up; the world is saved first), then exit.
 
 .EXAMPLE
   .\host-instance.ps1 -GameRoot "D:\Bellwright"
@@ -97,17 +98,76 @@ $restartReq  = Join-Path $logDir 'bw_restart.request'
 $stopMarker  = Join-Path $logDir 'bw_stop.marker'
 function L($m){ $line = ('[' + (Get-Date -Format o) + '] ' + $m); Write-Host $line; Add-Content -LiteralPath $logPath -Value $line -ErrorAction SilentlyContinue }
 
+# Save the world before the game process is killed. bw_host saves when it finds
+# Logs\hearth_force_save_<gameplay port>.marker (it checks about every 5 s); the
+# game writes temp-then-rename, so a newer TEMP_auto.sav means a whole save landed.
+# Without this, -Stop and -Restart killed the game outright: everything since the
+# last autosave was lost, and a kill in the middle of an autosave can leave a torn
+# save. Same steps as the managed stop command.
+function Save-WorldBeforeKill([int]$gamePid, [int]$port, [string]$savePath) {
+  if ($gamePid -le 0 -or $port -le 0 -or [string]::IsNullOrWhiteSpace($savePath)) { return }
+  $proc = Get-Process -Id $gamePid -ErrorAction SilentlyContinue
+  if (-not $proc -or $proc.ProcessName -notlike 'BellwrightGame*') { return }
+  $marker = Join-Path $logDir ('hearth_force_save_' + $port + '.marker')
+  $was = [datetime]::MinValue
+  if (Test-Path -LiteralPath $savePath) { try { $was = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
+  Set-Content -LiteralPath $marker -Value ((Get-Date).ToString('o')) -ErrorAction SilentlyContinue
+  $ok = $false
+  $end = (Get-Date).AddSeconds(20)
+  while ((Get-Date) -lt $end) {
+    Start-Sleep -Milliseconds 500
+    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) { break }
+    $now = [datetime]::MinValue
+    if (Test-Path -LiteralPath $savePath) { try { $now = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
+    if ($now -gt $was) { $ok = $true; break }
+  }
+  if ($ok) {
+    # never kill on the tick the rename landed: wait until size and time stop moving
+    $sig = ''
+    $end2 = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $end2) {
+      Start-Sleep -Milliseconds 500
+      $item = Get-Item -LiteralPath $savePath -ErrorAction SilentlyContinue
+      if (-not $item) { break }
+      $cur = [string]$item.LastWriteTimeUtc + '|' + [string]$item.Length
+      if ($cur -eq $sig) { break }
+      $sig = $cur
+    }
+  }
+  Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+  if ($ok) { L 'save before stop: confirmed' } else { L 'save before stop: NOT confirmed within 20 s (stopping anyway)' }
+}
+function Read-PidFile([string]$path) {
+  $p = 0
+  if (Test-Path -LiteralPath $path) { try { $p = [int](Get-Content -LiteralPath $path -ErrorAction Stop | Select-Object -First 1) } catch {} }
+  return $p
+}
+
 # ---------------------------------------------------------------------------
 # -Stop / -Restart: signal a running instance and leave.
 # ---------------------------------------------------------------------------
 if ($Stop) {
   [IO.File]::WriteAllText($stopMarker, 'stop', [System.Text.Encoding]::ASCII)
-  foreach ($pf in @($supPidFile, $pidFile, $serverPidFile)) {
-    if (Test-Path -LiteralPath $pf) {
-      $p = 0; try { $p = [int](Get-Content -LiteralPath $pf -ErrorAction Stop | Select-Object -First 1) } catch {}
-      if ($p -gt 0) { try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {} }
-      Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
-    }
+  # 1. the supervisor first, so it cannot relaunch the game while it saves
+  $p = Read-PidFile $supPidFile
+  if ($p -gt 0) { try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {} }
+  Remove-Item -LiteralPath $supPidFile -Force -ErrorAction SilentlyContinue
+  # 2. save the world (port and save path from the same settings the launch used)
+  $stopPort = 0; $stopSave = ''
+  try {
+    $stopHearth = (Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json).Hearth
+    $stopPort = [int]$stopHearth.GameplayPort; if ($stopPort -le 0) { $stopPort = 7777 }
+    $stopUserDir = [string]$stopHearth.GameUserDir
+    if ([string]::IsNullOrWhiteSpace($stopUserDir)) { $stopUserDir = Join-Path $PackageRoot 'UserDir' }
+    if (-not [IO.Path]::IsPathRooted($stopUserDir)) { $stopUserDir = Join-Path $serverDir $stopUserDir }
+    $stopSave = Join-Path $stopUserDir 'Saved\SaveGames\TEMP_auto.sav'
+  } catch { L ('save before stop: settings not readable (' + $_.Exception.Message + ')') }
+  Save-WorldBeforeKill (Read-PidFile $pidFile) $stopPort $stopSave
+  # 3. then the game and HearthServer
+  foreach ($pf in @($pidFile, $serverPidFile)) {
+    $p = Read-PidFile $pf
+    if ($p -gt 0) { try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {} }
+    Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
   }
   L 'stop requested: supervisor, game and HearthServer signalled'
   return
@@ -322,8 +382,12 @@ MinDynamicBandwidth=524288
 bUseFixedFrameRate=true
 FixedFrameRate=30.000000
 
+[/Script/Engine.GarbageCollectionSettings]
+gc.TimeBetweenPurgingPendingKillObjects=180
+
 [ConsoleVariables]
 t.MaxFPS=30
+gc.TimeBetweenPurgingPendingKillObjects=180
 sg.GlobalIlluminationQuality=0
 sg.ReflectionQuality=0
 sg.ShadowQuality=0
@@ -334,6 +398,12 @@ sg.FoliageQuality=0
 net.UseAdaptiveNetUpdateFrequency=1
 net.TrackQueuedActorThreshold=1
 net.TrackQueuedActorThresholdOwner=1
+
+[Core.Log]
+; The game logs "GetTargets called on quest ... but player was null" under LogGame
+; many times a second, because the hidden host has no player: 98% of the log on a
+; long-running server (190 MB in 18 days, measured 2026-10-12). Errors still log.
+LogGame=Error
 "@ -replace "`r?`n", "`r`n"
 foreach ($cfgDir in @((Join-Path $userDir 'Saved\Config\Windows'), (Join-Path $userDir 'Bellwright\Saved\Config\Windows'), (Join-Path $userDir 'Bellwright\Saved\Config\WindowsServer'))) {
   if (-not (Test-Path -LiteralPath $cfgDir)) { New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null }
@@ -926,6 +996,42 @@ public class BwInj {
     Buffer.BlockCopy(expected,0,trampoline,5,expected.Length);
     return InstallEntryTrampoline(pid,imageBase,rva,"UMistUIManager::CreateTemporaryContext null-manager guard",expected,trampoline,19,expected.Length);
   }
+  public static string PatchMaxSessionPlayers(int pid, long imageBase, int sessionPlayers){
+    // GetMaxSessionPlayers() returns max(1, min(4, GMistMaxSessionPlayers)), a hard
+    // cap of 4 people per session. AMistOasisGameMode::PreLogin refuses a join with
+    // MistSessionFull once the world's PlayerStates reach it, and the hidden host's
+    // own PlayerState is one of them, so a 4-slot server only ever admitted 3 real
+    // players. AMistOasisGameSession::InitOptions also overwrites the
+    // URL MaxPlayers with it. Return the paid slots plus the host's seat instead.
+    const long rva = 0x63F8770;
+    byte[] expected = new byte[]{0xB9,0x04,0x00,0x00,0x00,0xB8,0x01,0x00,0x00,0x00};
+    if(sessionPlayers < 2 || sessionPlayers > 65) return "ERR session player count out of range " + sessionPlayers;
+    byte[] patch = new byte[]{0xB8,(byte)sessionPlayers,0x00,0x00,0x00,0xC3};
+    IntPtr h=OpenProcess(0x1FFFFF,false,pid); if(h==IntPtr.Zero) return "ERR OpenProcess";
+    IntPtr addr = new IntPtr(imageBase + rva);
+    byte[] cur = new byte[expected.Length];
+    UIntPtr n;
+    if(!ReadProcessMemory(h,addr,cur,(uint)cur.Length,out n)) return "ERR ReadProcessMemory";
+    bool already=true;
+    for(int i=0;i<patch.Length;i++){ if(cur[i]!=patch[i]){ already=false; break; } }
+    if(already) return "OK already patched GetMaxSessionPlayers RVA 0x63F8770 = " + sessionPlayers;
+    for(int i=0;i<expected.Length;i++){
+      if(cur[i]!=expected[i]) return "ERR unexpected GetMaxSessionPlayers bytes at RVA 0x63F8770 got " + Hex(cur, expected.Length);
+    }
+    uint oldProtect;
+    if(!VirtualProtectEx(h,addr,(uint)patch.Length,0x40,out oldProtect)) return "ERR VirtualProtectEx";
+    UIntPtr w;
+    if(!WriteProcessMemory(h,addr,patch,(uint)patch.Length,out w)) return "ERR WriteProcessMemory";
+    FlushInstructionCache(h,addr,(uint)patch.Length);
+    uint discard;
+    VirtualProtectEx(h,addr,(uint)patch.Length,oldProtect,out discard);
+    byte[] verify = new byte[patch.Length];
+    if(!ReadProcessMemory(h,addr,verify,(uint)verify.Length,out n)) return "ERR verify ReadProcessMemory";
+    for(int i=0;i<patch.Length;i++){
+      if(verify[i]!=patch[i]) return "ERR verify mismatch got " + Hex(verify, verify.Length);
+    }
+    return "OK patched GetMaxSessionPlayers RVA 0x63F8770: max 4 -> " + sessionPlayers + " (" + Hex(patch, patch.Length) + ")";
+  }
 }
 "@ -ErrorAction SilentlyContinue
 $cores = [int]$env:NUMBER_OF_PROCESSORS; if ($cores -lt 1) { $cores = 1 }
@@ -1047,6 +1153,19 @@ function Inject-Dll([int]$cpid, [string]$dllPath, [string]$label, [string]$ready
 function Start-HostWithRetry {
   for ($attempt = 1; $attempt -le 3; $attempt++) {
     if (Test-Path -LiteralPath $stopMarker) { L 'stop requested during launch -> abort'; return 0 }
+    # Keep the last three sessions' host-mod logs (bw_host.1.log = previous session), so a
+    # restart does not destroy the record of the session being asked about.
+    try {
+      if (Test-Path -LiteralPath $hostLog) {
+        $hl3 = [System.IO.Path]::ChangeExtension($hostLog, '3.log')
+        $hl2 = [System.IO.Path]::ChangeExtension($hostLog, '2.log')
+        $hl1 = [System.IO.Path]::ChangeExtension($hostLog, '1.log')
+        Remove-Item -LiteralPath $hl3 -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $hl2) { Move-Item -LiteralPath $hl2 -Destination $hl3 -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $hl1) { Move-Item -LiteralPath $hl1 -Destination $hl2 -Force -ErrorAction SilentlyContinue }
+        Move-Item -LiteralPath $hostLog -Destination $hl1 -Force -ErrorAction SilentlyContinue
+      }
+    } catch { }
     Remove-Item -LiteralPath $hostLog -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fogPatchMarker -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $gameplaySettingsStatus -Force -ErrorAction SilentlyContinue
@@ -1110,6 +1229,18 @@ function Start-HostWithRetry {
       $uiRes = [BwInj]::PatchTemporaryUiContextNullManager($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
       L ('native settlement-UI null-manager patch: ' + $uiRes)
     } catch { L ('native player-map/crash patch EXCEPTION: ' + $_.Exception.Message) }
+    #
+    # SESSION CAPACITY PATCH (build 24840601): Bellwright caps a session at 4
+    # people and counts the hidden host, so a 4-player server admitted only 3 real
+    # players and the URL MaxPlayers bw_host passes was overwritten. Make the
+    # game's cap MaxPlayers plus the host's seat. Must land before bw_host's
+    # OpenLevel (GameSession InitOptions reads it once); PreLogin reads it on
+    # every join.
+    try {
+      $gameProc0 = Get-Process -Id $cpid -ErrorAction Stop
+      $sessionRes = [BwInj]::PatchMaxSessionPlayers($cpid, $gameProc0.MainModule.BaseAddress.ToInt64(), ($maxPlayers + 1))
+      L ('native session-capacity patch: ' + $sessionRes)
+    } catch { L ('native session-capacity patch EXCEPTION: ' + $_.Exception.Message) }
     #
     # NULLRHI FOG PATCHES (build 24840601): the original v0.1.77 crash stack lands
     # in UMapRevealerComponent::UpdateMapFogAtLocation after AMapFog::Tick passes a
@@ -1231,6 +1362,10 @@ function Start-HostWithRetry {
 # clear stale stop/restart markers so a fresh start is clean
 Remove-Item -LiteralPath $stopMarker -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $restartReq -Force -ErrorAction SilentlyContinue
+# clear the last session's player list. HearthServer reads roster.json the moment it starts,
+# but bw_host only rewrites it once its service loop runs (about 3 minutes in), so a server
+# stopped with a player connected showed that player in the count after every restart.
+Remove-Item -LiteralPath (Join-Path $serverDir 'roster.json') -Force -ErrorAction SilentlyContinue
 # write the supervisor pid BEFORE the initial launch so a concurrent stop can kill us even
 # during the boot/inject window (Start-HostWithRetry also aborts if $stopMarker appears).
 try { $PID | Set-Content -Encoding ASCII $supPidFile } catch {}
@@ -1268,7 +1403,7 @@ while ($true) {
   if ($recycle) {
     L 'restart-request -> recycle host'
     Remove-Item -LiteralPath $restartReq -Force -ErrorAction SilentlyContinue
-    if ($alive) { try { Stop-Process -Id $cpid -Force -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Seconds 4 }
+    if ($alive) { Save-WorldBeforeKill $cpid $gameplayPort $canonicalSave; try { Stop-Process -Id $cpid -Force -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Seconds 4 }
   } else { L ('host pid ' + $cpid + ' gone (crash/exit) -> relaunch') }
   Reap-Crash
   if (Test-Path -LiteralPath $stopMarker) { L 'stop marker before relaunch -> supervisor exit'; break }

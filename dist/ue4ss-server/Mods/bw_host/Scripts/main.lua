@@ -1,4 +1,71 @@
--- bw_host v0.18.53: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.58: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.58: the false "Server full" after a fast reconnect (2026-09-16,
+--              seen again 2026-10-09 at PCs=4 against a cap of 5). The engine
+--              refuses a login with "Server full." when GameMode NumPlayers +
+--              NumTravellingPlayers reaches GameSession MaxPlayers, and on these
+--              hosts that sum can stay above the number of live controllers
+--              after a player reconnects before their old connection is reaped,
+--              until a restart. The heartbeat now logs the engine's count next
+--              to the live controllers (seats=) and, when the count stays above
+--              the live non-spectator controllers for two heartbeats in a row
+--              with no join or leave in between and nobody travelling, sets it
+--              back on the game thread. Log line: 'seat count corrected'.
+--              Kill switch: environment HEARTH_SEAT_HEAL=0. Also folds in the
+--              unreleased v0.18.56 dropped-controller change below (with its
+--              objectAddress use-before-definition fixed: it stopped the join
+--              service on every pass in the lab), and removes a MapFog sweep
+--              loop that had never run (same use-before-definition shape).
+--   v0.18.57: a late joiner is no longer frozen. HearthServer drops a
+--              login-identities row 45 min after login. The conn of a player
+--              who stayed longer then failed its sticky lookup and recency-
+--              claimed the next fresh row, which was the newcomer's; the
+--              newcomer got no identity and was quarantined (no-login-
+--              identity) ~7 min later, and the old player took over the
+--              newcomer's roster id (and admin ticket, if any). Seen
+--              2026-10-10 on two servers. A conn that holds a claim now only
+--              re-claims a row with its own seed; a captured identity holds
+--              for the life of the controller (only weak -> Steam-backed may
+--              replace it); claims and identities keyed by object address
+--              are dropped when the address now holds a differently named
+--              conn or controller.
+--   v0.18.56: (first shipped in v0.18.58) leave a real player's dropped
+--              controller to the game. A remote
+--              player whose connection dropped on the Halmare map had their
+--              orphaned controller frozen by the pre-login quarantine 9 s later
+--              (SetReplicates false, tick off, hidden) while the game kept it
+--              alive for 2.5 min; the rejoin 35 s after the drop came back with
+--              an empty character (2026-09-15). The quarantine now skips any
+--              controller that was serviced with a live connection, nothing is
+--              quarantined or start-driven on the TransitionMap, and the host's
+--              own controller is recognised by object address across a travel
+--              (its full name changes per map; it was quarantined on the return
+--              trip). Log line: 'remote player connection dropped, controller
+--              left to the game'.
+--   v0.18.55: Renown readout and a staff repair lever. A remote player's
+--              Renown went to -14,560 after a time skip on the islands. In
+--              this build the HUD number is TotalRenown minus the Renown
+--              "used" by recruited villagers and structures (UMistHiring-
+--              ValueComponent::UpdateUsedRenown, recomputed on data rebind and
+--              snapshotted per map on a voyage); daily militia/mercenary
+--              upkeep is paid in coins, never Renown. The mod now logs the
+--              hiring component's readable properties at install, after each
+--              world change and around every Renown movement it can hook
+--              (PayRenownCost, MulticastRenownGained, ServerGiveRenown), and
+--              honours an operator marker Logs\bw_renown.marker holding one
+--              integer: GiveRenown(n) through the game's own cheat component,
+--              logged before/after, marker removed. Nothing runs without it.
+--   v0.18.54: (1) a seamless travel passes through /Game/Mist/Maps/Dev/
+--              TransitionMap for ~25 s; v0.18.50 took THAT as the world change
+--              and its 60 s throttle swallowed the real destination, so the
+--              Travel Sign sweep re-ran against the transition map. In-transit
+--              worlds are ignored now; the destination is the change.
+--              (2) Log-only diagnostics for the two open reports on a remote
+--              player's map after a voyage and their palisade after Place:
+--              the seamless-travel handshake (ServerFinishSeamlessTravelSetup,
+--              ClientPostSeamlessTravelSetup, the ClientSendIcon* stream and
+--              ServerKeyValuesAck per player), the four Client spline replies,
+--              a property dump of the wall actor after every accepted edit and
+--              the construction-site count before/after. Nothing else changes.
 --   v0.18.53: flush spline dormancy BEFORE the game edits replicated points.
 --              Waking afterward can initialize the replication comparison from
 --              the already-modified state and lose the update. Request the net
@@ -243,6 +310,12 @@ local ADMIN_AUTH = {
     configured = {},
     count = 0,
     pawnByPc = {},
+    -- v0.18.56: per-PC flags for the dropped-connection rule (see shouldServiceRemoteController)
+    livePlayerByPc = {},
+    dropLoggedByPc = {},
+    -- v0.18.58: the controller's short name last seen at each object address, so a
+    -- controller that reuses a departed one's address starts with clean flags
+    nameByPc = {},
     queuedByPc = {},
     unavailableByPc = {},
     deniedByPc = {},
@@ -334,7 +407,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.53  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.58  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -425,17 +498,10 @@ for _, fogCls in ipairs({ "/Script/Mist.MapFog", "/Script/Mist.MistMapFog" }) do
         end)
     end)
 end
--- safety sweep for instances that predate the mod or respawn oddly
-LoopAsync(5000, function()
-    pcall(function()
-        for _, cn in ipairs({ "MapFog", "MistMapFog" }) do
-            for _, o in ipairs(safeFindAll(cn)) do
-                pcall(function() guardFogActor(o) end)
-            end
-        end
-    end)
-    return false
-end)
+-- v0.18.58: a 5 s "safety sweep" loop used to sit here. It called safeFindAll before
+-- that local is defined, so it raised inside its pcall on every pass and never guarded
+-- anything; the NotifyOnNewObject hooks above are what has always guarded the fog actors
+-- (the native patches land before the world loads). Removed rather than switched on.
 
 local function flagText(flags)
     local n = tonumber(flags) or 0
@@ -1454,6 +1520,18 @@ local function liveGameMode()
 end
 
 local knownHostControllerNames = {}
+-- v0.18.56: the listen host's own controller keeps its object address across a
+-- seamless travel while its full name changes with the map, so the name set alone
+-- let the host controller be treated as a remote joiner on the TransitionMap and
+-- quarantined there (customer voyage, 2026-09-15). Addresses share the name set
+-- (numeric keys) so the chunk stays under Lua's 200-local limit.
+
+-- (defined before isRemoteJoinerCandidate, which keys the host controller by address)
+local function objectAddress(obj)
+    local addr = 0
+    pcall(function() addr = obj:GetAddress() end)
+    return tonumber(addr) or 0
+end
 
 -- Is this PlayerController a REMOTE joiner candidate (not the host's own local
 -- player)? This is only a first-pass classifier: serviceJoiners must still prove
@@ -1461,16 +1539,11 @@ local knownHostControllerNames = {}
 local function isRemoteJoinerCandidate(pc)
     local full = objFullName(pc)
     if knownHostControllerNames[full] then return false end
+    if knownHostControllerNames[objectAddress(pc)] then return false end
     local isLocal = false
     pcall(function() isLocal = pc:IsLocalPlayerController() end)
     if isLocal then return false end
     return true
-end
-
-local function objectAddress(obj)
-    local addr = 0
-    pcall(function() addr = obj:GetAddress() end)
-    return tonumber(addr) or 0
 end
 
 local function playerStateOf(pc)
@@ -1548,6 +1621,7 @@ local function sanitizeHost(pc)
     if type(ExecuteInGameThread) ~= "function" then return end
     knownHostControllerNames[objFullName(pc)] = true
     local pcAddr = objectAddress(pc)
+    if pcAddr ~= 0 then knownHostControllerNames[pcAddr] = true end
     if pcAddr == 0 or hostControllerSanitized[pcAddr] == "complete" then return end
     executeInGameThreadSafe("sanitize-host", function()
         if not (pc and pc.IsValid and pc:IsValid()) then return end
@@ -1574,6 +1648,36 @@ local stableSeedByPc = {}
 local rosterNameByPc = {}
 local identitySeedLoggedByPc = {}
 local identitySkipLoggedByPc = {}
+-- v0.18.57 identity guards, one table (the main chunk is at Lua's 200-local limit).
+-- pcName: the controller an identity was captured for (its full name carries a
+-- per-session serial, OasisPlayerController_C_5); the maps above are keyed by object
+-- address, which the engine can hand to a new controller after a player leaves.
+-- rowSeed / connName: the seed of the login row a conn claimed and that conn's full
+-- name (IpConnection_N), for the same reason on the conn side.
+local IDGUARD = { pcName = {}, keptByPc = {}, rowSeed = {}, connName = {}, keptByConn = {},
+    claimedRows = {}, claimByConn = {} }
+
+function IDGUARD.forgetStalePc(pc, key)
+    local held = IDGUARD.pcName[key]
+    if not held then return end
+    local now = objFullName(pc)
+    if now == "None" or now == held then return end
+    log("identity: controller address " .. tostring(key) .. " is now " .. now .. " (was " .. held
+        .. "); dropping the old identity seed='" .. tostring(stableSeedByPc[key]) .. "'")
+    stableIdByPc[key] = nil
+    stableSeedByPc[key] = nil
+    rosterNameByPc[key] = nil
+    identitySeedLoggedByPc[key] = nil
+    identitySkipLoggedByPc[key] = nil
+    IDGUARD.keptByPc[key] = nil
+    IDGUARD.pcName[key] = nil
+    -- admin authority is keyed the same way; the new player earns their own
+    ADMIN_AUTH.authorizedSteamByPc[key] = nil
+    ADMIN_AUTH.deniedByPc[key] = nil
+    ADMIN_AUTH.unavailableByPc[key] = nil
+    ADMIN_AUTH.pawnByPc[key] = nil
+    ADMIN_AUTH.republishByPc[key] = nil
+end
 
 local function trimString(s)
     if type(s) ~= "string" then return nil end
@@ -1790,6 +1894,13 @@ local REMOTE_LOGIN_IDENTITY_WAIT_SECONDS = 165
 local pendingRemoteByPc = {}
 local remoteWaitLoggedByPc = {}
 local remoteQuarantinedByPc = {}
+-- v0.18.56: controllers that were serviced with a live connection and identity. When
+-- such a player's connection drops, the game keeps the controller alive for a while
+-- (about 2.5 min on the Halmare map, 2026-09-15) and its own reconnect handling owns
+-- it; the pre-login quarantine (SetReplicates false, tick off, hidden) must never
+-- touch it. The quarantine is for controllers that never had a live player.
+-- (state lives in ADMIN_AUTH.livePlayerByPc / ADMIN_AUTH.dropLoggedByPc: the chunk is at
+-- Lua's 200-local limit, so no new top-level locals.)
 local requestUrlProbeLogged = false
 
 local function usefulRequestUrl(s)
@@ -1888,8 +1999,12 @@ local loginIdentityCache = { loadedAt = 0, byAddress = {}, byLogin = {}, rows = 
 -- request URL is readable through UE4SS, an unmatched live conn claims the
 -- oldest unclaimed fresh TSV row; each row is handed out to exactly one conn.
 local LOGIN_ROW_CLAIM_MAX_AGE_MS = 150000
-local claimedLoginRows = {}   -- rowKey -> conn object address
-local loginRowClaimByConn = {} -- conn object address -> rowKey
+-- IDGUARD.claimedRows: rowKey -> conn object address; IDGUARD.claimByConn: conn object
+-- address -> rowKey (moved into IDGUARD in v0.18.57: the main chunk is at 200 locals).
+-- v0.18.57: HearthServer drops a row 45 min after login, so a player who stays longer
+-- loses their sticky row; their conn then claimed the next fresh row, a newcomer's, and
+-- the newcomer was quarantined (no-login-identity) ~7 min later. A conn that holds a
+-- claim now only re-claims a row with its own player's seed (IDGUARD.rowSeed).
 
 local function loginCacheDecode(s)
     return urlDecode(s or "") or ""
@@ -1946,27 +2061,55 @@ local function claimLoginRowForConn(conn, cache)
     local connKey = objectAddress(conn)
     if connKey == 0 then return nil, nil end
 
+    -- v0.18.57: a new connection can get a departed one's object address; its
+    -- full name (IpConnection_N, a per-session serial) tells them apart.
+    local connName = objFullName(conn)
+    local claimedKey = IDGUARD.claimByConn[connKey]
+    if claimedKey and IDGUARD.connName[connKey] and connName ~= "None"
+        and IDGUARD.connName[connKey] ~= connName then
+        log("identity: conn address " .. tostring(connKey) .. " is now " .. connName .. " (was "
+            .. tostring(IDGUARD.connName[connKey]) .. "); dropping its old claim seed='"
+            .. tostring(IDGUARD.rowSeed[connKey]) .. "'")
+        IDGUARD.claimByConn[connKey] = nil
+        IDGUARD.rowSeed[connKey] = nil
+        IDGUARD.connName[connKey] = nil
+        IDGUARD.keptByConn[connKey] = nil
+        claimedKey = nil
+    end
+
     -- sticky: a conn that already claimed a row keeps it while the row lives
-    local claimedKey = loginRowClaimByConn[connKey]
     if claimedKey then
         for _, row in ipairs(cache.rows) do
             if loginRowKey(row) == claimedKey then return row, "claimed-row" end
         end
     end
+    -- v0.18.57: a conn that already holds a claim may only move to a row with its
+    -- own player's seed (HearthServer rewrites a row a few seconds after login);
+    -- once its row has expired it claims nothing, so it can never take a newcomer's.
+    local ownSeed = claimedKey and IDGUARD.rowSeed[connKey] or nil
 
     local nowMs = os.time() * 1000
     for _, row in ipairs(cache.rows) do -- oldest first: login order ~= service order
-        if (row.ts or 0) > 0 and (nowMs - row.ts) <= LOGIN_ROW_CLAIM_MAX_AGE_MS then
+        if (row.ts or 0) > 0 and (nowMs - row.ts) <= LOGIN_ROW_CLAIM_MAX_AGE_MS
+            and (not claimedKey or (ownSeed and row.seed == ownSeed)) then
             local key = loginRowKey(row)
-            if not claimedLoginRows[key] then
-                claimedLoginRows[key] = connKey
-                loginRowClaimByConn[connKey] = key
+            if not IDGUARD.claimedRows[key] then
+                IDGUARD.claimedRows[key] = connKey
+                IDGUARD.claimByConn[connKey] = key
+                IDGUARD.rowSeed[connKey] = row.seed
+                if connName ~= "None" then IDGUARD.connName[connKey] = connName end
                 local ageS = math.floor((nowMs - row.ts) / 1000)
                 log("identity: recency-claimed login row seed='" .. tostring(row.seed)
-                    .. "' display='" .. tostring(row.display) .. "' age=" .. tostring(ageS) .. "s conn=" .. tostring(connKey))
+                    .. "' display='" .. tostring(row.display) .. "' age=" .. tostring(ageS) .. "s conn=" .. tostring(connKey)
+                    .. (claimedKey and " (same player's rewritten row)" or ""))
                 return row, "recent-row:" .. tostring(ageS) .. "s"
             end
         end
+    end
+    if claimedKey and not IDGUARD.keptByConn[connKey] then
+        IDGUARD.keptByConn[connKey] = true
+        log("identity: conn " .. tostring(connKey) .. " keeps its captured identity seed='" .. tostring(ownSeed)
+            .. "'; its login row has expired and it claims no other row")
     end
     return nil, nil
 end
@@ -2024,6 +2167,7 @@ end
 local function remoteIdentityReady(pc, conn)
     local key = objectAddress(pc)
     if key == 0 then return false, nil end
+    IDGUARD.forgetStalePc(pc, key)
     if stableSeedByPc[key] and stableSeedByPc[key] ~= "" then return true, stableSeedByPc[key] end
     local seed = loginSeedForConn(conn)
     if seed and seed ~= "" then return true, seed end
@@ -2122,8 +2266,10 @@ local function seedJoinerIdentity(pc, reason)
     if not ps then return nil end
     local key = objectAddress(pc)
     if key == 0 then return nil end
+    IDGUARD.forgetStalePc(pc, key)
     local uid, seed, display = identityPartsFor(pc, ps)
     if not seed or seed == "" then
+        if stableIdByPc[key] then return stableIdByPc[key] end
         if not identitySkipLoggedByPc[key] then
             identitySkipLoggedByPc[key] = true
             log("identity: no stable login identity yet; native fields preserved reason=" .. tostring(reason))
@@ -2131,9 +2277,27 @@ local function seedJoinerIdentity(pc, reason)
         return nil
     end
 
+    -- v0.18.57: a captured identity holds for the life of the controller. Before,
+    -- each pass re-read it from the conn, so a conn that had taken a newcomer's row
+    -- became that newcomer (roster entry, and admin authority when the newcomer is
+    -- an admin). Only a move to a Steam-backed seed from a weaker one is accepted.
+    local held = stableSeedByPc[key]
+    if held and held ~= "" and held ~= seed then
+        local upgrade = ADMIN_AUTH.steam64FromIdentity(seed) and not ADMIN_AUTH.steam64FromIdentity(held)
+        if not upgrade then
+            if not IDGUARD.keptByPc[key] then
+                IDGUARD.keptByPc[key] = true
+                log("identity: kept captured seed='" .. tostring(held) .. "', ignored seed='" .. tostring(seed)
+                    .. "' reason=" .. tostring(reason))
+            end
+            return stableIdByPc[key]
+        end
+    end
+
     stableIdByPc[key] = uid
     stableSeedByPc[key] = seed
     rosterNameByPc[key] = display
+    IDGUARD.pcName[key] = objFullName(pc)
 
     if not identitySeedLoggedByPc[key] then
         identitySeedLoggedByPc[key] = true
@@ -2331,9 +2495,40 @@ end
 local function shouldServiceRemoteController(pc, t)
     local key = objectAddress(pc)
     if key == 0 then return false end
+    local fullName = objFullName(pc)
+    -- v0.18.58: these flags are keyed by object address, and the engine can hand a
+    -- departed controller's address to a new one. The short name carries a per-world
+    -- serial (OasisPlayerController_C_5) and survives a seamless travel, so a change
+    -- means a different controller: clear its quarantine, wait clock and live flag.
+    local shortName = fullName:match("([^%.:]+)$") or fullName
+    local seenName = ADMIN_AUTH.nameByPc[key]
+    if seenName ~= shortName then
+        if seenName then
+            remoteQuarantinedByPc[key] = nil
+            pendingRemoteByPc[key] = nil
+            remoteWaitLoggedByPc[key] = nil
+            ADMIN_AUTH.livePlayerByPc[key] = nil
+            ADMIN_AUTH.dropLoggedByPc[key] = nil
+        end
+        ADMIN_AUTH.nameByPc[key] = shortName
+    end
     if remoteQuarantinedByPc[key] then return false end
+    -- v0.18.56: a seamless travel carries every controller through the TransitionMap
+    -- with no usable connection view; do not start the quarantine clock or drive the
+    -- native start handler there. The destination world services it again.
+    if fullName:find("TransitionMap", 1, true) then
+        pendingRemoteByPc[key] = nil
+        return false
+    end
     local conn = connForPc(pc)
     if not (conn and conn.IsValid and conn:IsValid()) then
+        if ADMIN_AUTH.livePlayerByPc[key] then
+            if not ADMIN_AUTH.dropLoggedByPc[key] then
+                ADMIN_AUTH.dropLoggedByPc[key] = true
+                log("remote player connection dropped, controller left to the game pc=" .. fullName)
+            end
+            return false
+        end
         local first = pendingRemoteByPc[key]
         if not first then
             pendingRemoteByPc[key] = t
@@ -2379,6 +2574,7 @@ local function shouldServiceRemoteController(pc, t)
 
     pendingRemoteByPc[key] = nil
     remoteWaitLoggedByPc[key] = nil
+    ADMIN_AUTH.livePlayerByPc[key] = true
     return true
 end
 
@@ -3175,6 +3371,74 @@ end
 local diagT = 0
 local lastWorldTime = nil
 local lastWorldTimeWall = nil
+-- v0.18.58 seat count. The engine refuses a login with "Server full." when
+-- GameMode NumPlayers + NumTravellingPlayers reaches GameSession MaxPlayers
+-- (AGameSession::AtCapacity). Every live, non-spectating controller adds one at
+-- PostLogin and takes one away at Logout, so the sum should equal the live
+-- controllers. After a fast reconnect it has been seen to stay above them until a
+-- restart (refusals at PCs=3 against a cap of 5 on 2026-09-16, at PCs=4 against 5
+-- on 2026-10-09). The heartbeat reports both and, when the engine count stays
+-- higher for two heartbeats in a row with the same controllers, nobody travelling
+-- and no TransitionMap, sets NumPlayers back on the game thread. It never raises
+-- the count: Bellwright's own PreLogin session check still caps the world.
+-- State lives on ADMIN_AUTH: the main chunk is at Lua's 200-local limit.
+ADMIN_AUTH.seat = { enabled = (os.getenv("HEARTH_SEAT_HEAL") ~= "0"), pending = nil, heals = 0 }
+
+function ADMIN_AUTH.seatRead(gm, pcs)
+    local np = readOptionalField(gm, "NumPlayers")
+    local ntp = readOptionalField(gm, "NumTravellingPlayers")
+    if type(np) ~= "number" or type(ntp) ~= "number" then return nil end
+    local live, travel = 0, false
+    for i = 1, #pcs do
+        local pc = pcs[i]
+        if pc and pc.IsValid and pc:IsValid() then
+            if objFullName(pc):find("TransitionMap", 1, true) then travel = true end
+            local ps = playerStateOf(pc)
+            if ps and readOptionalField(ps, "bOnlySpectator") ~= true then live = live + 1 end
+        end
+    end
+    return { np = np, ntp = ntp, count = np + ntp, live = live, pcs = #pcs, travel = travel }
+end
+
+function ADMIN_AUTH.seatCheck(pcs)
+    local S = ADMIN_AUTH.seat
+    local gm = liveGameMode()
+    if not (gm and gm.IsValid and gm:IsValid()) then S.pending = nil; return "" end
+    local r = ADMIN_AUTH.seatRead(gm, pcs)
+    if not r then
+        if not S.unreadable then
+            S.unreadable = true
+            log("seat count: GameMode NumPlayers/NumTravellingPlayers not readable on this build; check off")
+        end
+        return ""
+    end
+    local info = " seats=" .. tostring(r.count) .. "/" .. tostring(r.live)
+    if r.count <= r.live or r.ntp > 0 or r.travel or not S.enabled then S.pending = nil; return info end
+    local sig = tostring(r.count) .. ":" .. tostring(r.live) .. ":" .. tostring(r.pcs)
+    if S.pending ~= sig then S.pending = sig; return info .. " (over, watching)" end
+    S.pending = nil
+    executeInGameThreadSafe("seat-count-heal", function()
+        local g = liveGameMode()
+        if not (g and g.IsValid and g:IsValid()) then return end
+        local now = ADMIN_AUTH.seatRead(g, FindAllOf("PlayerController") or {})
+        if not now or now.count <= now.live or now.ntp > 0 or now.travel then return end
+        local target = now.live - now.ntp
+        if target < 0 then return end
+        local maxPlayers = nil
+        pcall(function() maxPlayers = readOptionalField(readOptionalField(g, "GameSession"), "MaxPlayers") end)
+        if set_prop(g, "NumPlayers", target) then
+            S.heals = S.heals + 1
+            log("seat count corrected NumPlayers " .. tostring(now.np) .. " -> " .. tostring(target)
+                .. " (NumTravellingPlayers=" .. tostring(now.ntp) .. " live controllers=" .. tostring(now.live)
+                .. " PCs=" .. tostring(now.pcs) .. " MaxPlayers=" .. tostring(maxPlayers)
+                .. " heals=" .. tostring(S.heals) .. ")")
+        else
+            log("seat count correction failed: NumPlayers not writable")
+        end
+    end)
+    return info .. " (over, correcting)"
+end
+
 local function serviceJoiners(t)
     local pcs = FindAllOf("PlayerController") or {}
     diagT = diagT + 1
@@ -3255,7 +3519,9 @@ local function serviceJoiners(t)
             lastWorldTime = wt
             lastWorldTimeWall = os.time()
         end
-        log("hb t=" .. t .. " PCs=" .. #pcs .. " remote=" .. nRemote .. tickInfo)
+        local seatInfo = ""
+        pcall(function() seatInfo = ADMIN_AUTH.seatCheck(pcs) end)
+        log("hb t=" .. t .. " PCs=" .. #pcs .. " remote=" .. nRemote .. seatInfo .. tickInfo)
     end
 end
 
@@ -3456,14 +3722,25 @@ loop50.mainLoopBody = function()
         -- world. Everything remembered by path belongs to the old world.
         if nd and up and upT and (t - upT) > 30 then
             local wnLive = netWorld and objFullName(netWorld) or nil
-            if wnLive and wnLive ~= "None" and loop50.liveWorldName and wnLive ~= loop50.liveWorldName
-                and (t - loop50.liveWorldChangeT) >= 60 then
-                loop50.liveWorldChangeT = t
-                log("live world changed: " .. tostring(loop50.liveWorldName) .. " -> " .. wnLive)
-                clearObjCache()
-                pcall(function() resetTravelSignDiscovery("world-changed") end)
+            -- v0.18.54: a seamless travel sits in /Game/Mist/Maps/Dev/TransitionMap for
+            -- ~25 s. That is not a world anyone plays in: ignore it, and treat the
+            -- destination as the change (no throttle; a real map change is rare).
+            local inTransit = wnLive and wnLive:find("TransitionMap", 1, true) ~= nil
+            if wnLive and wnLive ~= "None" and not inTransit then
+                if loop50.liveWorldName and wnLive ~= loop50.liveWorldName then
+                    loop50.liveWorldChangeT = t
+                    log("live world changed: " .. tostring(loop50.liveWorldName) .. " -> " .. wnLive)
+                    clearObjCache()
+                    pcall(function() resetTravelSignDiscovery("world-changed") end)
+                    pcall(function() if type(SEAMLESS_DIAG_WORLD) == "function" then SEAMLESS_DIAG_WORLD(wnLive) end end)
+                    pcall(function() if type(RENOWN_DIAG_SNAPSHOT) == "function" then RENOWN_DIAG_SNAPSHOT("world " .. tostring(wnLive)) end end)
+                end
+                loop50.liveWorldName = wnLive
+            elseif inTransit and not loop50.inTransitLogged then
+                loop50.inTransitLogged = true
+                log("live world in transit: " .. tostring(loop50.liveWorldName) .. " -> " .. tostring(wnLive))
             end
-            if wnLive and wnLive ~= "None" then loop50.liveWorldName = wnLive end
+            if not inTransit then loop50.inTransitLogged = false end
         end
         if nd and not up then
             up = true; upT = t; log("listen server UP (NetDriver valid) t=" .. t)
@@ -3527,6 +3804,7 @@ loop50.mainLoopBody = function()
             if not settingsOk then
                 log("gameplay settings service ERROR: " .. tostring(settingsErr))
             end
+            pcall(function() if type(RENOWN_DIAG_SERVICE) == "function" then RENOWN_DIAG_SERVICE() end end)
         end
         -- re-assert the 600s server-side timeouts periodically: config gets wiped and
         -- the GameNetDriver can be (re)constructed after our initial stamp. Cheap, and
@@ -3582,6 +3860,225 @@ LoopAsync(250, function()
     if not ok then return false end
     return retire and true or false
 end)
+
+-- v0.18.55: Renown readout + operator repair marker. See the header note.
+-- One table in a do-block (200-active-locals limit). Installed from the
+-- Splineworks block; serviced from the main loop beside the force-save marker.
+do
+local rn = { installed = false, lines = 0, maxLines = 200, checkT = -10, queued = false, marker = nil }
+rn.log = function(s)
+    if rn.lines >= rn.maxLines then return end
+    rn.lines = rn.lines + 1
+    log("renown: " .. tostring(s))
+end
+rn.marker = (function()
+    local d = type(LOG) == "string" and LOG:match("^(.*)[/\\][^/\\]+$") or nil
+    if d and #d > 0 then return d .. "\\bw_renown.marker" end
+    return nil
+end)()
+rn.props = function(obj)
+    -- every readable property of the object's own classes up to (not including) ActorComponent/Actor/Object
+    local parts = {}
+    pcall(function()
+        local cls = obj:GetClass()
+        local depth = 0
+        while cls and depth < 8 do
+            local cn = "?"
+            pcall(function() cn = cls:GetFName():ToString() end)
+            if cn == "ActorComponent" or cn == "Actor" or cn == "Object" then break end
+            pcall(function() cls:ForEachProperty(function(pr)
+                pcall(function()
+                    local pn = pr:GetFName():ToString()
+                    local pt = pr:GetClass():GetFName():ToString()
+                    local v = obj[pn]
+                    local out = nil
+                    if pt == "ObjectProperty" or pt == "ClassProperty" or pt == "SoftObjectProperty" then out = objFullName(v)
+                    elseif pt == "ArrayProperty" or pt == "MapProperty" or pt == "SetProperty" then
+                        out = "n=" .. tostring(v and v.GetArrayNum and v:GetArrayNum() or "?")
+                    elseif pt == "BoolProperty" or pt == "IntProperty" or pt == "FloatProperty" or pt == "DoubleProperty"
+                        or pt == "ByteProperty" or pt == "EnumProperty" or pt == "NameProperty" or pt == "StrProperty"
+                        or pt == "Int64Property" or pt == "UInt32Property" then
+                        out = tostring(v)
+                        if pt == "NameProperty" and v and v.ToString then pcall(function() out = v:ToString() end) end
+                    end
+                    if out ~= nil then parts[#parts + 1] = pn .. "=" .. out end
+                end)
+            end) end)
+            local nxt = nil
+            pcall(function() nxt = cls:GetSuperStruct() end)
+            cls = nxt; depth = depth + 1
+        end
+    end)
+    return table.concat(parts, " ")
+end
+rn.snapshot = function(why)
+    pcall(function()
+        local n = 0
+        for _, c in ipairs(safeFindAll("MistHiringValueComponent")) do
+            if c and c.IsValid and c:IsValid() then
+                local nm = objFullName(c)
+                if not nm:find("Default__", 1, true) then
+                    n = n + 1
+                    rn.log(tostring(why) .. " | " .. nm .. " | " .. rn.props(c))
+                end
+            end
+        end
+        if n == 0 then rn.log(tostring(why) .. " | no live MistHiringValueComponent") end
+    end)
+end
+rn.cheat = function()
+    local component = nil
+    pcall(function() component = cachedFirst("MistCheatingComponent") end)
+    if component and component.IsValid and component:IsValid() then return component end
+    for _, candidate in ipairs(safeFindAll("MistCheatingComponent")) do
+        if candidate and candidate.IsValid and candidate:IsValid() and not objFullName(candidate):find("Default__", 1, true) then
+            return candidate
+        end
+    end
+    return nil
+end
+rn.service = function()
+    if rn.queued or not rn.marker or (t - rn.checkT) < 5 then return end
+    rn.checkT = t
+    local f = io.open(rn.marker, "r")
+    if not f then return end
+    local line = f:read("*l") or ""
+    f:close()
+    local amount = tonumber((line:match("-?%d+")) or "")
+    if not amount then
+        rn.log("marker unreadable (" .. tostring(line) .. "), removing")
+        pcall(os.remove, rn.marker)
+        return
+    end
+    if type(ExecuteInGameThread) ~= "function" then return end
+    local component = rn.cheat()
+    if not component then rn.log("marker pending: MistCheatingComponent unavailable"); return end
+    rn.queued = true
+    local queued = executeInGameThreadSafe("renown-marker", function()
+        rn.snapshot("before GiveRenown(" .. tostring(amount) .. ")")
+        local ok, err = pcall(function() component:GiveRenown(amount) end)
+        rn.log("GiveRenown(" .. tostring(amount) .. ") through " .. objFullName(component) .. " ok=" .. tostring(ok) .. (ok and "" or (" err=" .. tostring(err))))
+        rn.snapshot("after GiveRenown(" .. tostring(amount) .. ")")
+        pcall(os.remove, rn.marker)
+        rn.queued = false
+    end, function() rn.queued = false end)
+    if not queued then rn.queued = false; rn.log("marker request could not be queued") end
+end
+rn.install = function()
+    if rn.installed then return end
+    rn.installed = true
+    local function reg(path, label)
+        local ok, err = pcall(function()
+            RegisterHook(path, function(ctx, p1, p2)
+                pcall(function()
+                    local a, b = "-", "-"
+                    pcall(function() if p1 ~= nil then a = tostring(p1:get()) end end)
+                    pcall(function() if p2 ~= nil then b = tostring(p2:get()) end end)
+                    local who = "?"
+                    pcall(function() who = (objFullName(ctx:get()):gsub("^.-PersistentLevel%.", "")) end)
+                    rn.log(label .. " " .. who .. " p1=" .. a .. " p2=" .. b)
+                end)
+            end, function() end)
+        end)
+        log("renown hook " .. label .. " install ok=" .. tostring(ok) .. (ok and "" or (" err=" .. tostring(err))))
+    end
+    reg("/Script/Mist.MistNpcRecruitmentComponent:PayRenownCost", "PayRenownCost")
+    reg("/Script/Mist.MistOasisGameState:MulticastRenownGained", "MulticastRenownGained")
+    reg("/Script/Mist.MistCheatingComponent:ServerGiveRenown", "ServerGiveRenown")
+    reg("/Script/Mist.MistBlueprintLibrary:EarnRenown", "EarnRenown")
+    rn.snapshot("install")
+    rn.log("marker path " .. tostring(rn.marker))
+end
+RENOWN_DIAG_INSTALL = rn.install
+RENOWN_DIAG_SERVICE = rn.service
+RENOWN_DIAG_SNAPSHOT = rn.snapshot
+end
+
+-- v0.18.54: seamless-travel handshake diagnostics (log-only). After a voyage a
+-- remote player's map is empty. The game re-sends a player's map icons only after
+-- that player's client reports ServerFinishSeamlessTravelSetup (which lifts
+-- SetDeferUpdates on the server-side manager); the icons then go out as
+-- ClientSendIconInfos / KeyValues / Locations and the client answers
+-- ServerKeyValuesAck. Count every step per player so the break is visible.
+-- Installed from the Splineworks block (same game-thread install), one table.
+do
+local st = { installed = false, lines = 0, maxLines = 300, counts = {}, detail = {} }
+st.log = function(s)
+    if st.lines >= st.maxLines then return end
+    st.lines = st.lines + 1
+    log("seamless: " .. tostring(s))
+end
+st.who = function(ctx)
+    local s = "?"
+    pcall(function()
+        local o = ctx:get()
+        local owner = nil
+        pcall(function() owner = o:GetOuter() end)
+        s = objFullName(o)
+        if owner and owner.IsValid and owner:IsValid() then
+            local cn = ""
+            pcall(function() cn = o:GetClass():GetFName():ToString() end)
+            if cn:find("Component", 1, true) then s = objFullName(owner) end
+        end
+    end)
+    -- shorten "OasisPlayerController_C /Game/.../Karvenia_08.Karvenia_08:PersistentLevel.OasisPlayerController_C_1"
+    return (s:gsub("^.-PersistentLevel%.", ""))
+end
+st.bump = function(label, who)
+    local k = label .. "|" .. tostring(who)
+    st.counts[k] = (st.counts[k] or 0) + 1
+    return st.counts[k]
+end
+st.arrayNum = function(p)
+    local n = "?"
+    pcall(function() local v = p:get(); if v and v.GetArrayNum then n = tostring(v:GetArrayNum()) end end)
+    return n
+end
+st.reg = function(path, label, mode)
+    local ok, err = pcall(function()
+        RegisterHook(path, function(ctx, p1)
+            pcall(function()
+                local who = st.who(ctx)
+                local n = st.bump(label, who)
+                if mode == "count" then
+                    if n <= 5 or n % 50 == 0 then
+                        st.log(string.format("%s #%d to %s items=%s", label, n, who, st.arrayNum(p1)))
+                    end
+                else
+                    local extra = ""
+                    pcall(function() if p1 ~= nil then extra = " p1=" .. tostring(p1:get()) end end)
+                    st.log(string.format("%s #%d %s%s", label, n, who, extra))
+                end
+            end)
+        end, function() end)
+    end)
+    log("seamless hook " .. label .. " install ok=" .. tostring(ok) .. (ok and "" or (" err=" .. tostring(err))))
+end
+st.install = function()
+    if st.installed then return end
+    st.installed = true
+    local pc = "/Script/Mist.MistOasisPlayerController:"
+    local pm = "/Script/Mist.MistPlayerMapIconManagerComponent:"
+    st.reg(pc .. "ServerFinishSeamlessTravelSetup", "ServerFinishSeamlessTravelSetup", "each")
+    st.reg(pc .. "ClientPostSeamlessTravelSetup", "ClientPostSeamlessTravelSetup", "each")
+    st.reg(pc .. "MulticastSetIsSeamlessTravelling", "MulticastSetIsSeamlessTravelling", "each")
+    st.reg(pc .. "MulticastSetWasInitializedAfterSeamlessTravelling", "MulticastSetWasInitializedAfterSeamlessTravelling", "each")
+    st.reg(pc .. "ServerConfirmStreamingDone", "ServerConfirmStreamingDone", "each")
+    st.reg(pm .. "ClientSendIconInfos", "ClientSendIconInfos", "count")
+    st.reg(pm .. "ClientSendIconKeyValues", "ClientSendIconKeyValues", "count")
+    st.reg(pm .. "ClientSendIconLocations", "ClientSendIconLocations", "count")
+    st.reg(pm .. "ServerKeyValuesAck", "ServerKeyValuesAck", "each")
+end
+st.world = function(wn)
+    local parts = {}
+    for k, n in pairs(st.counts) do parts[#parts + 1] = k .. "=" .. tostring(n) end
+    table.sort(parts)
+    st.log("world now " .. tostring(wn) .. " | counts so far: " .. (#parts > 0 and table.concat(parts, " ") or "none"))
+    st.counts = {}
+end
+SEAMLESS_DIAG_INSTALL = st.install
+SEAMLESS_DIAG_WORLD = st.world
+end
 
 -- Splineworks (palisade wall / road) replication and server-side diagnostics.
 -- Each RegisterHook callback runs on the game thread inside the RPC and touches
@@ -3654,6 +4151,47 @@ sw.afterEdit = function(actor, why)
     local forced = pcall(function() actor:ForceNetUpdate() end)
     sw.swLog(string.format("#%d %s: after edit force=%s", sw.calls, tostring(why), tostring(forced)))
 end
+sw.sites = function()
+    local n = -1
+    pcall(function() n = #safeFindAll("MistConstructionSite") end)
+    return n
+end
+sw.dump = function(actor, why)
+    -- v0.18.54: every readable property of the wall actor and its own classes up
+    -- to (not including) Actor, so the state a remote player never sees is visible.
+    if not (actor and actor.IsValid and actor:IsValid()) then return end
+    local parts = {}
+    pcall(function()
+        local cls = actor:GetClass()
+        local depth = 0
+        while cls and depth < 8 do
+            local cn = "?"
+            pcall(function() cn = cls:GetFName():ToString() end)
+            if cn == "Actor" or cn == "Object" then break end
+            pcall(function() cls:ForEachProperty(function(pr)
+                pcall(function()
+                    local pn = pr:GetFName():ToString()
+                    local pt = pr:GetClass():GetFName():ToString()
+                    local v = actor[pn]
+                    local out = nil
+                    if pt == "ObjectProperty" or pt == "ClassProperty" or pt == "SoftObjectProperty" then out = objFullName(v)
+                    elseif pt == "ArrayProperty" then out = "n=" .. tostring(v and v.GetArrayNum and v:GetArrayNum() or "?")
+                    elseif pt == "BoolProperty" or pt == "IntProperty" or pt == "FloatProperty" or pt == "DoubleProperty"
+                        or pt == "ByteProperty" or pt == "EnumProperty" or pt == "NameProperty" or pt == "StrProperty"
+                        or pt == "Int64Property" or pt == "UInt32Property" then
+                        out = tostring(v)
+                        if pt == "NameProperty" and v and v.ToString then pcall(function() out = v:ToString() end) end
+                    end
+                    if out ~= nil then parts[#parts + 1] = pn .. "=" .. out end
+                end)
+            end) end)
+            local nxt = nil
+            pcall(function() nxt = cls:GetSuperStruct() end)
+            cls = nxt; depth = depth + 1
+        end
+    end)
+    sw.swLog(string.format("#%d %s props: %s", sw.calls, tostring(why), table.concat(parts, " ")))
+end
 sw.census = function()
     pcall(function()
         local arr = safeFindAll("MistSplineworksActor")
@@ -3708,9 +4246,10 @@ sw.install = function()
             local ev, np = nil, nil
             pcall(function() ev = actor.EditVersion end)
             pcall(function() np = actor.Points:GetArrayNum() end)
-            sw.swLog(string.format("#%d ServerExtendSpline done: actor EditVersion=%s points=%s (unchanged = rejected)",
-                sw.calls, tostring(ev), tostring(np)))
+            sw.swLog(string.format("#%d ServerExtendSpline done: actor EditVersion=%s points=%s (unchanged = rejected) sites=%s",
+                sw.calls, tostring(ev), tostring(np), tostring(sw.sites())))
             sw.afterEdit(actor, "ServerExtendSpline")
+            sw.dump(actor, "ServerExtendSpline")
         end)
     end)
     for _, fn in ipairs({ "ServerCloseSpline", "ServerRemoveSplineSegment", "ServerRemoveSpline" }) do
@@ -3740,6 +4279,18 @@ sw.install = function()
             sw.afterEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
         end)
     end)
+    -- v0.18.54: the four replies the server sends the placing client.
+    for _, fn in ipairs({ "ClientSplineCreationSuccess", "ClientSplineModificationSuccess", "ClientSplineRemovalSuccess", "ClientSplineworksError" }) do
+        reg(fn, function(ctx, a1)
+            pcall(function()
+                local actorName = "-"
+                pcall(function() if a1 ~= nil then actorName = objFullName(a1:get()) end end)
+                sw.swLog(string.format("#%d -> %s to owner=%s actor=%s", sw.calls, fn, sw.swOwner(ctx), actorName))
+            end)
+        end)
+    end
+    pcall(function() if type(SEAMLESS_DIAG_INSTALL) == "function" then SEAMLESS_DIAG_INSTALL() end end)
+    pcall(function() if type(RENOWN_DIAG_INSTALL) == "function" then RENOWN_DIAG_INSTALL() end end)
     pcall(function()
         NotifyOnNewObject("/Script/Mist.MistSplineworksActor", function(obj)
             sw.spawns = sw.spawns + 1

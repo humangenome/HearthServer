@@ -22,7 +22,7 @@ local env = setmetatable({
 assert(load(source:sub(start), "spline hooks", "t", env))()
 local count = 0
 for _ in pairs(hooks) do count = count + 1 end
-assert(count == 6, "all six spline RPCs must be installed")
+assert(count == 10, "six spline RPCs plus the four Client spline replies must be installed")
 
 local function param(value)
     return { get = function() return value end }
