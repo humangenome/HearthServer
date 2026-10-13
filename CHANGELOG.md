@@ -4,6 +4,10 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.91] - 2026-10-12
+
+A fourth player can now join: Bellwright counts its own host as one of four places and sends world data to only three joining players, and the host package frees the hidden host's place and sends a fourth player that data (the `bw_seat4` mod with `HearthFourthSeat.dll`). Fixed: a player who joined 45 minutes or more after a friend could freeze about seven minutes later; a server could refuse every join with "Server full" after a quick reconnect until it was restarted; a player whose connection dropped had their character frozen by the host while the game still held it for a rejoin; a save left as zeros by a power loss stopped every start, and now the newest intact copy takes its place; `host-instance.ps1 -Stop` and `-Restart` closed the game without saving, and now ask for a save and wait up to 20 seconds for it; the player count showed the last session's players after a restart; after a trip to the islands the host latched on to the transition map. Also: the game's warning spam about quests with no player is no longer written, memory clean-up runs every 3 minutes instead of every minute, and the host keeps its last three session logs.
+
 ## [0.1.90] - 2026-09-07
 
 The whole server side is now open source and published here. This release adds

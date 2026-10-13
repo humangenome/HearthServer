@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check the tag matches the version stamp
         run: bash scripts/check-version-stamp.sh "${{ github.ref_name }}"
@@ -55,8 +55,8 @@ jobs:
           {
             printf '%s\n' "$notes"
             printf '\n## Downloads\n\n'
-            printf '%s\n' "- \`HearthServer-Host-Windows-x64-$tag.zip\` — the complete host package: the supervisor, the UE4SS runtime with the \`bw_host\` and \`bw_fog\` mods and their signature packs, the Engine.ini templates and \`host-instance.ps1\`. Extract it, point the script at a Bellwright install, and you have a joinable server. See the repository README."
-            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\` — the supervisor only: \`HearthServer.exe\`, its .NET runtime, and \`HearthSaveGuard.exe\`. For people who already have the host runtime and only want the RCON / query / admin-API sidecar."
+            printf '%s\n' "- \`HearthServer-Host-Windows-x64-$tag.zip\`: the complete host package (the supervisor, the UE4SS runtime with the \`bw_host\`, \`bw_fog\` and \`bw_seat4\` mods and their signature packs and native helpers, the Engine.ini templates and \`host-instance.ps1\`). Extract it, point the script at a Bellwright install, and you have a joinable server. See the repository README."
+            printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\`: the supervisor alone (\`HearthServer.exe\`, its .NET runtime and \`HearthSaveGuard.exe\`), for anyone who already runs the host runtime and only wants RCON, server query and the admin API."
             printf '\n---\n\n'
             printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"
           } > release-body.md
@@ -80,7 +80,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
