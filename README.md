@@ -39,7 +39,7 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 
 | | |
 |---|---|
-| OS | Windows 10, Windows 11 or Windows Server |
+| OS | Windows 10 version 1909 or newer, Windows 11, or Windows Server 2022. Windows Server 2019 is not supported (Bellwright needs Windows build 18363 or newer) |
 | Game files | A Bellwright installation on the host from your own Steam copy (about 23 GB) |
 | Ports | One UDP port for gameplay and one for server query, two TCP ports for RCON and the admin API |
 | Hardware | No GPU. Plan on 3 to 4 GB of RAM and one to two CPU cores per server; the game simulates its villages whether or not anyone is online |
