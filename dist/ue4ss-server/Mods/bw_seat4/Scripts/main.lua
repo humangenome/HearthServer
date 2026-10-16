@@ -11,7 +11,7 @@
 -- native and build-locked; on a Bellwright build it does not know, it installs nothing.
 --
 -- Isolated UE4SS mod (own lua_State): a failure here cannot take bw_host down.
-local MOD_VERSION = "v0.1.0"
+local MOD_VERSION = "v0.1.1"
 local DLL = ".\\ue4ss\\Mods\\bw_seat4\\HearthFourthSeat.dll"
 local STATUS = ".\\ue4ss\\Mods\\bw_seat4\\fourth-seat-status.txt"
 
@@ -52,11 +52,20 @@ local function readStatus()
     return (tostring(s):gsub("[\r\n]+", " "))
 end
 
+-- v0.1.1 (2026-10-15): a game-thread callback UE4SS never runs would leave `queued` set, and
+-- if that was the first call the add-on would never install (seen with the host mod on
+-- 2026-10-12, "Ref was not function"); after 120 s queue again.
+local queuedAt, lostCallbacks = 0, 0
 LoopAsync(2000, function()
     if gaveUp then return true end
-    if queued then return false end
+    if queued then
+        if os.time() - queuedAt < 120 then return false end
+        lostCallbacks = lostCallbacks + 1
+        if lostCallbacks <= 5 or lostCallbacks % 100 == 0 then log("game-thread callback lost (not run 120 s after it was queued, " .. lostCallbacks .. " so far); queuing again") end
+    end
     if not loadNative() then gaveUp = true; return true end
     queued = true
+    queuedAt = os.time()
     local ok, err = pcall(function()
         ExecuteInGameThread(function()
             local cok, cerr = pcall(service)

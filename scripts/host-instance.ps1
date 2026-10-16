@@ -200,6 +200,14 @@ foreach ($cand in @((Join-Path $GameRoot 'Bellwright\Binaries\Win64'), (Join-Pat
   if (Test-Path -LiteralPath (Join-Path $cand 'BellwrightGame-Win64-Shipping.exe')) { $gameBinDir = $cand; break }
 }
 if (-not $gameBinDir) { throw "BellwrightGame-Win64-Shipping.exe not found under $GameRoot" }
+# Bellwright needs Windows build 18363 (Windows 10 1909) or newer for its DirectX Agility loader;
+# the managed hosts refuse older builds for the same reason (Windows Server 2019 is 17763), so
+# this script says so up front instead of letting the game fail at boot.
+$osBuild = 0
+[void][int]::TryParse([string](Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber, [ref]$osBuild)
+if ($osBuild -gt 0 -and $osBuild -lt 18363) {
+  throw ('Windows build ' + $osBuild + ' is not supported for the Bellwright host: it needs Windows 10 version 1909 (build 18363) or newer, Windows 11, or Windows Server 2022. Windows Server 2019 is build 17763.')
+}
 $spExePath = Join-Path $gameBinDir 'BellwrightGame-Win64-Shipping.exe'
 $workDir   = $gameBinDir
 

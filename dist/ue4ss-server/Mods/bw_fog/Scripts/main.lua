@@ -10,7 +10,20 @@
 -- AMistMapFog saves the array, restores it on load, and streams it to every joiner.
 --
 -- Isolated UE4SS mod (own lua_State): a failure here cannot take bw_host down.
-local MOD_VERSION = "v0.1.2"
+--
+-- v0.1.3 (2026-10-14): a callback the game thread never runs no longer stops the reveal
+-- for good (queued again after 120 s).  And no full object searches on the steady path.  v0.1.2 searched the
+-- whole object list twice every 2 s on the game thread (FindAllOf for two controller
+-- class names; the second found the same controllers), even with nobody on, and each
+-- search froze the server for 65-110 ms.  The host runs a fixed 30 fps step, so every
+-- frozen frame was game time lost: worlds ran at 92-96% of real time idle.  Now the
+-- controllers are searched once (one class), kept by object path and resolved through
+-- StaticFindObject (a hash lookup) each cycle, and searched again only when a new
+-- controller is constructed, a kept one stops resolving (a leave or a travel), the map
+-- fog actor changes, or every 30 s with players on (2 min with nobody on) as a safety
+-- net.  Fog and map-view lookups are retried every 5th cycle while missing instead of
+-- every cycle.  Stamping is unchanged.
+local MOD_VERSION = "v0.1.3"
 local DLL = ".\\ue4ss\\Mods\\bw_fog\\HearthFogReveal.dll"
 local REQUEST = ".\\ue4ss\\Mods\\bw_fog\\fog-reveal-request.txt"
 local STATUS = ".\\ue4ss\\Mods\\bw_fog\\fog-reveal-status.txt"
@@ -31,7 +44,8 @@ end
 log("mod loaded " .. MOD_VERSION)
 
 -- ---------------------------------------------------------------- config
-local cfg = { test_fill = nil, radius_cm = 15000, value = 255, interval_ms = 2000, min_move_px = 1, test_stamp = nil, log_every = 60 }
+local cfg = { test_fill = nil, radius_cm = 15000, value = 255, interval_ms = 2000, min_move_px = 1, test_stamp = nil, log_every = 60,
+    rescan_cycles = 15, idle_rescan_cycles = 60, missing_retry_cycles = 5, stats_cycles = 300 }
 pcall(function()
     local f = io.open(CFG, "r")
     if not f then return end
@@ -42,6 +56,10 @@ pcall(function()
         elseif k == "interval_ms" then cfg.interval_ms = tonumber(v) or cfg.interval_ms
         elseif k == "min_move_px" then cfg.min_move_px = tonumber(v) or cfg.min_move_px
         elseif k == "log_every" then cfg.log_every = tonumber(v) or cfg.log_every
+        elseif k == "rescan_cycles" then cfg.rescan_cycles = math.max(1, tonumber(v) or cfg.rescan_cycles)
+        elseif k == "idle_rescan_cycles" then cfg.idle_rescan_cycles = math.max(1, tonumber(v) or cfg.idle_rescan_cycles)
+        elseif k == "missing_retry_cycles" then cfg.missing_retry_cycles = math.max(1, tonumber(v) or cfg.missing_retry_cycles)
+        elseif k == "stats_cycles" then cfg.stats_cycles = math.max(1, tonumber(v) or cfg.stats_cycles)
         elseif k == "test_fill" then cfg.test_fill = tonumber(v)
         elseif k == "test_stamp" then
             local x, y, z = v:match("^(-?[%d%.]+),(-?[%d%.]+),(-?[%d%.]+)$")
@@ -67,10 +85,27 @@ local function className(o)
     pcall(function() s = o:GetClass():GetFName():ToString() end)
     return tostring(s)
 end
+-- Every FindAllOf walks the whole object list (hundreds of thousands of objects).  Count
+-- them so the stats line shows what the steady path costs.
+local stats = { walks = 0, searches = 0, resolves = 0, stamps = 0 }
 local function findAll(c)
+    stats.walks = stats.walks + 1
     local ok, a = pcall(function() return FindAllOf(c) end)
     if ok and type(a) == "table" then return a end
     return {}
+end
+-- GetFullName() is "Class /Path.Outer:Sub.Name"; StaticFindObject wants the path.
+local function pathOf(o)
+    local fn = fullName(o)
+    local path = fn:match("^%S+%s+(/%S.*)$")
+    return path
+end
+local function resolve(path)
+    stats.resolves = stats.resolves + 1
+    local o = nil
+    pcall(function() o = StaticFindObject(path) end)
+    if valid(o) then return o end
+    return nil
 end
 local function num(v)
     if type(v) == "number" then return v end
@@ -135,11 +170,21 @@ local function runNative(fogAddr, fogSize, stamps)
 end
 
 -- ---------------------------------------------------------------- world lookups
-local world = { fog = nil, fogAddr = nil, view = nil, size = nil, ratio = nil, coordShape = nil, swapAxes = false, swapChecked = false }
+local world = { fog = nil, fogAddr = nil, view = nil, size = nil, ratio = nil, coordShape = nil, swapAxes = false, swapChecked = false,
+    fogMiss = 0, viewMiss = 0, fogWake = true, generation = 0 }
 
 local function findFog()
-    if valid(world.fog) then return world.fog end
-    world.fog = nil; world.view = nil; world.size = nil; world.ratio = nil
+    if valid(world.fog) then
+        if not world.size or world.size < 16 then pcall(function() world.size = world.fog.FogRenderTargetSize end) end
+        return world.fog
+    end
+    if world.fog ~= nil then log("fog actor gone; searching again"); world.fogWake = true end
+    world.fog = nil; world.view = nil; world.size = nil; world.ratio = nil; world.viewMiss = 0
+    -- while there is no fog actor (menu, the travel map, a world still loading) search on a
+    -- new-fog event or every missing_retry_cycles-th cycle, not every cycle
+    world.fogMiss = world.fogMiss + 1
+    if not world.fogWake and ((world.fogMiss - 1) % cfg.missing_retry_cycles) ~= 0 then return nil end
+    world.fogWake = false
     local candidates = {}
     for _, o in ipairs(findAll("MistMapFog")) do if valid(o) and not fullName(o):find("Default__", 1, true) then table.insert(candidates, o) end end
     if #candidates == 0 then
@@ -157,6 +202,8 @@ local function findFog()
     end
     if #candidates == 0 then return nil end
     world.fog = candidates[1]
+    world.fogMiss = 0
+    world.generation = world.generation + 1
     pcall(function() world.fogAddr = world.fog:GetAddress() end)
     pcall(function() world.size = world.fog.FogRenderTargetSize end)
     log("fog actor " .. fullName(world.fog) .. " addr=" .. tostring(world.fogAddr) .. " size=" .. tostring(world.size) .. " candidates=" .. #candidates)
@@ -165,6 +212,9 @@ end
 
 local function findView(fog)
     if valid(world.view) then return world.view end
+    world.view = nil
+    world.viewMiss = world.viewMiss + 1
+    if ((world.viewMiss - 1) % cfg.missing_retry_cycles) ~= 0 then return nil end
     local fogName = fullName(fog)
     local firstAny = nil
     for _, v in ipairs(findAll("MapViewComponent")) do
@@ -177,7 +227,7 @@ local function findView(fog)
         end
     end
     if not world.view then world.view = firstAny end
-    if world.view then log("map view " .. fullName(world.view)) else log("map view not found (MapViewComponent count=" .. #findAll("MapViewComponent") .. ")") end
+    if world.view then world.viewMiss = 0; log("map view " .. fullName(world.view)) else log("map view not found (will retry every " .. cfg.missing_retry_cycles .. " cycles)") end
     return world.view
 end
 
@@ -245,29 +295,104 @@ local function ensureRatio(fog)
 end
 
 -- ---------------------------------------------------------------- players
-local lastPixel = {}   -- pawn full name -> {cx, cy}
-local function remotePawnLocations()
-    local out = {}
-    for _, cls in ipairs({ "OasisPlayerController_C", "MistOasisPlayerController" }) do
-        for _, pc in ipairs(findAll(cls)) do
-            if valid(pc) and not fullName(pc):find("Default__", 1, true) then
-                local isLocal = true
-                pcall(function() isLocal = pc:IsLocalPlayerController() end)
-                if not isLocal then
-                    local pawn = nil
-                    pcall(function() pawn = pc.Pawn end)
-                    if valid(pawn) then
-                        local loc = nil
-                        pcall(function() loc = pawn:K2_GetActorLocation() end)
-                        local v = vec(loc)
-                        if v then table.insert(out, { key = fullName(pawn), loc = loc, v = v }) end
-                    end
+-- The player controllers, kept by object path between cycles.  A full search (one walk
+-- of the object list) runs only when it is due: at start, when a new controller was
+-- constructed (NotifyOnNewObject below), when a kept path stops resolving (a player left,
+-- or a travel renamed the controller into the new world), when the fog actor changed,
+-- or every rescan_cycles cycles with a remote player on (idle_rescan_cycles with nobody).
+local CONTROLLER_CLASS = "MistOasisPlayerController"   -- FindAllOf includes subclasses (OasisPlayerController_C)
+local track = { paths = {}, kept = {}, wake = true, sinceSearch = 0, remote = 0, generation = -1, hooked = false, keptLogged = false }
+
+local function addressOf(o)
+    local a = nil
+    pcall(function() a = o:GetAddress() end)
+    return a
+end
+
+local function searchControllers(why)
+    stats.searches = stats.searches + 1
+    local paths, kept, seen = {}, {}, {}
+    for _, pc in ipairs(findAll(CONTROLLER_CLASS)) do
+        if valid(pc) and not fullName(pc):find("Default__", 1, true) then
+            local path = pathOf(pc)
+            if path and not seen[path] then
+                seen[path] = true
+                table.insert(paths, path)
+                -- check once that the path resolves to this very object; if it does not, keep
+                -- the object itself for this controller (checked with IsValid each cycle)
+                local back = resolve(path)
+                if not (back and addressOf(back) == addressOf(pc)) then
+                    kept[path] = pc
+                    if not track.keptLogged then track.keptLogged = true; log("path lookup did not return the controller (" .. path .. "); keeping the object instead") end
                 end
             end
         end
     end
+    track.kept = kept
+    local changed = #paths ~= #track.paths
+    if not changed then for i, p in ipairs(paths) do if track.paths[i] ~= p then changed = true; break end end end
+    track.paths = paths
+    track.wake = false
+    track.sinceSearch = 0
+    if changed then log("controllers " .. #paths .. " (search: " .. tostring(why) .. ")") end
+end
+
+local function controllerSearchDue()
+    if track.wake then return "event" end
+    if track.generation ~= world.generation then return "fog actor changed" end
+    local every = (track.remote > 0) and cfg.rescan_cycles or cfg.idle_rescan_cycles
+    if not track.hooked then every = math.min(every, cfg.missing_retry_cycles) end
+    if track.sinceSearch >= every then return "periodic" end
+    return nil
+end
+
+local lastPixel = {}   -- pawn full name -> {cx, cy}
+local function remotePawnLocations()
+    track.sinceSearch = track.sinceSearch + 1
+    local why = controllerSearchDue()
+    if why then track.generation = world.generation; searchControllers(why) end
+    local out, remote, lost = {}, 0, false
+    for _, path in ipairs(track.paths) do
+        local pc = track.kept[path]
+        if pc then
+            if not valid(pc) then pc = nil end
+        else
+            pc = resolve(path)
+        end
+        if not pc then
+            lost = true
+        else
+            local isLocal = true
+            pcall(function() isLocal = pc:IsLocalPlayerController() end)
+            if not isLocal then
+                remote = remote + 1
+                local pawn = nil
+                pcall(function() pawn = pc.Pawn end)
+                if valid(pawn) then
+                    local loc = nil
+                    pcall(function() loc = pawn:K2_GetActorLocation() end)
+                    local v = vec(loc)
+                    if v then table.insert(out, { key = fullName(pawn), loc = loc, v = v }) end
+                end
+            end
+        end
+    end
+    track.remote = remote
+    -- a kept controller no longer resolves: search again next cycle (once, not every cycle)
+    if lost then track.wake = true end
     return out
 end
+
+-- A new controller (a joiner's login, or one rebuilt by a travel) wakes the search.  The
+-- callback runs inside object construction: set a flag, touch nothing.
+pcall(function()
+    NotifyOnNewObject("/Script/Mist.MistOasisPlayerController", function() track.wake = true end)
+    track.hooked = true
+end)
+pcall(function()
+    NotifyOnNewObject("/Script/Mist.MistMapFog", function() world.fogWake = true end)
+end)
+log("new-controller hook " .. (track.hooked and "on" or "unavailable (searching every " .. cfg.missing_retry_cycles .. " cycles)"))
 
 -- ---------------------------------------------------------------- main cycle
 local booted = false
@@ -276,8 +401,15 @@ local lastLogT = 0
 local lastSummary = ""
 local queued = false
 
+local function logStats()
+    if cycles % cfg.stats_cycles ~= 0 then return end
+    log(string.format("stats cycles=%d searches=%d walks=%d resolves=%d stamps=%d controllers=%d remote=%d",
+        cycles, stats.searches, stats.walks, stats.resolves, stats.stamps, #track.paths, track.remote))
+end
+
 local function cycle()
     cycles = cycles + 1
+    logStats()
     if not loadNative() then return end
     local fog = findFog()
     if not fog or not world.fogAddr or not world.size or world.size < 16 then
@@ -330,6 +462,7 @@ local function cycle()
     if #stamps == 0 then return end
 
     local st = runNative(world.fogAddr, world.size, stamps)
+    stats.stamps = stats.stamps + #stamps
     local summary = statusText(st)
     -- readback self-check through the game's own reader; on the first stamp decide the axis order
     local checks = {}
@@ -362,9 +495,17 @@ local function cycle()
     end
 end
 
+-- A game-thread callback UE4SS never runs would leave `queued` set and stop the reveal for
+-- good (seen with the host mod on 2026-10-12, "Ref was not function"); after 120 s queue again.
+local queuedAt, lostCallbacks = 0, 0
 LoopAsync(cfg.interval_ms, function()
-    if queued then return false end
+    if queued then
+        if os.time() - queuedAt < 120 then return false end
+        lostCallbacks = lostCallbacks + 1
+        if lostCallbacks <= 5 or lostCallbacks % 100 == 0 then log("game-thread callback lost (not run 120 s after it was queued, " .. lostCallbacks .. " so far); queuing again") end
+    end
     queued = true
+    queuedAt = os.time()
     local ok, err = pcall(function()
         ExecuteInGameThread(function()
             local cok, cerr = pcall(cycle)

@@ -1,4 +1,17 @@
--- bw_host v0.18.58: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.59: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.59: (1) a game-thread callback that never runs no longer stops a
+--              service for good (see GAME_THREAD_WATCH below; one server lost
+--              its roster, settings, saves and join help for 58 h on 10/12).
+--              (2) two full object searches left the game thread (2026-10-14). The
+--              roster write searched every IpNetDriver on the game thread every
+--              service pass with a player on (every 9 s idle), and the viewport
+--              re-assert searched every GameViewportClient on the game thread
+--              every 15 s. Each search walks the whole object list and froze the
+--              server for 65-110 ms; on the fixed 30 fps step that is lost world
+--              time. The roster now reads the listen world's own net driver
+--              (kept by the service loop) and the viewport comes from the
+--              engine's GameViewport; each falls back to the old search only
+--              when that object is not known. Roster contents are unchanged.
 --   v0.18.58: the false "Server full" after a fast reconnect (2026-09-16,
 --              seen again 2026-10-09 at PCs=4 against a cap of 5). The engine
 --              refuses a login with "Server full." when GameMode NumPlayers +
@@ -350,10 +363,35 @@ end
 -- On b50986bd, a callback error can enter luaL_traceback and crash while its
 -- recursive name lookup walks Lua tables. Catch the callback inside Lua first,
 -- then return normally to UE4SS. Queue failures and cleanup hooks stay explicit.
+-- v0.18.59: every queued callback is watched. On 2026-10-12 one server's UE4SS log
+-- read "Hook threw exception: ... Ref was not function" then "Freed invalid
+-- callbacks", and the callbacks queued at that moment never ran. Each service keeps
+-- a "queued" flag until its callback runs, so the roster, gameplay settings, saves
+-- and joins all stopped for 58 hours until a restart. A callback that has not run
+-- 120 s after it was queued is now given up on: its onError runs (the services'
+-- onError clears their flag, so they queue again) and a line is logged. If that
+-- callback runs after all, it is skipped (the service already queued a new one).
+-- When nothing has run on the game thread for 5 minutes while work waits, one line
+-- says so, and the heartbeat carries gt=lost:<n>. Global (uppercase) table: the main
+-- chunk is at Lua's 200-active-locals limit.
+GAME_THREAD_WATCH = { pending = {}, seq = 0, lastRunAt = os.time(), lastQueuedAt = 0, lost = 0, lostLogged = 0, late = 0, deadLoggedAt = 0, timeout = 120 }
 local function executeInGameThreadSafe(label, callback, onError)
     if type(ExecuteInGameThread) ~= "function" then return false, "unavailable" end
+    local W = GAME_THREAD_WATCH
+    W.seq = W.seq + 1
+    local id = W.seq
+    W.pending[id] = { label = tostring(label), at = os.time(), onError = onError }
+    W.lastQueuedAt = os.time()
     local queued, queueErr = pcall(function()
         ExecuteInGameThread(function()
+            W.lastRunAt = os.time()
+            local entry = W.pending[id]
+            W.pending[id] = nil
+            if not entry and onError then
+                W.late = W.late + 1
+                log("game-thread callback ran after it was given up on label=" .. tostring(label) .. "; skipped (its service queued again)")
+                return
+            end
             local callbackOk, callbackErr = pcall(callback)
             if not callbackOk then
                 log("game-thread callback failed label=" .. tostring(label)
@@ -363,11 +401,41 @@ local function executeInGameThreadSafe(label, callback, onError)
         end)
     end)
     if not queued then
+        W.pending[id] = nil
         log("game-thread callback queue failed label=" .. tostring(label)
             .. " err=" .. tostring(queueErr))
         if onError then pcall(onError, queueErr) end
     end
     return queued, queueErr
+end
+-- Called from the service loop (off the game thread). See the v0.18.59 note above.
+function GAME_THREAD_WATCH.check()
+    local W = GAME_THREAD_WATCH
+    local now = os.time()
+    for id, entry in pairs(W.pending) do
+        if now - entry.at >= W.timeout then
+            W.pending[id] = nil
+            W.lost = W.lost + 1
+            if W.lostLogged < 20 then
+                W.lostLogged = W.lostLogged + 1
+                log("game-thread callback lost label=" .. entry.label .. " (not run " .. tostring(now - entry.at)
+                    .. " s after it was queued); its service will queue it again"
+                    .. (W.lostLogged == 20 and " (further losses only in the 10-minute summary)" or ""))
+            end
+            if entry.onError then pcall(entry.onError, "game-thread callback lost") end
+        end
+    end
+    if W.lost > 0 and W.lastQueuedAt > W.lastRunAt and now - W.lastRunAt >= 300 and now - W.deadLoggedAt >= 600 then
+        W.deadLoggedAt = now
+        log("game-thread callbacks are not running (nothing ran for " .. tostring(now - W.lastRunAt) .. " s, "
+            .. tostring(W.lost) .. " given up on): roster, gameplay settings, saves and join help are stopped; a restart clears it")
+    end
+end
+function GAME_THREAD_WATCH.info()
+    local W = GAME_THREAD_WATCH
+    if W.lost == 0 then return "" end
+    local stalled = (W.lastQueuedAt > W.lastRunAt and os.time() - W.lastRunAt >= 300) and ",stalled" or ""
+    return " gt=lost:" .. tostring(W.lost) .. stalled
 end
 local function safeArrayNum(arr)
     if not arr then return 0 end
@@ -407,7 +475,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.58  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.59  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -1434,7 +1502,16 @@ local function disableWorldRendering()
     if type(ExecuteInGameThread) ~= "function" then return false end
     executeInGameThreadSafe("disable-world-rendering", function()
         local n = 0
-        for _, vc in ipairs(FindAllOf("GameViewportClient") or {}) do
+        -- v0.18.59: the engine's own viewport, not a search of every GameViewportClient
+        -- (a full object walk on the game thread every 15 s)
+        local viewports = nil
+        pcall(function()
+            local eng = cachedFirst("GameEngine")
+            local vc = eng and readOptionalField(eng, "GameViewport") or nil
+            if vc and vc.IsValid and vc:IsValid() then viewports = { vc } end
+        end)
+        if not viewports then viewports = FindAllOf("GameViewportClient") or {} end
+        for _, vc in ipairs(viewports) do
             if vc and vc:IsValid() then
                 if writeOptionalField(vc, "bDisableWorldRendering", true) then n = n + 1 end
             end
@@ -2582,7 +2659,18 @@ local function writeRoster()
     if not ROSTER_PATH then return end
     local players = {}
     local seen = {}
-    for _, nd in ipairs(FindAllOf("IpNetDriver") or {}) do
+    -- v0.18.59: the listen world's own net driver (netDriverValid keeps that world);
+    -- the old search of every IpNetDriver walked the whole object list on the game
+    -- thread on every service pass with a player on. Search only when it is not known.
+    local drivers = nil
+    pcall(function()
+        if netWorld and netWorld:IsValid() then
+            local d = readOptionalField(netWorld, "NetDriver")
+            if d and d.IsValid and d:IsValid() then drivers = { d } end
+        end
+    end)
+    if not drivers then drivers = FindAllOf("IpNetDriver") or {} end
+    for _, nd in ipairs(drivers) do
         local arr = readOptionalField(nd, "ClientConnections")
         if arr then
             local n = safeArrayNum(arr)
@@ -3521,7 +3609,7 @@ local function serviceJoiners(t)
         end
         local seatInfo = ""
         pcall(function() seatInfo = ADMIN_AUTH.seatCheck(pcs) end)
-        log("hb t=" .. t .. " PCs=" .. #pcs .. " remote=" .. nRemote .. seatInfo .. tickInfo)
+        log("hb t=" .. t .. " PCs=" .. #pcs .. " remote=" .. nRemote .. seatInfo .. tickInfo .. GAME_THREAD_WATCH.info())
     end
 end
 
@@ -3786,6 +3874,7 @@ loop50.mainLoopBody = function()
         -- 4s per-PC cooldown, so persistence gets time to finish between native
         -- HandleStartingNewPlayer attempts.
         if up then
+            pcall(GAME_THREAD_WATCH.check)
             local discoveryOk, discoveryErr = pcall(function() serviceTravelSignDiscovery(t) end)
             if not discoveryOk then
                 log("travel sign discovery service ERROR: " .. tostring(discoveryErr))
