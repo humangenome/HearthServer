@@ -83,7 +83,7 @@ dotnet restore HearthServer.sln
 dotnet build HearthServer.sln -c Release
 dotnet test  HearthServer.sln -c Release
 cargo test --manifest-path src/tools/Hearth.SaveGuard/Cargo.toml --release
-lua5.4 tests/host-seat-count.test.lua   # also host-login-identity and host-spline-replication
+for t in tests/*.test.lua; do lua5.4 "$t"; done   # the host-mod checks
 ```
 
 Tagged releases (`vX.Y.Z`) build, test and attach both archives through GitHub Actions, and every archive is layout-checked before upload.
