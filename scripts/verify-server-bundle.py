@@ -81,6 +81,24 @@ MIN_WARP_BYTES = 1_000_000
 # The launch helper is ~15 KB of PowerShell.
 MIN_HOST_SCRIPT_BYTES = 2_000
 
+# The sample mods that come with a stock UE4SS download. None of them belongs on
+# a host: a bundle packed from a full UE4SS zip switches them on with no other
+# change, and on a sibling project they made the game crash in about one start in
+# three. Switched on (a ': 1' line in mods.txt, or an enabled.txt in the mod's
+# folder) fails the package; a folder that is present but off is tolerated.
+UE4SS_SAMPLE_MODS = (
+    "ActorDumperMod",
+    "BPML_GenericFunctions",
+    "BPModLoaderMod",
+    "CheatManagerEnablerMod",
+    "ConsoleCommandsMod",
+    "ConsoleEnablerMod",
+    "jsbLuaProfilerMod",
+    "Keybinds",
+    "LineTraceMod",
+    "SplitScreenMod",
+)
+
 # The self-contained supervisor publish output is ~350 files.
 MIN_SUPERVISOR_ENTRIES = 300
 
@@ -195,6 +213,13 @@ def verify(path):
             enabled = enabled_mods(manifest)
             if not enabled:
                 failures.append("ue4ss/Mods/mods.txt enables no mods at all")
+            samples = {m.lower(): m for m in UE4SS_SAMPLE_MODS}
+            for mod in enabled:
+                if mod.lower() in samples:
+                    failures.append(
+                        "mods.txt switches on the UE4SS sample mod '{}'; a host "
+                        "runs only its own mods".format(mod)
+                    )
             for mod in enabled:
                 key = "ue4ss/mods/{}/scripts/main.lua".format(mod.lower())
                 if key not in sizes:
@@ -202,6 +227,13 @@ def verify(path):
                         "mods.txt enables '{}' but the zip has no "
                         "ue4ss/Mods/{}/Scripts/main.lua".format(mod, mod)
                     )
+
+        for sample in UE4SS_SAMPLE_MODS:
+            if "ue4ss/mods/{}/enabled.txt".format(sample.lower()) in sizes:
+                failures.append(
+                    "ue4ss/Mods/{}/enabled.txt switches on a UE4SS sample "
+                    "mod".format(sample)
+                )
 
     return failures
 
