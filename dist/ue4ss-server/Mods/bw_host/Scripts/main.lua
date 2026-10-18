@@ -1,4 +1,16 @@
--- bw_host v0.18.59: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.60: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.60: palisade walls placed by players become build sites (four customer
+--              reports since 2026-09-05: invisible, never built, still block other
+--              buildings, can be demolished). The game makes each wall piece's
+--              construction site with the first player controller's character as
+--              builder; on this host that controller is the hidden host, which has
+--              no character, so every piece waited forever. After an accepted wall
+--              edit the server re-runs the wall's own update with the placing
+--              player's character in that slot for the one call, then empties it
+--              again. Walls saved in the stuck state are healed once a player is on,
+--              after a copy of the save (<save>.wallheal.bak). The spline census
+--              lists every spline actor and each wall's build-site count. Off
+--              switches: HEARTH_WALL_BUILDER=0, or a file Logs\bw_wallfix.off.
 --   v0.18.59: (1) a game-thread callback that never runs no longer stops a
 --              service for good (see GAME_THREAD_WATCH below; one server lost
 --              its roster, settings, saves and join help for 58 h on 10/12).
@@ -475,7 +487,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.59  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.60  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -3821,6 +3833,7 @@ loop50.mainLoopBody = function()
                     clearObjCache()
                     pcall(function() resetTravelSignDiscovery("world-changed") end)
                     pcall(function() if type(SEAMLESS_DIAG_WORLD) == "function" then SEAMLESS_DIAG_WORLD(wnLive) end end)
+                    pcall(function() if type(WALLFIX_WORLD) == "function" then WALLFIX_WORLD(wnLive) end end)
                     pcall(function() if type(RENOWN_DIAG_SNAPSHOT) == "function" then RENOWN_DIAG_SNAPSHOT("world " .. tostring(wnLive)) end end)
                 end
                 loop50.liveWorldName = wnLive
@@ -4281,7 +4294,301 @@ sw.dump = function(actor, why)
     end)
     sw.swLog(string.format("#%d %s props: %s", sw.calls, tostring(why), table.concat(parts, " ")))
 end
+-- v0.18.60: palisade build sites on a host that has no character of its own.
+-- Read from build 24840601: FMistWallEntity::UpdateActor turns each wall piece into a
+-- town construction site with FMistBuildingUtils::BuildPlaceable, and the builder it
+-- passes is the Pawn of UWorld::GetFirstPlayerController(). In co-op that is the
+-- host's character. On this host the first controller is the hidden host, which never
+-- has a character, so the game skipped every piece and waited on that controller's
+-- OnNewPawn, which never fires: no construction site, nothing replicated to players
+-- (an invisible wall), nothing for villagers to build, while the spline keeps its grid
+-- cells (it blocks other buildings and can be demolished). Restarts did not help: the
+-- saved wall loads into the same wait.
+-- After an accepted wall edit the server re-runs the wall's own mesh update
+-- (OnRep_Points -> UpdateMesh -> UpdateMeshClient -> UpdateActor) with the hidden host
+-- controller's Pawn field pointing at the placing player's character for that one
+-- call on the game thread, then clears it: the same builder the game passes for any
+-- building a player places (UMistBuildingComponent::TryPlace). A wall saved without
+-- build sites is healed the same way once a player has a character, after a copy of
+-- the save is written, one line per wall. Off switches: environment
+-- HEARTH_WALL_BUILDER=0, or a file Logs\bw_wallfix.off (checked on every use).
+sw.wb = { enabled = (os.getenv("HEARTH_WALL_BUILDER") ~= "0"), off = nil, broken = false, nullOk = nil,
+    lines = 0, maxLines = 300, rebuilds = 0, heals = 0, healed = {}, recheck = {}, scanQueued = false,
+    sweptFor = false, nextScanT = 0, backupState = nil, offLogged = false }
+-- a voyage loads another map: look at its walls once a player is there
+WALLFIX_WORLD = function(wn)
+    sw.wb.sweptFor = false
+    sw.wb.nextScanT = os.time() + 30
+    sw.wb.recheck = {}
+end
+sw.wb.off = (function()
+    local d = type(LOG) == "string" and LOG:match("^(.*)[/\\][^/\\]+$") or nil
+    if d and #d > 0 then return d .. "\\bw_wallfix.off" end
+    return nil
+end)()
+sw.wbLog = function(s)
+    if sw.wb.lines >= sw.wb.maxLines then return end
+    sw.wb.lines = sw.wb.lines + 1
+    log("wallfix: " .. tostring(s))
+end
+sw.wbOn = function()
+    if not sw.wb.enabled or sw.wb.broken then return false end
+    if sw.wb.off then
+        local f = io.open(sw.wb.off, "r")
+        if f then
+            f:close()
+            if not sw.wb.offLogged then sw.wb.offLogged = true; sw.wbLog("switched off by " .. sw.wb.off) end
+            return false
+        end
+    end
+    return true
+end
+sw.valid = function(o)
+    local v = false
+    pcall(function() v = (o ~= nil and o.IsValid ~= nil and o:IsValid()) and true or false end)
+    return v
+end
+sw.isA = function(o, classPath)
+    if not sw.valid(o) then return false end
+    local r = false
+    pcall(function()
+        local c = StaticFindObject(classPath)
+        if c and c:IsValid() then r = o:IsA(c) and true or false end
+    end)
+    return r
+end
+sw.isWall = function(a) return sw.isA(a, "/Script/Mist.MistWallBuildingActor") end
+sw.pathOf = function(fullName)
+    if type(fullName) ~= "string" then return nil end
+    local path = fullName:match("^%S+%s+(%S.*)$") or fullName
+    if path:sub(1, 1) ~= "/" then return nil end
+    return path
+end
+sw.resolve = function(fullName)
+    local path = sw.pathOf(fullName)
+    if not path then return nil end
+    local o = nil
+    pcall(function() o = StaticFindObject(path) end)
+    if sw.valid(o) then return o end
+    return nil
+end
+sw.numPoints = function(a)
+    local n = 0
+    pcall(function() n = tonumber(a.Points:GetArrayNum()) or 0 end)
+    return n
+end
+-- Build sites of a wall = its child actors that are placeables (the construction sites
+-- and finished pieces BuildPlaceable makes are owned by the wall actor).
+sw.sitesOf = function(a)
+    local n, kids = 0, 0
+    pcall(function()
+        a.Children:ForEach(function(_, elem)
+            local c = elem:get()
+            kids = kids + 1
+            if sw.isA(c, "/Script/Mist.MistPlaceable") then n = n + 1 end
+        end)
+    end)
+    return n, kids
+end
+sw.hostPc = function(ctx)
+    local pc = nil
+    pcall(function()
+        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        pc = gs:GetPlayerController(ctx, 0)
+    end)
+    if sw.valid(pc) then return pc end
+    return nil
+end
+sw.pawnOfPc = function(pc)
+    local p = nil
+    pcall(function() p = pc.Pawn end)
+    if sw.valid(p) then return p end
+    return nil
+end
+sw.setPawn = function(pc, pawn)
+    -- pawn nil = clear. Returns true only when the readback matches.
+    local wrote = pcall(function() pc.Pawn = pawn end)
+    if not wrote and pawn == nil and type(CreateInvalidObject) == "function" then
+        wrote = pcall(function() pc.Pawn = CreateInvalidObject() end)
+    end
+    local now = sw.pawnOfPc(pc)
+    -- an empty slot must be both written and read back empty: the proof below runs while
+    -- the slot is already empty, so a refused write must not pass as a clear
+    if pawn == nil then return wrote and now == nil end
+    local same = false
+    pcall(function() same = (now ~= nil and now:GetAddress() == pawn:GetAddress()) end)
+    return same
+end
+-- Run fn with the first controller's Pawn = builder, then clear it. Game thread only.
+sw.withBuilder = function(ctxActor, builder, fn)
+    local pc = sw.hostPc(ctxActor)
+    if not pc then return false, "no first controller" end
+    if sw.pawnOfPc(pc) then
+        local ok, err = pcall(fn)
+        return ok, ok and "first controller already has a character" or tostring(err)
+    end
+    if not sw.isA(builder, "/Script/Mist.MistPlayer") then return false, "builder is not a player character" end
+    if sw.wb.nullOk == nil then
+        -- prove the clear works before the first swap (the field is empty right now)
+        sw.wb.nullOk = sw.setPawn(pc, nil)
+        if not sw.wb.nullOk then
+            sw.wb.broken = true
+            sw.wbLog("cannot write an empty Pawn on the first controller; wall fix off for this session")
+            return false, "clear not writable"
+        end
+    end
+    if not sw.setPawn(pc, builder) then
+        sw.setPawn(pc, nil)
+        return false, "builder write did not read back"
+    end
+    local ok, err = pcall(fn)
+    if not sw.setPawn(pc, nil) and not sw.setPawn(pc, nil) then
+        sw.wb.broken = true
+        sw.wbLog("FAILED to clear the first controller's Pawn after a wall update (" .. objFullName(pc)
+            .. "); wall fix off for this session")
+    end
+    return ok, ok and "ok" or tostring(err)
+end
+-- Re-run the wall's mesh update so pieces without a build site get one. Game thread only.
+sw.rebuild = function(wall, builder, why)
+    local before = sw.sitesOf(wall)
+    local ran, info = sw.withBuilder(wall, builder, function() wall:OnRep_Points() end)
+    local after = sw.sitesOf(wall)
+    sw.wb.rebuilds = sw.wb.rebuilds + 1
+    sw.wbLog(string.format("%s %s points=%d build sites %d -> %d builder=%s result=%s",
+        tostring(why), objFullName(wall), sw.numPoints(wall), before, after, objFullName(builder),
+        ran and tostring(info) or ("failed: " .. tostring(info))))
+    return after
+end
+sw.placerOf = function(ctx)
+    local p = nil
+    pcall(function() p = ctx:get():GetOwner() end)
+    if not sw.valid(p) then pcall(function() p = ctx:get():GetOuter() end) end
+    if sw.valid(p) then return p end
+    return nil
+end
+-- Post-hook of every wall edit RPC: rebuild when the edit changed the wall.
+sw.afterWallEdit = function(ctx, actor, why)
+    if not sw.wbOn() or not sw.isWall(actor) then return end
+    local ev = nil
+    pcall(function() ev = actor.EditVersion end)
+    if ev ~= nil and sw.preVersion ~= nil and tostring(ev) == tostring(sw.preVersion) then return end
+    local after = sw.rebuild(actor, sw.placerOf(ctx), why)
+    -- the game re-solves a piece on a 15 s timer when its ground heights change; look again after it
+    sw.wb.recheck[objFullName(actor)] = { due = os.time() + 20, sites = after }
+    -- a removed segment can split the wall into a new actor; the next sweep looks at every wall
+    sw.wb.sweptFor = false
+    sw.wb.nextScanT = os.time() + 20
+end
+-- Copy the save once per session before healing saved walls (temp file + rename).
+sw.backupSave = function()
+    local src = (type(SAVE_FILE) == "string" and #SAVE_FILE > 0) and SAVE_FILE or nil
+    if not src then return false, "no save path" end
+    local dst = src .. ".wallheal.bak"
+    local tmp = dst .. ".tmp"
+    local f = io.open(src, "rb")
+    if not f then return false, "save not readable" end
+    local size1 = f:seek("end"); f:seek("set", 0)
+    local data = f:read("*a"); f:close()
+    if not data or #data == 0 or #data ~= size1 then return false, "save changed while copying" end
+    local g = io.open(src, "rb")
+    local size2 = g and g:seek("end") or -1
+    if g then g:close() end
+    if size2 ~= size1 then return false, "save changed while copying" end
+    os.remove(tmp)
+    local o = io.open(tmp, "wb")
+    if not o then return false, "backup not writable" end
+    local okw = o:write(data); o:close()
+    if not okw then os.remove(tmp); return false, "backup write failed" end
+    os.remove(dst)
+    local okr, err = os.rename(tmp, dst)
+    if not okr then os.remove(tmp); return false, "backup rename failed: " .. tostring(err) end
+    return true, dst .. " (" .. tostring(#data) .. " bytes)"
+end
+-- Service (off the game thread): find walls without build sites while a player has a
+-- character, copy the save, then heal them on the game thread. Names only cross threads.
+sw.wbService = function()
+    if not sw.wbOn() or not sw.installed then return end
+    local players = travelSignRemotePlayers
+    if type(players) ~= "table" or #players == 0 then return end
+    local now = os.time()
+    local due = {}
+    for name, r in pairs(sw.wb.recheck) do
+        if now >= r.due then due[name] = r; sw.wb.recheck[name] = nil end
+    end
+    local sweep = (not sw.wb.sweptFor and now >= sw.wb.nextScanT)
+    if not sweep and next(due) == nil then return end
+    if sw.wb.scanQueued then return end
+    local walls = {}
+    if sweep then
+        for _, a in ipairs(safeFindAll("MistWallBuildingActor")) do
+            local n = objFullName(a)
+            if n ~= "None" and not n:find("Default__", 1, true) then walls[#walls + 1] = n end
+        end
+    else
+        for name in pairs(due) do walls[#walls + 1] = name end
+    end
+    local builderName = players[1]
+    sw.wb.scanQueued = true
+    local queued = executeInGameThreadSafe("wallfix-scan", function()
+        sw.wb.scanQueued = false
+        if sweep then sw.wb.sweptFor = true end
+        local todo = {}
+        for _, name in ipairs(walls) do
+            local w = sw.resolve(name)
+            if w and sw.isWall(w) and sw.numPoints(w) >= 2 then
+                local sites = sw.sitesOf(w)
+                local r = due[name]
+                if r and sites < (tonumber(r.sites) or 0) then
+                    todo[#todo + 1] = { name = name, kind = "recheck", sites = sites }
+                elseif sites == 0 and not sw.wb.healed[name] then
+                    todo[#todo + 1] = { name = name, kind = r and "recheck" or "saved", sites = sites }
+                end
+            end
+        end
+        if sweep then sw.wbLog("scan: " .. tostring(#walls) .. " walls, " .. tostring(#todo) .. " without build sites") end
+        if #todo == 0 then return end
+        sw.wb.pendingHeal = { todo = todo, builder = builderName }
+    end, function() sw.wb.scanQueued = false end)
+    if not queued then sw.wb.scanQueued = false end
+end
+-- Second half (off the game thread): backup if a saved wall is about to be healed, then heal.
+sw.wbHeal = function()
+    local job = sw.wb.pendingHeal
+    if not job or not sw.wbOn() then return end
+    sw.wb.pendingHeal = nil
+    local needsBackup = false
+    for _, item in ipairs(job.todo) do if item.kind == "saved" then needsBackup = true end end
+    if needsBackup and sw.wb.backupState ~= "ok" then
+        local ok, info = sw.backupSave()
+        sw.wbLog("save copy before healing saved walls: " .. (ok and ("written " .. tostring(info)) or ("NOT written: " .. tostring(info) .. "; saved walls left as they are")))
+        if not ok then
+            sw.wb.nextScanT = os.time() + 300
+            sw.wb.sweptFor = false
+            local kept = {}
+            for _, item in ipairs(job.todo) do if item.kind ~= "saved" then kept[#kept + 1] = item end end
+            if #kept == 0 then return end
+            job.todo = kept
+        else
+            sw.wb.backupState = "ok"
+        end
+    end
+    executeInGameThreadSafe("wallfix-heal", function()
+        local builder = sw.resolve(job.builder)
+        if not builder then sw.wbLog("heal skipped: builder " .. tostring(job.builder) .. " is gone"); return end
+        for _, item in ipairs(job.todo) do
+            local w = sw.resolve(item.name)
+            if w then
+                sw.wb.healed[item.name] = true
+                sw.wb.heals = sw.wb.heals + 1
+                sw.rebuild(w, builder, item.kind == "saved" and "heal saved wall" or "recheck after the game's re-solve")
+            end
+        end
+    end)
+end
 sw.census = function()
+    -- v0.18.60: every spline actor, one line each, with its own line budget; walls carry
+    -- their build-site count (0 on a wall with 2+ points = the invisible-wall state).
     pcall(function()
         local arr = safeFindAll("MistSplineworksActor")
         local byClass = {}
@@ -4293,10 +4600,20 @@ sw.census = function()
         local parts = {}
         for cn, n in pairs(byClass) do parts[#parts + 1] = cn .. "=" .. tostring(n) end
         table.sort(parts)
-        sw.swLog("census: " .. tostring(#arr) .. " spline actors in the world at install (" .. table.concat(parts, " ") .. ")")
-        for i = 1, math.min(#arr, 6) do
-            sw.swLog("census[" .. i .. "] " .. sw.swActor(arr[i]))
+        log("splineworks: census: " .. tostring(#arr) .. " spline actors in the world at install (" .. table.concat(parts, " ") .. ")")
+        local stuck = 0
+        for i = 1, math.min(#arr, 500) do
+            local a = arr[i]
+            local extra = ""
+            if sw.isWall(a) then
+                local sites, kids = sw.sitesOf(a)
+                extra = " buildSites=" .. tostring(sites) .. " children=" .. tostring(kids)
+                if sites == 0 and sw.numPoints(a) >= 2 then extra = extra .. " NO-BUILD-SITE"; stuck = stuck + 1 end
+            end
+            log("splineworks: census[" .. i .. "] " .. sw.swActor(a) .. extra)
         end
+        if #arr > 500 then log("splineworks: census: " .. tostring(#arr - 500) .. " more not listed") end
+        log("splineworks: census: walls without build sites=" .. tostring(stuck) .. " wallfix=" .. (sw.wbOn() and "on" or "off"))
     end)
 end
 sw.install = function()
@@ -4315,6 +4632,7 @@ sw.install = function()
         end)
     end)
     reg("ServerExtendSpline", function(ctx, splineActor, splineVersion, inPosition, bExtendFromStart, inTemplate)
+        sw.preVersion = nil
         pcall(function()
             sw.calls = sw.calls + 1
             local actor = sw.swParam(splineActor)
@@ -4322,6 +4640,7 @@ sw.install = function()
             local cv = sw.swNum(sw.swParam(splineVersion))
             local ev = nil
             pcall(function() ev = sw.swNum(actor.EditVersion) end)
+            sw.preVersion = ev
             local verdict = "version ok"
             if ev == nil or cv == nil then verdict = "version unreadable"
             elseif ev ~= cv then verdict = "VERSION MISMATCH (client " .. tostring(cv) .. " vs server " .. tostring(ev) .. ") -> the game rejects this edit" end
@@ -4340,22 +4659,27 @@ sw.install = function()
             sw.afterEdit(actor, "ServerExtendSpline")
             sw.dump(actor, "ServerExtendSpline")
         end)
+        pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor), "wall extended:")
     end)
     for _, fn in ipairs({ "ServerCloseSpline", "ServerRemoveSplineSegment", "ServerRemoveSpline" }) do
         reg(fn, function(ctx, splineActor, splineVersion)
             pcall(function()
                 sw.calls = sw.calls + 1
+                sw.preVersion = nil
+                pcall(function() sw.preVersion = sw.swNum(sw.swParam(splineActor).EditVersion) end)
                 sw.beforeEdit(sw.swParam(splineActor), fn)
                 sw.swLog(string.format("#%d %s owner=%s clientVersion=%s | actor %s",
                     sw.calls, fn, sw.swOwner(ctx), tostring(sw.swParam(splineVersion)), sw.swActor(sw.swParam(splineActor))))
             end)
         end, function(ctx, splineActor)
             pcall(function() sw.afterEdit(sw.swParam(splineActor), fn) end)
+            if fn ~= "ServerRemoveSpline" then pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor), "wall " .. fn .. ":") end
         end)
     end
     reg("ServerCombineSplines", function(ctx, splineActor1, splineVersion1, bExtendFromStart1, splineActor2, splineVersion2)
         pcall(function()
             sw.calls = sw.calls + 1
+            sw.preVersion = nil
             sw.beforeEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
             sw.beforeEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
             sw.swLog(string.format("#%d ServerCombineSplines owner=%s clientVersions=%s,%s | first %s | second %s",
@@ -4367,6 +4691,8 @@ sw.install = function()
             sw.afterEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
             sw.afterEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
         end)
+        pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor1), "walls combined:")
+        pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor2), "walls combined:")
     end)
     -- v0.18.54: the four replies the server sends the placing client.
     for _, fn in ipairs({ "ClientSplineCreationSuccess", "ClientSplineModificationSuccess", "ClientSplineRemovalSuccess", "ClientSplineworksError" }) do
@@ -4404,5 +4730,11 @@ LoopAsync(5000, function()
         return true
     end)
     return (ok and done) and true or false
+end)
+-- v0.18.60: wall build-site service (see sw.wb above); never stops itself.
+LoopAsync(5000, function()
+    pcall(sw.wbService)
+    pcall(sw.wbHeal)
+    return false
 end)
 end
