@@ -1,4 +1,24 @@
--- bw_host v0.18.60: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.61: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.61: game-thread work runs from one game-thread pump; the background
+--              service loop no longer calls UE4SS's ExecuteInGameThread, any
+--              hook registration or any game function (2026-10-18). In UE4SS b50986bd ExecuteInGameThread writes to the Lua
+--              stack the game thread is running on, with nothing locking the
+--              two. Now and then that left UE4SS's game-thread queue dead for the
+--              rest of the session ("Ref was not function": 11 of 54 sessions
+--              10/16-10/18, most with nobody on; roster, settings, joins help and
+--              the save before a Stop all stopped), or crashed the game inside a
+--              running callback (26 of 39 crashes in 10 days). The service loop
+--              now appends to a plain Lua queue that the pump drains every frame;
+--              the host start (OpenLevel, net driver swap), net tuning writes and
+--              the quarantine's identity-string writes run on the game thread;
+--              the join service reads Player/Pawn/PlayerNamePrivate instead of
+--              calling IsLocalPlayerController/K2_GetPawn/GetPlayerName.
+--              NotifyOnNewObject is registered from the pump's first run. A pump
+--              that stops for 60 s is logged and the heartbeat ends ",stalled",
+--              which the panel's Stop reads to wait for the game's own autosave.
+--              The startup fast pin (12 s of GameMode/GameEngine travel settings
+--              after host-up) is the one background write left, on purpose.
+--              tests/host-thread-safety.test.lua keeps it that way.
 --   v0.18.60: palisade walls placed by players become build sites (four customer
 --              reports since 2026-09-05: invisible, never built, still block other
 --              buildings, can be demolished). The game makes each wall piece's
@@ -371,83 +391,99 @@ local function log(s)
     local f = io.open(LOG, "a"); if f then f:write(os.date("%H:%M:%S ") .. line .. "\r\n"); f:close() end
 end
 
--- UE4SS invokes queued callbacks from its own native pcall/error-handler path.
--- On b50986bd, a callback error can enter luaL_traceback and crash while its
--- recursive name lookup walks Lua tables. Catch the callback inside Lua first,
--- then return normally to UE4SS. Queue failures and cleanup hooks stay explicit.
--- v0.18.59: every queued callback is watched. On 2026-10-12 one server's UE4SS log
--- read "Hook threw exception: ... Ref was not function" then "Freed invalid
--- callbacks", and the callbacks queued at that moment never ran. Each service keeps
--- a "queued" flag until its callback runs, so the roster, gameplay settings, saves
--- and joins all stopped for 58 hours until a restart. A callback that has not run
--- 120 s after it was queued is now given up on: its onError runs (the services'
--- onError clears their flag, so they queue again) and a line is logged. If that
--- callback runs after all, it is skipped (the service already queued a new one).
--- When nothing has run on the game thread for 5 minutes while work waits, one line
--- says so, and the heartbeat carries gt=lost:<n>. Global (uppercase) table: the main
--- chunk is at Lua's 200-active-locals limit.
-GAME_THREAD_WATCH = { pending = {}, seq = 0, lastRunAt = os.time(), lastQueuedAt = 0, lost = 0, lostLogged = 0, late = 0, deadLoggedAt = 0, timeout = 120 }
+-- v0.18.61 (2026-10-18): the game-thread pump. Background code no longer calls any UE4SS
+-- game-thread or hook function.
+-- Cause, read from UE4SS b50986bd (source and our exact UE4SS.dll with its PDB): ExecuteInGameThread
+-- pushes onto and pops from this mod's hook Lua stack, the same stack the game thread runs queued
+-- callbacks and hook callbacks on, and nothing locks the two against each other. Called from the
+-- LoopAsync service loop it now and then interleaved with a running callback: either a queued entry
+-- ended up pointing at a value that is not a function (UE4SS throws "Ref was not function" outside
+-- its own try, removes its game-tick hook and leaves its "busy" flag set, so nothing queued ever runs
+-- again that session: 11 of 54 sessions 10/16-10/18, most with nobody on), or a running UObject call
+-- (IsValid) read a moved stack slot and the game crashed (26 of 39 crashes on managed hosts in 10
+-- days). The single "Ref was not function" seen on 2026-10-12 was this too.
+-- Now: executeInGameThreadSafe only appends to a plain Lua table (any thread), and one game-thread
+-- loop registered once, as the last UE4SS call of this file (see its end), drains it every frame and
+-- runs each callback under pcall. Plain Lua bytecode runs under UE4SS's global Lua lock, which is let
+-- go only around C calls, so the append and the swap below contain no function calls and create no
+-- tables: another thread cannot run Lua in between. Everything this mod registers with UE4SS
+-- (NotifyOnNewObject, RegisterHook) now happens on the game thread, from the pump.
+-- If the pump stops running (the game thread frozen or UE4SS's tick gone) for 60 s, one line says so
+-- and the heartbeat ends ",stalled": the panel's Stop reads that and waits for the game's own
+-- autosave instead of asking this mod for a save that cannot run.
+-- Global (uppercase) table: the main chunk is at Lua's 200-active-locals limit.
+GAME_THREAD_WATCH = { items = {}, n = 0, ranAt = os.time(), runs = 0, callbacks = 0, failures = 0,
+    started = false, startErr = nil, booted = false, bootSteps = {}, stallAfter = 60, stalledSince = nil }
 local function executeInGameThreadSafe(label, callback, onError)
-    if type(ExecuteInGameThread) ~= "function" then return false, "unavailable" end
     local W = GAME_THREAD_WATCH
-    W.seq = W.seq + 1
-    local id = W.seq
-    W.pending[id] = { label = tostring(label), at = os.time(), onError = onError }
-    W.lastQueuedAt = os.time()
-    local queued, queueErr = pcall(function()
-        ExecuteInGameThread(function()
-            W.lastRunAt = os.time()
-            local entry = W.pending[id]
-            W.pending[id] = nil
-            if not entry and onError then
-                W.late = W.late + 1
-                log("game-thread callback ran after it was given up on label=" .. tostring(label) .. "; skipped (its service queued again)")
-                return
-            end
-            local callbackOk, callbackErr = pcall(callback)
-            if not callbackOk then
-                log("game-thread callback failed label=" .. tostring(label)
-                    .. " err=" .. tostring(callbackErr))
-                if onError then pcall(onError, callbackErr) end
-            end
-        end)
-    end)
-    if not queued then
-        W.pending[id] = nil
-        log("game-thread callback queue failed label=" .. tostring(label)
-            .. " err=" .. tostring(queueErr))
-        if onError then pcall(onError, queueErr) end
-    end
-    return queued, queueErr
+    local entry = { label = label, cb = callback, onError = onError }
+    -- no function calls and no new tables from here to the return
+    local n = W.n + 1
+    W.items[n] = entry
+    W.n = n
+    return true, nil
 end
--- Called from the service loop (off the game thread). See the v0.18.59 note above.
+-- Registered with LoopInGameThreadAfterFrames(1, ...) at the end of this file: runs on the game
+-- thread once a frame. The first run performs the boot steps (registrations that used to sit in the
+-- main chunk on UE4SS's start-up thread).
+function GAME_THREAD_WATCH.pump()
+    local W = GAME_THREAD_WATCH
+    W.ranAt = os.time()
+    W.runs = W.runs + 1
+    if not W.booted then
+        W.booted = true
+        for i, step in ipairs(W.bootSteps) do
+            local ok, err = pcall(step)
+            if not ok then log("game-thread boot step " .. tostring(i) .. " failed: " .. tostring(err)) end
+        end
+        log("game-thread pump running (boot steps " .. tostring(#W.bootSteps) .. ")")
+    end
+    if W.n == 0 then return end
+    local fresh = {}
+    -- no function calls and no new tables between the read and the swap
+    local items, n = W.items, W.n
+    W.items = fresh
+    W.n = 0
+    for i = 1, n do
+        local e = items[i]
+        W.callbacks = W.callbacks + 1
+        local ok, err = pcall(e.cb)
+        if not ok then
+            W.failures = W.failures + 1
+            log("game-thread callback failed label=" .. tostring(e.label) .. " err=" .. tostring(err))
+            if e.onError then pcall(e.onError, err) end
+        end
+    end
+end
+-- A registration that must run on the game thread at start-up (NotifyOnNewObject and the like):
+-- it runs in the pump's first run, before the host opens the world.
+function GAME_THREAD_WATCH.atBoot(step)
+    local W = GAME_THREAD_WATCH
+    W.bootSteps[#W.bootSteps + 1] = step
+end
+-- Called from the service loop (off the game thread): reads two numbers, writes the log.
 function GAME_THREAD_WATCH.check()
     local W = GAME_THREAD_WATCH
     local now = os.time()
-    for id, entry in pairs(W.pending) do
-        if now - entry.at >= W.timeout then
-            W.pending[id] = nil
-            W.lost = W.lost + 1
-            if W.lostLogged < 20 then
-                W.lostLogged = W.lostLogged + 1
-                log("game-thread callback lost label=" .. entry.label .. " (not run " .. tostring(now - entry.at)
-                    .. " s after it was queued); its service will queue it again"
-                    .. (W.lostLogged == 20 and " (further losses only in the 10-minute summary)" or ""))
-            end
-            if entry.onError then pcall(entry.onError, "game-thread callback lost") end
+    local age = now - W.ranAt
+    if age >= W.stallAfter then
+        if not W.stalledSince then
+            W.stalledSince = W.ranAt
+            log("game-thread pump is not running (last run " .. tostring(age) .. " s ago, " .. tostring(W.n)
+                .. " waiting" .. (W.started and "" or ", pump not registered: " .. tostring(W.startErr))
+                .. "): roster, gameplay settings, saves and join help wait; a Stop waits for the game's own autosave")
         end
-    end
-    if W.lost > 0 and W.lastQueuedAt > W.lastRunAt and now - W.lastRunAt >= 300 and now - W.deadLoggedAt >= 600 then
-        W.deadLoggedAt = now
-        log("game-thread callbacks are not running (nothing ran for " .. tostring(now - W.lastRunAt) .. " s, "
-            .. tostring(W.lost) .. " given up on): roster, gameplay settings, saves and join help are stopped; a restart clears it")
+    elseif W.stalledSince then
+        log("game-thread pump running again after " .. tostring(now - W.stalledSince) .. " s")
+        W.stalledSince = nil
     end
 end
+-- Heartbeat suffix. The panel's Stop looks for ",stalled" on the last heartbeat line (v0.18.59-60 wrote
+-- "gt=lost:<n>,stalled"; keep the ",stalled" ending).
 function GAME_THREAD_WATCH.info()
     local W = GAME_THREAD_WATCH
-    if W.lost == 0 then return "" end
-    local stalled = (W.lastQueuedAt > W.lastRunAt and os.time() - W.lastRunAt >= 300) and ",stalled" or ""
-    return " gt=lost:" .. tostring(W.lost) .. stalled
+    if W.stalledSince then return " gt=stalled:" .. tostring(os.time() - W.ranAt) .. "s,stalled" end
+    return ""
 end
 local function safeArrayNum(arr)
     if not arr then return 0 end
@@ -487,7 +523,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.60  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.61  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -571,13 +607,16 @@ local function guardFogActor(obj)
     end
 end
 
-for _, fogCls in ipairs({ "/Script/Mist.MapFog", "/Script/Mist.MistMapFog" }) do
-    pcall(function()
-        NotifyOnNewObject(fogCls, function(obj)
-            guardFogActor(obj)
+-- v0.18.61: registered on the game thread, in the pump's first run (see GAME_THREAD_WATCH)
+GAME_THREAD_WATCH.atBoot(function()
+    for _, fogCls in ipairs({ "/Script/Mist.MapFog", "/Script/Mist.MistMapFog" }) do
+        pcall(function()
+            NotifyOnNewObject(fogCls, function(obj)
+                guardFogActor(obj)
+            end)
         end)
-    end)
-end
+    end
+end)
 -- v0.18.58: a 5 s "safety sweep" loop used to sit here. It called safeFindAll before
 -- that local is defined, so it raised inside its pcall on every pass and never guarded
 -- anything; the NotifyOnNewObject hooks above are what has always guarded the fog actors
@@ -1032,7 +1071,7 @@ local function serviceTravelSignDiscoveryImpl(now)
         travelSignPlayerSyncPasses = travelSignPlayerSyncPasses - 1
         travelSignPlayerSyncNextT = now + TRAVEL_SIGN_PLAYER_SYNC_INTERVAL
     end
-    if #travelSignPending == 0 or type(ExecuteInGameThread) ~= "function" then return end
+    if #travelSignPending == 0 then return end
 
     local batch = travelSignPending
     travelSignPending = {}
@@ -1056,37 +1095,40 @@ local function serviceTravelSignDiscoveryImpl(now)
     end
 end
 
-local travelSignNotifyOk, travelSignNotifyErr = pcall(function()
-    NotifyOnNewObject("/Script/Mist.MistFastTravelComponent", function(obj)
-        queueTravelSignComponent(obj, 0)
+-- v0.18.61: registered on the game thread, in the pump's first run (see GAME_THREAD_WATCH)
+GAME_THREAD_WATCH.atBoot(function()
+    local travelSignNotifyOk, travelSignNotifyErr = pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistFastTravelComponent", function(obj)
+            queueTravelSignComponent(obj, 0)
+        end)
     end)
-end)
-if travelSignNotifyOk then
-    log("travel sign discovery object hook registered")
-else
-    log("travel sign discovery object hook unavailable: " .. tostring(travelSignNotifyErr))
-end
-local providerNotifyOk, providerNotifyErr = pcall(function()
-    NotifyOnNewObject("/Script/Mist.MistMapIconProviderComponent", function(obj)
-        queueTravelSignProvider(obj)
+    if travelSignNotifyOk then
+        log("travel sign discovery object hook registered")
+    else
+        log("travel sign discovery object hook unavailable: " .. tostring(travelSignNotifyErr))
+    end
+    local providerNotifyOk, providerNotifyErr = pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistMapIconProviderComponent", function(obj)
+            queueTravelSignProvider(obj)
+        end)
     end)
-end)
-if providerNotifyOk then
-    log("travel sign discovery provider hook registered")
-else
-    log("travel sign discovery provider hook unavailable: " .. tostring(providerNotifyErr))
-end
-local playerMapManagerNotifyOk, playerMapManagerNotifyErr = pcall(function()
-    NotifyOnNewObject("/Script/Mist.MistPlayerMapIconManagerComponent", function()
-        requestTravelSignPlayerSyncImpl("player-map-manager-created")
+    if providerNotifyOk then
+        log("travel sign discovery provider hook registered")
+    else
+        log("travel sign discovery provider hook unavailable: " .. tostring(providerNotifyErr))
+    end
+    local playerMapManagerNotifyOk, playerMapManagerNotifyErr = pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistPlayerMapIconManagerComponent", function()
+            requestTravelSignPlayerSyncImpl("player-map-manager-created")
+        end)
     end)
+    if playerMapManagerNotifyOk then
+        log("travel sign discovery player-map-manager hook registered")
+    else
+        log("travel sign discovery player-map-manager hook unavailable: "
+            .. tostring(playerMapManagerNotifyErr))
+    end
 end)
-if playerMapManagerNotifyOk then
-    log("travel sign discovery player-map-manager hook registered")
-else
-    log("travel sign discovery player-map-manager hook unavailable: "
-        .. tostring(playerMapManagerNotifyErr))
-end
 -- v0.18.50: the world was replaced (ServerTravel to the Halmare Isles and
 -- back, or any other map change). Every remembered path names an object of the
 -- old world, so forget all of it and run the startup sweep again.
@@ -1282,9 +1324,16 @@ local function applyNetTuning()
     pcall(function()
         if tuneIpNetDriver(StaticFindObject("/Script/OnlineSubsystemUtils.Default__IpNetDriver")) then touched = touched + 1 end
     end)
-    -- then every live instance (the actual GameNetDriver serving the listen world)
+    -- then every live instance (the actual GameNetDriver serving the listen world). v0.18.61:
+    -- this runs on the game thread now, so the listen world's own driver first; the search of
+    -- every object only while that driver is not known yet (before host-up)
     pcall(function()
-        for _, d in ipairs(FindAllOf("IpNetDriver") or {}) do
+        local drivers = nil
+        if netWorld and netWorld:IsValid() then
+            local d = readOptionalField(netWorld, "NetDriver")
+            if d and d.IsValid and d:IsValid() then drivers = { d } end
+        end
+        for _, d in ipairs(drivers or FindAllOf("IpNetDriver") or {}) do
             if tuneIpNetDriver(d) then touched = touched + 1 end
         end
     end)
@@ -1464,7 +1513,6 @@ local renderCvarsEverApplied = false
 local renderCvarsApplyQueued = false
 local function applyRenderCvars()
     if renderCvarsEverApplied or renderCvarsApplyQueued then return true end
-    if type(ExecuteInGameThread) ~= "function" then return false end
     -- run on the game thread; cvar sets that reach the renderer must NOT run from the
     -- async LoopAsync thread (that hard-stalls the UE4SS Lua VM on this 5.7 build).
     renderCvarsApplyQueued = true
@@ -1511,7 +1559,6 @@ end
 -- we just don't submit the scene. Re-asserted (the viewport can be recreated).
 local worldRenderDisabledLogged = false
 local function disableWorldRendering()
-    if type(ExecuteInGameThread) ~= "function" then return false end
     executeInGameThreadSafe("disable-world-rendering", function()
         local n = 0
         -- v0.18.59: the engine's own viewport, not a search of every GameViewportClient
@@ -1629,8 +1676,16 @@ local function isRemoteJoinerCandidate(pc)
     local full = objFullName(pc)
     if knownHostControllerNames[full] then return false end
     if knownHostControllerNames[objectAddress(pc)] then return false end
+    -- v0.18.61: read, not called (this runs in the background loop): a local controller's Player
+    -- is the LocalPlayer; a remote one's is its net connection (APlayerController::IsLocalController)
     local isLocal = false
-    pcall(function() isLocal = pc:IsLocalPlayerController() end)
+    pcall(function()
+        local player = readOptionalField(pc, "Player")
+        if player and player.IsValid and player:IsValid() then
+            local cn = tostring(player:GetClass():GetFName():ToString())
+            isLocal = cn:find("LocalPlayer", 1, true) ~= nil
+        end
+    end)
     if isLocal then return false end
     return true
 end
@@ -1641,10 +1696,10 @@ local function playerStateOf(pc)
     return nil
 end
 
+-- v0.18.61: the Pawn property only (K2_GetPawn returns the same field and is a game function,
+-- which the background loop must not call)
 local function pawnOf(pc)
     local pawn = readOptionalField(pc, "Pawn")
-    if pawn and pawn.IsValid and pawn:IsValid() then return pawn end
-    pcall(function() pawn = pc:K2_GetPawn() end)
     if pawn and pawn.IsValid and pawn:IsValid() then return pawn end
     return nil
 end
@@ -1665,10 +1720,10 @@ local function stringValue(v)
     return tostring(v)
 end
 
+-- v0.18.61: APlayerState::PlayerNamePrivate is the field GetPlayerName() returns; read, not called
 local function readPlayerName(ps)
     if not (ps and ps.IsValid and ps:IsValid()) then return "" end
-    local nm = nil
-    pcall(function() nm = ps:GetPlayerName() end)
+    local nm = readOptionalField(ps, "PlayerNamePrivate")
     return stringValue(nm)
 end
 
@@ -1707,7 +1762,6 @@ local function sanitizeHostObject(obj, label, hide)
 end
 
 local function sanitizeHost(pc)
-    if type(ExecuteInGameThread) ~= "function" then return end
     knownHostControllerNames[objFullName(pc)] = true
     local pcAddr = objectAddress(pc)
     if pcAddr ~= 0 then knownHostControllerNames[pcAddr] = true end
@@ -1831,7 +1885,6 @@ local function setCleanName(ps, name)
 end
 
 local function enforceCleanName(pc)
-    if type(ExecuteInGameThread) ~= "function" then return end
     executeInGameThreadSafe("enforce-clean-name", function()
         if not (pc and pc.IsValid and pc:IsValid()) then return end
         local ps = playerStateOf(pc)
@@ -2067,14 +2120,9 @@ end
 
 local function remoteAddressForConn(conn)
     if not (conn and conn.IsValid and conn:IsValid()) then return nil end
+    -- v0.18.61: LowLevelGetRemoteAddress is a plain C++ virtual in UE5, not a reflected function,
+    -- so UE4SS could never call it (it failed inside its pcall); the reflected fields only
     local s = nil
-    pcall(function() s = conn:LowLevelGetRemoteAddress(true) end)
-    s = cleanRemoteAddress(stringValue(s))
-    if s then return s end
-    s = nil
-    pcall(function() s = conn:LowLevelGetRemoteAddress(false) end)
-    s = cleanRemoteAddress(stringValue(s))
-    if s then return s end
     for _, prop in ipairs({ "RemoteAddress", "RemoteAddr", "PeerAddress", "URL" }) do
         s = cleanRemoteAddress(readStringProp(conn, prop))
         if s then return s end
@@ -2303,15 +2351,12 @@ local function quarantineRemoteController(pc, reason)
     remoteWaitLoggedByPc[key] = nil
     local full = objFullName(pc)
     joinerState[full] = nil
-    local cleared = clearUnrealObjectIdentityStrings(pc)
-    local ps = playerStateOf(pc)
-    if ps then cleared = cleared + clearUnrealObjectIdentityStrings(ps) end
-    if type(ExecuteInGameThread) ~= "function" then
-        log("remote pre-login quarantine queued without EIGT reason=" .. tostring(reason) .. " pc=" .. full .. " cleared=" .. tostring(cleared))
-        return
-    end
+    -- v0.18.61: the identity-string writes run on the game thread with the rest
     executeInGameThreadSafe("quarantine-remote-controller", function()
         if not (pc and pc.IsValid and pc:IsValid()) then return end
+        local cleared = clearUnrealObjectIdentityStrings(pc)
+        local ps = playerStateOf(pc)
+        if ps then cleared = cleared + clearUnrealObjectIdentityStrings(ps) end
         hideNonPlayerObject(pc, "Controller", reason)
         local pawn = pawnOf(pc)
         if pawn then hideNonPlayerObject(pawn, "Pawn", reason) end
@@ -2508,7 +2553,7 @@ local function replicatePropertyChange(obj, propName)
 end
 
 function ADMIN_AUTH.grant(pc, pawn)
-    if ADMIN_AUTH.count == 0 or type(ExecuteInGameThread) ~= "function" then return end
+    if ADMIN_AUTH.count == 0 then return end
     local pcKey = objectAddress(pc)
     local pawnKey = objectAddress(pawn)
     if pcKey == 0 or pawnKey == 0 then return end
@@ -2750,7 +2795,7 @@ end
 
 local rosterQueued = false
 local function queueRosterWrite()
-    if rosterQueued or type(ExecuteInGameThread) ~= "function" then return end
+    if rosterQueued then return end
     rosterQueued = true
     local ok = executeInGameThreadSafe("write-roster", function()
         rosterQueued = false
@@ -2794,12 +2839,13 @@ local function tryStartFor(pc, t)
     local gm = liveGameMode()
     if not (gm and gm:IsValid()) then log("start: no live GameMode (try "..st.tries..")"); return end
 
-    -- The native lifecycle handler must run on the game thread.
-    local hasEIGT = (type(ExecuteInGameThread) == "function")
-    if hasEIGT then
+    -- The native lifecycle handler must run on the game thread. v0.18.61: the GameMode found
+    -- here is handed over (no second search of every object on the game thread).
+    do
         log("start["..st.tries.."] -> EIGT HandleStartingNewPlayer queued key="..key)
         executeInGameThreadSafe("handle-starting-new-player", function()
-            local g = liveGameMode()
+            local g = gm
+            if not (g and g:IsValid()) then g = liveGameMode() end
             if g and g:IsValid() and pc and pc:IsValid() then
                 local seeded = nil
                 pcall(function() seeded = seedJoinerIdentity(pc, "pre-native-start") end)
@@ -2813,8 +2859,6 @@ local function tryStartFor(pc, t)
                 if f then f:write(os.date("%H:%M:%S ").."[bw_host] EIGT HandleStartingNewPlayer EXECUTED ok="..tostring(ok).." err="..tostring(err).."\r\n"); f:close() end
             end
         end)
-    else
-        log("start["..st.tries.."] WARNING ExecuteInGameThread unavailable -> cannot run native start flow")
     end
 end
 
@@ -3044,7 +3088,6 @@ local function enableWalk(pawn, key)
     if st.mmTicks == nil then st.mmTicks = 0 end
     if st.mmTicks >= 30 then return end
     st.mmTicks = st.mmTicks + 1
-    if type(ExecuteInGameThread) ~= "function" then return end
     executeInGameThreadSafe("enable-walk", function()
         local mc = readOptionalField(pawn, "CharacterMovement")
         if mc and mc:IsValid() then pcall(function() mc:SetMovementMode(1, 0) end) end  -- MOVE_Walking
@@ -3092,7 +3135,6 @@ local skeletalMeshAssetName = nil
 local function dumpNormalMutablePath()
     if normalMutablePathDumped then return end
     normalMutablePathDumped = true
-    if type(ExecuteInGameThread) ~= "function" then return end
     executeInGameThreadSafe("dump-normal-mutable-path", function()
         log("NORMAL-MUTABLE reflection begin: Bellwright head/face builder")
         local total = 0
@@ -3310,7 +3352,6 @@ local function servicePlayerMutableHead(pawn, key, t)
     end
     local mb = st.mutableBuild
     if mb.done then return end
-    if type(ExecuteInGameThread) ~= "function" then return end
     if mb.triggerTicks < 6 then
         mb.triggerTicks = mb.triggerTicks + 1
         executeInGameThreadSafe("player-mutable-trigger", function()
@@ -3419,7 +3460,6 @@ local function skipLandingIntro(pc, key, pawn)
     if st.introTicks == nil then st.introTicks = 0 end
     if st.introTicks >= 60 then return end   -- ~60 * 1.5s = 90s window; covers a slow WARP intro/load
     st.introTicks = st.introTicks + 1
-    if type(ExecuteInGameThread) ~= "function" then return end
     executeInGameThreadSafe("skip-landing-intro", function()
         if not (pc and pc.IsValid and pc:IsValid()) then return end
         local p = pawn
@@ -3689,10 +3729,6 @@ local function serviceForcedSave()
         end
     end
     if not markerFound then return end
-    if type(ExecuteInGameThread) ~= "function" then
-        log("force-save marker pending: ExecuteInGameThread unavailable")
-        return
-    end
 
     log("force-save marker detected for gameplay port " .. tostring(GAME_PORT))
     local component = resolveForcedSaveComponent()
@@ -3814,7 +3850,9 @@ loop50.mainLoopBody = function()
             end
             fired = true; fireT = t
             log("settled at t=" .. t .. " (menu stable) -> host")
-            pcall(doHost)
+            -- v0.18.61: OpenLevel, the net driver swap and the net tuning writes run on the
+            -- game thread (they ran from this background loop until v0.18.60)
+            executeInGameThreadSafe("host-open-level", doHost)
         end
     else
         local nd = netDriverValid()
@@ -3848,9 +3886,12 @@ loop50.mainLoopBody = function()
             -- v0.18.12: the menu world/GameMode died in the OpenLevel transition —
             -- drop all cached refs so the pins re-resolve against the LISTEN world.
             clearObjCache()
-            -- the live GameNetDriver now exists -> stamp 600 on the instance + CDO, and verify.
-            applyNetTuning()
-            log("NETPROOF (host up) " .. reportNetTuning())
+            -- the live GameNetDriver now exists -> stamp 600 on the instance + CDO, and verify
+            -- (v0.18.61: on the game thread)
+            executeInGameThreadSafe("net-tuning-host-up", function()
+                applyNetTuning()
+                log("NETPROOF (host up) " .. reportNetTuning())
+            end)
             -- collapse WARP render + Mutable sim cost so the game/net thread ticks sub-second
             -- The pre-host/menu application can be reset by OpenLevel(Karvenia_08);
             -- force one fresh pass in the listen world before idle/join validation.
@@ -3913,7 +3954,7 @@ loop50.mainLoopBody = function()
         -- it guarantees a freshly-built driver never sits at the default 60s when a real
         -- (WARP-slow) joiner is mid-stream. Every ~12s.
         if up and (math.floor(t) % 12 == 0) then
-            pcall(applyNetTuning)
+            executeInGameThreadSafe("net-tuning", applyNetTuning)
         end
         -- The full cvar batch is expensive on WARP because ExecuteConsoleCommand runs on
         -- the game thread and can serialize with D3D12 work. Queue it once per boot.
@@ -4052,7 +4093,6 @@ rn.service = function()
         pcall(os.remove, rn.marker)
         return
     end
-    if type(ExecuteInGameThread) ~= "function" then return end
     local component = rn.cheat()
     if not component then rn.log("marker pending: MistCheatingComponent unavailable"); return end
     rn.queued = true
@@ -4314,12 +4354,13 @@ end
 -- HEARTH_WALL_BUILDER=0, or a file Logs\bw_wallfix.off (checked on every use).
 sw.wb = { enabled = (os.getenv("HEARTH_WALL_BUILDER") ~= "0"), off = nil, broken = false, nullOk = nil,
     lines = 0, maxLines = 300, rebuilds = 0, heals = 0, healed = {}, recheck = {}, scanQueued = false,
-    sweptFor = false, nextScanT = 0, backupState = nil, offLogged = false }
+    sweptFor = false, nextScanT = 0, backupState = nil, offLogged = false, removed = {} }
 -- a voyage loads another map: look at its walls once a player is there
 WALLFIX_WORLD = function(wn)
     sw.wb.sweptFor = false
     sw.wb.nextScanT = os.time() + 30
     sw.wb.recheck = {}
+    sw.wb.removed = {}
 end
 sw.wb.off = (function()
     local d = type(LOG) == "string" and LOG:match("^(.*)[/\\][^/\\]+$") or nil
@@ -4516,6 +4557,8 @@ sw.wbService = function()
     for name, r in pairs(sw.wb.recheck) do
         if now >= r.due then due[name] = r; sw.wb.recheck[name] = nil end
     end
+    -- v0.18.61: a wall the player took down is not a wall that lost its build sites
+    for name in pairs(due) do if sw.wb.removed[name] then due[name] = nil end end
     local sweep = (not sw.wb.sweptFor and now >= sw.wb.nextScanT)
     if not sweep and next(due) == nil then return end
     if sw.wb.scanQueued then return end
@@ -4523,7 +4566,7 @@ sw.wbService = function()
     if sweep then
         for _, a in ipairs(safeFindAll("MistWallBuildingActor")) do
             local n = objFullName(a)
-            if n ~= "None" and not n:find("Default__", 1, true) then walls[#walls + 1] = n end
+            if n ~= "None" and not n:find("Default__", 1, true) and not sw.wb.removed[n] then walls[#walls + 1] = n end
         end
     else
         for name in pairs(due) do walls[#walls + 1] = name end
@@ -4694,6 +4737,23 @@ sw.install = function()
         pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor1), "walls combined:")
         pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor2), "walls combined:")
     end)
+    -- v0.18.61: a player taking a wall down (the game's Disassemble -> RemoveSegment, which on a
+    -- 2-point wall destroys the actor without touching its points). Until now nothing logged it,
+    -- and a destroyed wall stays findable until the next garbage collection, so the scan read it as
+    -- "1 without build sites" and the recheck as "0 -> 0". Logged, and
+    -- dropped from the rechecks and scans of this world.
+    reg("ServerDisassemble", function(ctx, placeable, itemIndex)
+        pcall(function()
+            local actor = sw.swParam(placeable)
+            if not (actor and sw.isWall(actor)) then return end
+            local name = objFullName(actor)
+            sw.wb.removed[name] = true
+            sw.wb.recheck[name] = nil
+            sw.wbLog("wall taken down by the player " .. name:gsub("^.-PersistentLevel%.", "") .. " piece="
+                .. tostring(sw.swNum(sw.swParam(itemIndex))) .. " points=" .. tostring(sw.numPoints(actor))
+                .. " owner=" .. sw.swOwner(ctx))
+        end)
+    end)
     -- v0.18.54: the four replies the server sends the placing client.
     for _, fn in ipairs({ "ClientSplineCreationSuccess", "ClientSplineModificationSuccess", "ClientSplineRemovalSuccess", "ClientSplineworksError" }) do
         reg(fn, function(ctx, a1)
@@ -4718,7 +4778,6 @@ LoopAsync(5000, function()
     local ok, done = pcall(function()
         if sw.installed then return true end
         if not (up and upT and (t - upT) > 5) then return false end
-        if type(ExecuteInGameThread) ~= "function" then sw.install(); return true end
         sw.installed = true
         -- v0.18.58: through the protected helper like every other queued callback
         local queued = executeInGameThreadSafe("splineworks-install", function()
@@ -4738,3 +4797,10 @@ LoopAsync(5000, function()
     return false
 end)
 end
+
+-- v0.18.61: the game-thread pump (GAME_THREAD_WATCH, near the top). This must stay the last UE4SS
+-- call of this file: until it is registered nothing of this mod runs on the game thread, so the
+-- start-up thread above can touch the Lua registry (LoopAsync) without a game-thread callback doing
+-- the same at that moment. tests/host-thread-safety.test.lua fails if anything follows it.
+GAME_THREAD_WATCH.started, GAME_THREAD_WATCH.startErr = pcall(LoopInGameThreadAfterFrames, 1, GAME_THREAD_WATCH.pump)
+log("game-thread pump registered=" .. tostring(GAME_THREAD_WATCH.started) .. (GAME_THREAD_WATCH.started and "" or (" err=" .. tostring(GAME_THREAD_WATCH.startErr))))

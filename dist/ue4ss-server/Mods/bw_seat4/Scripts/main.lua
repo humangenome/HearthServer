@@ -11,7 +11,7 @@
 -- native and build-locked; on a Bellwright build it does not know, it installs nothing.
 --
 -- Isolated UE4SS mod (own lua_State): a failure here cannot take bw_host down.
-local MOD_VERSION = "v0.1.1"
+local MOD_VERSION = "v0.1.2"
 local DLL = ".\\ue4ss\\Mods\\bw_seat4\\HearthFourthSeat.dll"
 local STATUS = ".\\ue4ss\\Mods\\bw_seat4\\fourth-seat-status.txt"
 
@@ -30,7 +30,6 @@ end
 log("mod loaded " .. MOD_VERSION)
 
 local service = nil
-local queued = false
 local reported = false
 local gaveUp = false
 
@@ -52,31 +51,21 @@ local function readStatus()
     return (tostring(s):gsub("[\r\n]+", " "))
 end
 
--- v0.1.1 (2026-10-15): a game-thread callback UE4SS never runs would leave `queued` set, and
--- if that was the first call the add-on would never install (seen with the host mod on
--- 2026-10-12, "Ref was not function"); after 120 s queue again.
-local queuedAt, lostCallbacks = 0, 0
-LoopAsync(2000, function()
-    if gaveUp then return true end
-    if queued then
-        if os.time() - queuedAt < 120 then return false end
-        lostCallbacks = lostCallbacks + 1
-        if lostCallbacks <= 5 or lostCallbacks % 100 == 0 then log("game-thread callback lost (not run 120 s after it was queued, " .. lostCallbacks .. " so far); queuing again") end
+-- v0.1.2 (2026-10-18): the call runs from one game-thread loop (LoopInGameThreadWithDelay, every 2 s),
+-- registered as the last UE4SS call of this file. Until v0.1.1 a background loop (LoopAsync) queued it
+-- with ExecuteInGameThread, and in UE4SS b50986bd that call writes to the Lua stack the game thread is
+-- running on with nothing locking the two: it could leave UE4SS's game-thread queue dead for the rest
+-- of the session ("Ref was not function") or crash the game. No background code here any more
+-- (tests/host-thread-safety.test.lua).
+local function serviceOnGameThread()
+    if gaveUp then return end
+    if not loadNative() then gaveUp = true; return end
+    local cok, cerr = pcall(service)
+    if not cok then log("native call failed: " .. tostring(cerr)) end
+    if not reported then
+        reported = true
+        log("native status " .. tostring(readStatus() or "missing"))
     end
-    if not loadNative() then gaveUp = true; return true end
-    queued = true
-    queuedAt = os.time()
-    local ok, err = pcall(function()
-        ExecuteInGameThread(function()
-            local cok, cerr = pcall(service)
-            if not cok then log("native call failed: " .. tostring(cerr)) end
-            if not reported then
-                reported = true
-                log("native status " .. tostring(readStatus() or "missing"))
-            end
-            queued = false
-        end)
-    end)
-    if not ok then log("queue failed: " .. tostring(err)); queued = false end
-    return false
-end)
+end
+local loopOk, loopErr = pcall(LoopInGameThreadWithDelay, 2000, serviceOnGameThread)
+log("game-thread loop registered=" .. tostring(loopOk) .. (loopOk and "" or (" err=" .. tostring(loopErr))))

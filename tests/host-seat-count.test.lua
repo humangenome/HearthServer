@@ -30,7 +30,10 @@ local stubOs = setmetatable({
 
 local drivers, pcs, gameModes = {}, {}, {}
 local noop = function() return nil end
+-- v0.18.61: game-thread callbacks run from the pump the mod registers with LoopInGameThreadAfterFrames
+local gtPump = nil
 local env = setmetatable({
+    LoopInGameThreadAfterFrames = function(_, callback) gtPump = callback end,
     os = stubOs,
     LoopAsync = noop, ExecuteWithDelay = noop, ExecuteAsync = noop, RegisterHook = noop,
     NotifyOnNewObject = noop, RegisterKeyBind = noop, RegisterConsoleCommandHandler = noop,
@@ -53,6 +56,21 @@ local exports = "\nreturn { seatCheck = ADMIN_AUTH.seatCheck, seat = ADMIN_AUTH.
     .. " service = shouldServiceRemoteController, quarantined = remoteQuarantinedByPc,"
     .. " live = ADMIN_AUTH.livePlayerByPc, serviceJoiners = serviceJoiners }\n"
 local mod = assert(load(source .. exports, "main.lua", "t", env))()
+local onGameThreadPump = nil
+local function runPump()
+    if not gtPump then return end
+    if onGameThreadPump then onGameThreadPump(gtPump) else gtPump() end
+end
+for k, v in pairs(mod) do
+    if type(v) == "function" then
+        mod[k] = function(...)
+            local r = table.pack(v(...))
+            runPump()
+            return table.unpack(r, 1, r.n)
+        end
+    end
+end
+runPump() -- the first frame: boot steps
 
 local function uobj(addr, name, fields)
     local o = fields or {}
@@ -66,6 +84,8 @@ local function uobj(addr, name, fields)
     end
     return o
 end
+local LOCAL_PLAYER = uobj(9800, "LocalPlayer /Engine/Transient.GameEngine_0:LocalPlayer_0")
+LOCAL_PLAYER.GetClass = function() return { GetFName = function() return { ToString = function() return "LocalPlayer" end } end } end
 local LEVEL = "/Game/Mist/Maps/Karvenia/Karvenia_08/Karvenia_08.Karvenia_08:PersistentLevel."
 local TRANSIT = "/Game/Mist/Maps/Dev/TransitionMap.TransitionMap:PersistentLevel."
 local conns = { GetArrayNum = function(self) return #self end }
@@ -78,9 +98,9 @@ gameModes[1] = gm
 local function controller(addr, serial, opts)
     opts = opts or {}
     local ps = uobj(addr + 1, "OasisPlayerState_C " .. LEVEL .. "OasisPlayerState_C_" .. serial,
-        { bOnlySpectator = opts.spectator or false, GetPlayerName = function() return opts.name or "Player" end })
+        { bOnlySpectator = opts.spectator or false, PlayerNamePrivate = opts.name or "Player", GetPlayerName = function() return opts.name or "Player" end })
     local pc = uobj(addr, "OasisPlayerController_C " .. (opts.level or LEVEL) .. "OasisPlayerController_C_" .. serial,
-        { PlayerState = ps, IsLocalPlayerController = function() return opts.host or false end })
+        { PlayerState = ps, Player = (opts.host or false) and LOCAL_PLAYER or nil, IsLocalPlayerController = function() return opts.host or false end })
     return pc
 end
 local function setControllers(list)

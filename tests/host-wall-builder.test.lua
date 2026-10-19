@@ -131,6 +131,8 @@ local function loadMod(w, opts)
         ExecuteInGameThread = function(callback) callback() end,
         executeInGameThreadSafe = function(_, callback) callback(); return true end,
         LoopAsync = function(_, callback) loops[#loops + 1] = callback end,
+        -- v0.18.61: the block ends with the game-thread pump registration
+        GAME_THREAD_WATCH = { pump = function() end }, LoopInGameThreadAfterFrames = function() end,
         os = setmetatable({
             getenv = function(k) if opts.env and opts.env[k] ~= nil then return opts.env[k] end return os.getenv(k) end,
             time = function(...) if opts.clock then return opts.clock() end return os.time(...) end,
@@ -331,6 +333,25 @@ check("a piece the game re-solves later without a build site is rebuilt on the r
     for _, l in ipairs(loops) do l() end
     assert(#a.kids == 1 and w.hostPawn() == nil, "the re-solved piece was not rebuilt")
     assert(has(w.logs, "recheck after the game's re%-solve"), "recheck not logged")
+end)
+
+check("a wall the player takes down is logged and never rechecked as a lost one (v0.18.61)", function()
+    local now = 2000000
+    local w = newWorld()
+    local a = wall(w, "WallActor_C_1", 1, 0)
+    local hooks, loops = loadMod(w, { clock = function() return now end,
+        players = { "Player_C /Game/Map.Map:PersistentLevel.Player_C_1" } })
+    for _, l in ipairs(loops) do l() end
+    extend(hooks, w, a, true)
+    assert(#a.kids == 1)
+    -- the game's Disassemble on a 2-point wall destroys the actor; it stays findable until GC
+    hooks.ServerDisassemble[1](ctxFor(w.player), param(a), param(0))
+    a.kids = {}
+    assert(has(w.logs, "wall taken down by the player WallActor_C_1 piece=0 points=2"), "take-down not logged")
+    local runs = a.onrep
+    now = now + 30
+    for _, l in ipairs(loops) do l() end
+    assert(a.onrep == runs and not has(w.logs, "recheck after the game's re%-solve"), "a removed wall was rechecked")
 end)
 
 os.remove(saveFile); os.remove(saveFile .. ".wallheal.bak"); os.remove(logFile); os.remove(tmpdir)

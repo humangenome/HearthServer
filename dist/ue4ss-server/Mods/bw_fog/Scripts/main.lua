@@ -23,7 +23,7 @@
 -- fog actor changes, or every 30 s with players on (2 min with nobody on) as a safety
 -- net.  Fog and map-view lookups are retried every 5th cycle while missing instead of
 -- every cycle.  Stamping is unchanged.
-local MOD_VERSION = "v0.1.3"
+local MOD_VERSION = "v0.1.4"
 local DLL = ".\\ue4ss\\Mods\\bw_fog\\HearthFogReveal.dll"
 local REQUEST = ".\\ue4ss\\Mods\\bw_fog\\fog-reveal-request.txt"
 local STATUS = ".\\ue4ss\\Mods\\bw_fog\\fog-reveal-status.txt"
@@ -384,22 +384,24 @@ local function remotePawnLocations()
 end
 
 -- A new controller (a joiner's login, or one rebuilt by a travel) wakes the search.  The
--- callback runs inside object construction: set a flag, touch nothing.
-pcall(function()
-    NotifyOnNewObject("/Script/Mist.MistOasisPlayerController", function() track.wake = true end)
-    track.hooked = true
-end)
-pcall(function()
-    NotifyOnNewObject("/Script/Mist.MistMapFog", function() world.fogWake = true end)
-end)
-log("new-controller hook " .. (track.hooked and "on" or "unavailable (searching every " .. cfg.missing_retry_cycles .. " cycles)"))
+-- callback runs inside object construction: set a flag, touch nothing.  v0.1.4: registered from
+-- the game-thread loop's first run (see the end of this file), not from this start-up chunk.
+local function registerHooks()
+    pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistOasisPlayerController", function() track.wake = true end)
+        track.hooked = true
+    end)
+    pcall(function()
+        NotifyOnNewObject("/Script/Mist.MistMapFog", function() world.fogWake = true end)
+    end)
+    log("new-controller hook " .. (track.hooked and "on" or "unavailable (searching every " .. cfg.missing_retry_cycles .. " cycles)"))
+end
 
 -- ---------------------------------------------------------------- main cycle
 local booted = false
 local cycles = 0
 local lastLogT = 0
 local lastSummary = ""
-local queued = false
 
 local function logStats()
     if cycles % cfg.stats_cycles ~= 0 then return end
@@ -495,24 +497,20 @@ local function cycle()
     end
 end
 
--- A game-thread callback UE4SS never runs would leave `queued` set and stop the reveal for
--- good (seen with the host mod on 2026-10-12, "Ref was not function"); after 120 s queue again.
-local queuedAt, lostCallbacks = 0, 0
-LoopAsync(cfg.interval_ms, function()
-    if queued then
-        if os.time() - queuedAt < 120 then return false end
-        lostCallbacks = lostCallbacks + 1
-        if lostCallbacks <= 5 or lostCallbacks % 100 == 0 then log("game-thread callback lost (not run 120 s after it was queued, " .. lostCallbacks .. " so far); queuing again") end
+-- v0.1.4 (2026-10-18): one game-thread loop (LoopInGameThreadWithDelay, every interval_ms), registered
+-- as the last UE4SS call of this file.  Until v0.1.3 a background loop (LoopAsync) queued each cycle
+-- with ExecuteInGameThread, and in UE4SS b50986bd that call writes to the Lua stack the game thread is
+-- running on with nothing locking the two: it could leave UE4SS's game-thread queue dead for the rest
+-- of the session ("Ref was not function") or crash the game.  No background code here any more
+-- (tests/host-thread-safety.test.lua).
+local hooksRegistered = false
+local function cycleOnGameThread()
+    if not hooksRegistered then
+        hooksRegistered = true
+        registerHooks()
     end
-    queued = true
-    queuedAt = os.time()
-    local ok, err = pcall(function()
-        ExecuteInGameThread(function()
-            local cok, cerr = pcall(cycle)
-            if not cok then log("cycle failed: " .. tostring(cerr)) end
-            queued = false
-        end)
-    end)
-    if not ok then log("queue failed: " .. tostring(err)); queued = false end
-    return false
-end)
+    local cok, cerr = pcall(cycle)
+    if not cok then log("cycle failed: " .. tostring(cerr)) end
+end
+local loopOk, loopErr = pcall(LoopInGameThreadWithDelay, cfg.interval_ms, cycleOnGameThread)
+log("game-thread loop registered=" .. tostring(loopOk) .. (loopOk and "" or (" err=" .. tostring(loopErr))))

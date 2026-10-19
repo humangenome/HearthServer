@@ -19,11 +19,13 @@ local env = setmetatable({
     ExecuteInGameThread = function(callback) callback() end,
     executeInGameThreadSafe = function(_, callback) callback(); return true end,
     LoopAsync = function(_, callback) callback() end,
+    -- v0.18.61: the block ends with the game-thread pump registration
+    GAME_THREAD_WATCH = { pump = function() end }, LoopInGameThreadAfterFrames = function() end,
 }, { __index = _G })
 assert(load(source:sub(start), "spline hooks", "t", env))()
 local count = 0
 for _ in pairs(hooks) do count = count + 1 end
-assert(count == 10, "six spline RPCs plus the four Client spline replies must be installed")
+assert(count == 11, "six spline RPCs, ServerDisassemble and the four Client spline replies must be installed")
 
 local function param(value)
     return { get = function() return value end }

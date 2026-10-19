@@ -28,7 +28,10 @@ local stubOs = setmetatable({
 
 local drivers = {}
 local noop = function() return nil end
+-- v0.18.61: game-thread callbacks run from the pump the mod registers with LoopInGameThreadAfterFrames
+local gtPump = nil
 local env = setmetatable({
+    LoopInGameThreadAfterFrames = function(_, callback) gtPump = callback end,
     os = stubOs,
     LoopAsync = noop, ExecuteWithDelay = noop, ExecuteAsync = noop, RegisterHook = noop,
     NotifyOnNewObject = noop, RegisterKeyBind = noop, RegisterConsoleCommandHandler = noop,
@@ -40,6 +43,21 @@ local env = setmetatable({
 local exports = "\nreturn { ready = remoteIdentityReady, seed = seedJoinerIdentity,"
     .. " stableSeedByPc = stableSeedByPc, stableIdByPc = stableIdByPc }\n"
 local mod = assert(load(source .. exports, "main.lua", "t", env))()
+local onGameThreadPump = nil
+local function runPump()
+    if not gtPump then return end
+    if onGameThreadPump then onGameThreadPump(gtPump) else gtPump() end
+end
+for k, v in pairs(mod) do
+    if type(v) == "function" then
+        mod[k] = function(...)
+            local r = table.pack(v(...))
+            runPump()
+            return table.unpack(r, 1, r.n)
+        end
+    end
+end
+runPump() -- the first frame: boot steps
 
 local function uobj(addr, name, fields)
     local o = fields or {}
@@ -53,6 +71,8 @@ local function uobj(addr, name, fields)
     end
     return o
 end
+local LOCAL_PLAYER = uobj(9800, "LocalPlayer /Engine/Transient.GameEngine_0:LocalPlayer_0")
+LOCAL_PLAYER.GetClass = function() return { GetFName = function() return { ToString = function() return "LocalPlayer" end } end } end
 local LEVEL = "/Game/Mist/Maps/Karvenia/Karvenia_08/Karvenia_08.Karvenia_08:PersistentLevel."
 local conns = { GetArrayNum = function(self) return #self end }
 drivers[1] = uobj(9000, "IpNetDriver /Engine/Transient.IpNetDriver_0", { ClientConnections = conns })
@@ -60,9 +80,9 @@ drivers[1] = uobj(9000, "IpNetDriver /Engine/Transient.IpNetDriver_0", { ClientC
 -- A player on a blind connection: controller + player state + conn, listed on the driver.
 local function join(pcAddr, pcSerial, connAddr, connSerial, name)
     local ps = uobj(pcAddr + 1, "OasisPlayerState_C " .. LEVEL .. "OasisPlayerState_C_" .. pcSerial,
-        { GetPlayerName = function() return name end })
+        { PlayerNamePrivate = name, GetPlayerName = function() return name end })
     local pc = uobj(pcAddr, "OasisPlayerController_C " .. LEVEL .. "OasisPlayerController_C_" .. pcSerial,
-        { PlayerState = ps, IsLocalPlayerController = function() return false end })
+        { PlayerState = ps, Player = (false) and LOCAL_PLAYER or nil, IsLocalPlayerController = function() return false end })
     local conn = uobj(connAddr, "IpConnection /Engine/Transient.IpConnection_" .. connSerial, { OwningActor = pc })
     conns[#conns + 1] = conn
     return { pc = pc, conn = conn }

@@ -104,10 +104,69 @@ function L($m){ $line = ('[' + (Get-Date -Format o) + '] ' + $m); Write-Host $li
 # Without this, -Stop and -Restart killed the game outright: everything since the
 # last autosave was lost, and a kill in the middle of an autosave can leave a torn
 # save. Same steps as the managed stop command.
+#
+# A stalled host helper cannot save (bw_host before v0.18.61 could lose its game-thread queue for a
+# whole session; v0.18.61 still says so if its game-thread pump stops). Then the marker would only
+# cost 20 s: when bw_host's last heartbeat ends ",stalled", or its log has been silent for 90 s,
+# wait instead for the game's own next autosave (every 2 minutes) when it is due within 150 s.
+# Same rule as the managed stop command.
+function Test-HostHelperStalled {
+  $hb = Join-Path $logDir 'bw_host.log'
+  if (-not (Test-Path -LiteralPath $hb)) { return $false }
+  $item = Get-Item -LiteralPath $hb -ErrorAction SilentlyContinue
+  if (-not $item) { return $false }
+  if (((Get-Date) - $item.LastWriteTime).TotalSeconds -ge 90) { return $true }
+  $last = ''
+  try {
+    $fs = [IO.File]::Open($hb, 'Open', 'Read', 'ReadWrite,Delete')
+    try {
+      $start = [math]::Max(0, $fs.Length - 32768); $null = $fs.Seek($start, 'Begin')
+      $buf = New-Object byte[] ($fs.Length - $start); $n = $fs.Read($buf, 0, $buf.Length)
+      foreach ($line in ([Text.Encoding]::UTF8.GetString($buf, 0, $n) -split "`r?`n")) { if ($line -match '\] hb t=') { $last = $line } }
+    } finally { $fs.Close() }
+  } catch { return $false }
+  return ($last.TrimEnd() -match ',stalled$')
+}
+function Wait-GameOwnSave([int]$gamePid, [string]$savePath) {
+  $was = [datetime]::MinValue
+  if (Test-Path -LiteralPath $savePath) { try { $was = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
+  $wait = 150
+  if ($was -ne [datetime]::MinValue) {
+    $due = 130 - ((Get-Date).ToUniversalTime() - $was).TotalSeconds
+    if ($due -gt 150) { L 'save before stop: host helper stalled and the game''s next own save is not due within 150 s (stopping now)'; return }
+    if ($due -le 0) { $wait = 60 } else { $wait = [math]::Max(15, [math]::Min(150, [int]$due + 20)) }
+  }
+  L ('save before stop: host helper stalled, waiting up to ' + $wait + ' s for the game''s own save')
+  $ok = $false
+  $t0 = Get-Date
+  $end = $t0.AddSeconds($wait)
+  while ((Get-Date) -lt $end) {
+    Start-Sleep -Milliseconds 500
+    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) { break }
+    $now = [datetime]::MinValue
+    if (Test-Path -LiteralPath $savePath) { try { $now = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
+    if ($now -gt $was) { $ok = $true; break }
+  }
+  if ($ok) {
+    $sig = ''
+    $end2 = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $end2) {
+      Start-Sleep -Milliseconds 500
+      $item = Get-Item -LiteralPath $savePath -ErrorAction SilentlyContinue
+      if (-not $item) { break }
+      $cur = [string]$item.LastWriteTimeUtc + '|' + [string]$item.Length
+      if ($cur -eq $sig) { break }
+      $sig = $cur
+    }
+  }
+  $secs = [int]((Get-Date) - $t0).TotalSeconds
+  if ($ok) { L ('save before stop: the game''s own save landed after ' + $secs + ' s') } else { L ('save before stop: no game save within ' + $secs + ' s (stopping anyway)') }
+}
 function Save-WorldBeforeKill([int]$gamePid, [int]$port, [string]$savePath) {
   if ($gamePid -le 0 -or $port -le 0 -or [string]::IsNullOrWhiteSpace($savePath)) { return }
   $proc = Get-Process -Id $gamePid -ErrorAction SilentlyContinue
   if (-not $proc -or $proc.ProcessName -notlike 'BellwrightGame*') { return }
+  if (Test-HostHelperStalled) { Wait-GameOwnSave $gamePid $savePath; return }
   $marker = Join-Path $logDir ('hearth_force_save_' + $port + '.marker')
   $was = [datetime]::MinValue
   if (Test-Path -LiteralPath $savePath) { try { $was = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
@@ -1072,20 +1131,30 @@ function Set-GamePin([int]$cpid, [bool]$quiet = $false) {
     try { (Get-Process -Id $cpid -ErrorAction Stop).PriorityClass = 'AboveNormal' } catch {}
     return $true
   }
+  # 2026-10-19: the game resets its own affinity a few times during its first minute, so one
+  # set + readback could land right after a reset and fail the start (fleet logs: 59 of 939
+  # launch attempts, 8 starts gave up). Set it again up to 6 times, 250 ms apart; a set made
+  # after the reset holds. Still fail closed if it never holds.
   try {
     $p = Get-Process -Id $cpid -ErrorAction Stop
     $beforeAffinity = [int64]$p.ProcessorAffinity
     $beforePriority = $p.PriorityClass
-    $p.ProcessorAffinity = [IntPtr][int64]$mask
-    $p.PriorityClass = 'AboveNormal'
-    Start-Sleep -Milliseconds 200
-    $p2 = Get-Process -Id $cpid -ErrorAction Stop
-    if (([int64]$p2.ProcessorAffinity) -ne ([int64]$mask)) {
-      L ('PIN FAILED: affinity readback ' + ([int64]$p2.ProcessorAffinity) + ' != mask ' + ([int64]$mask))
+    $held = $false; $readback = 0; $try = 0
+    for ($try = 1; $try -le 6; $try++) {
+      $p = Get-Process -Id $cpid -ErrorAction Stop
+      $p.ProcessorAffinity = [IntPtr][int64]$mask
+      $p.PriorityClass = 'AboveNormal'
+      Start-Sleep -Milliseconds 250
+      $p2 = Get-Process -Id $cpid -ErrorAction Stop
+      $readback = [int64]$p2.ProcessorAffinity
+      if ($readback -eq ([int64]$mask)) { $held = $true; break }
+    }
+    if (-not $held) {
+      L ('PIN FAILED: affinity readback ' + $readback + ' != mask ' + ([int64]$mask) + ' after 6 tries')
       return $false
     }
-    if ((-not $quiet) -or $beforeAffinity -ne ([int64]$mask) -or $beforePriority -ne 'AboveNormal') {
-      L ('pinned pid=' + $cpid + ' affinity=' + ([int64]$mask) + ' (0x' + ('{0:X}' -f ([int64]$mask)) + ', ' + $K + ' cores, slot ' + $slot + ') priority=' + $p2.PriorityClass)
+    if ((-not $quiet) -or $beforeAffinity -ne ([int64]$mask) -or $beforePriority -ne 'AboveNormal' -or $try -gt 1) {
+      L ('pinned pid=' + $cpid + ' affinity=' + ([int64]$mask) + ' (0x' + ('{0:X}' -f ([int64]$mask)) + ', ' + $K + ' cores, slot ' + $slot + ') priority=' + $p2.PriorityClass + $(if ($try -gt 1) { ' (held on try ' + $try + ')' } else { '' }))
     }
     return $true
   } catch { L ('PIN FAILED (exception): ' + $_.Exception.Message); return $false }

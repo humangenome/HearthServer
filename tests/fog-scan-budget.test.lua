@@ -120,8 +120,10 @@ local function makeWorld(opts)
                 W.files[".\\ue4ss\\Mods\\bw_fog\\fog-reveal-status.txt"] = "state=ok\nstamps=" .. n .. "\n"
             end
         end },
-        LoopAsync = function(ms, fn) table.insert(W.loops, fn) end,
-        ExecuteInGameThread = function(fn) fn() end,
+        -- v0.1.4: one game-thread loop, no background loop and no ExecuteInGameThread
+        LoopInGameThreadWithDelay = function(ms, fn) table.insert(W.loops, fn) end,
+        LoopAsync = function() W.asyncLoops = (W.asyncLoops or 0) + 1 end,
+        ExecuteInGameThread = function() error("bw_fog must not call ExecuteInGameThread") end,
         NotifyOnNewObject = function(cls, cb)
             if opts.noHook and cls:find("PlayerController", 1, true) then error("hook unavailable") end
             W.notify[cls] = W.notify[cls] or {}; table.insert(W.notify[cls], cb)
@@ -143,7 +145,8 @@ local function makeWorld(opts)
         print = function() end,
     }, { __index = _G })
     assert(load(source, "bw_fog main.lua", "t", env))()
-    assert(#W.loops == 1, "the mod registers one LoopAsync")
+    assert(#W.loops == 1, "the mod registers one game-thread loop")
+    assert((W.asyncLoops or 0) == 0, "the mod registers a background loop")
     function W.cycles(n, each)
         for i = 1, n do
             if each then each(i) end

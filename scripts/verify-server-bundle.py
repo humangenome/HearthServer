@@ -27,6 +27,9 @@ correct package was SMALLER than the broken one.
 
 import argparse
 import os
+import shutil
+import subprocess
+import tempfile
 import sys
 import zipfile
 
@@ -235,7 +238,42 @@ def verify(path):
                     "mod".format(sample)
                 )
 
+        failures.extend(thread_safety(zf, sizes))
+
     return failures
+
+
+# The packaged host mods' background code must never call UE4SS's game-thread or hook functions
+# or a game function (tests/host-thread-safety.test.lua explains why). Runs that test on the
+# main.lua files inside the zip when lua5.4 and luac5.4 are on PATH (the Linux checks and the
+# overlay builds); the Windows release job has no Lua and says so instead of failing.
+def thread_safety(zf, sizes):
+    test = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests",
+                        "host-thread-safety.test.lua")
+    lua, luac = shutil.which("lua5.4"), shutil.which("luac5.4")
+    if not (lua and luac and os.path.isfile(test)):
+        print("note: game-thread safety check skipped (needs lua5.4, luac5.4 and "
+              "tests/host-thread-safety.test.lua)")
+        return []
+    with tempfile.TemporaryDirectory() as tmp:
+        files = []
+        for mod in ("bw_host", "bw_fog", "bw_seat4"):
+            key = "ue4ss/mods/{}/scripts/main.lua".format(mod)
+            if key not in sizes:
+                continue
+            out = os.path.join(tmp, mod + ".lua")
+            with open(out, "wb") as fh:
+                fh.write(zf.read("ue4ss/Mods/{}/Scripts/main.lua".format(mod)))
+            files.append(out)
+        if not files:
+            return []
+        run = subprocess.run([lua, test] + files, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, universal_newlines=True)
+        if run.returncode != 0:
+            return ["game-thread safety: " + line.strip()
+                    for line in run.stdout.splitlines() if line.strip()]
+        print(run.stdout.strip())
+    return []
 
 
 def main(argv):

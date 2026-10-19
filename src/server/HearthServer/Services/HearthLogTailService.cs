@@ -114,6 +114,21 @@ public sealed class HearthLogTailService : BackgroundService
         _loginIdentityCachePath = ResolveLoginIdentityCachePath(_opts.LoginIdentityCachePath);
     }
 
+    internal static IEnumerable<string?> SteamManifestRoots(HearthServerOptions opts)
+    {
+        yield return opts.GameInstallRoot;
+        string? parent = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(opts.GameUserDir))
+                parent = Path.GetDirectoryName(Path.GetFullPath(opts.GameUserDir).TrimEnd('\\', '/'));
+        }
+        catch (ArgumentException)
+        {
+        }
+        yield return parent;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(_opts.GameUserDir))
@@ -123,6 +138,10 @@ public sealed class HearthLogTailService : BackgroundService
         }
         var logPaths = CandidateLogPaths(_opts.GameUserDir).ToArray();
         _log.LogInformation("[Bellwright] log tail watching {Paths}", string.Join(", ", logPaths));
+        // The game's own build banner names no build ("UE5-CL-0"); report the install's Steam build.
+        // Managed hosts leave GameInstallRoot empty: the install is the folder above GameUserDir.
+        if (HearthVersionInfo.TrySetSteamBuild(SteamManifestRoots(_opts)))
+            _log.LogInformation("[Bellwright] Steam build {Build} (install manifest)", HearthVersionInfo.HearthBuild);
         WriteLoginIdentityCache();
 
         while (!ct.IsCancellationRequested)
