@@ -51,5 +51,7 @@
     <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
     <PackageVersion Include="FluentAssertions" Version="6.12.1" />
     <PackageVersion Include="coverlet.collector" Version="6.0.2" />
+    <!-- Launcher window tests: real windows on Avalonia's headless platform (no desktop). -->
+    <PackageVersion Include="Avalonia.Headless.XUnit" Version="11.2.0" />
   </ItemGroup>
 </Project>

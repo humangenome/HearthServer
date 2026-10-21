@@ -19,8 +19,9 @@ namespace HearthServer.Services;
 /// orchestrator.
 ///
 /// Routes (all under <c>/api/v1</c>):
-///   GET  /health                       — public, no auth
+///   GET  /health, /players, /manifest  — public, no auth
 ///   GET  /info                         — instance + version
+///   GET  /chat/recent, /chat/motd      — admin broadcast history (auth)
 ///   GET  /snapshots                    — list snapshots (auth)
 ///   GET  /snapshots/{id}/download      — stream zip (auth)
 ///   POST /snapshots                    — upload zip body, store as snapshot (auth)
@@ -32,12 +33,31 @@ namespace HearthServer.Services;
 /// and sends headers:
 ///   X-Hearth-Timestamp: &lt;unix seconds&gt;
 ///   X-Hearth-Signature: &lt;hex&gt;
+///   X-Hearth-Content-Sha256: &lt;body_sha256_hex&gt;  (required when the body is over 64 KB)
 /// Server rejects timestamps older than 5 minutes (replay window).
+///
+/// The signature is checked from the headers before any body byte is read:
+/// a body of up to 64 KB is read into memory (Content-Length required, short
+/// deadline) and hashed; a larger body must declare its hash up front, the
+/// signature and replay check run on that declared hash, and only then is the
+/// body streamed to disk, where the streamed hash must match. Public routes,
+/// signed routes and large uploads each have their own concurrency limit, so
+/// signed traffic can never starve the public health and player reads.
 /// </summary>
 public sealed class HearthHttpService : BackgroundService
 {
     private const int ReplayWindowSeconds = 300;
-    private const int MaxConcurrentRequests = 8;
+    internal const int PublicConcurrentRequests = 16;
+    internal const int SignedConcurrentRequests = 8;
+    internal const int UploadConcurrentRequests = 2;
+    internal const int SmallBodyMaxBytes = 64 * 1024;
+    internal static readonly TimeSpan SmallBodyReadTimeout = TimeSpan.FromSeconds(15);
+    internal const string ContentShaHeader = "X-Hearth-Content-Sha256";
+    // Shown by the app's World window when an upload is refused. An app from
+    // before the content hash header shows its own fixed "Import failed." text
+    // whatever the answer says; it updates itself on launch.
+    internal const string UpdateAppMessage = "Update your Hearth app to upload worlds to this server.";
+    internal const string UploadBusyMessage = "Another world upload is running on this server. Try again in a few minutes.";
 
     private readonly ILogger<HearthHttpService> _log;
     private readonly HearthServerOptions _opts;
@@ -48,7 +68,9 @@ public sealed class HearthHttpService : BackgroundService
     private readonly ChatService _chat;
     private readonly AdminJoinTicketService _adminJoinTickets;
     private readonly byte[] _authKey;
-    private readonly SemaphoreSlim _requestLimiter = new(MaxConcurrentRequests, MaxConcurrentRequests);
+    private readonly SemaphoreSlim _publicLimiter = new(PublicConcurrentRequests, PublicConcurrentRequests);
+    private readonly SemaphoreSlim _signedLimiter = new(SignedConcurrentRequests, SignedConcurrentRequests);
+    private readonly SemaphoreSlim _uploadLimiter = new(UploadConcurrentRequests, UploadConcurrentRequests);
     // Sliding window of signatures we've already accepted, so a captured
     // valid request inside the 5-minute replay window can't be re-sent to
     // double-trigger a restore or pile up snapshots.
@@ -176,10 +198,17 @@ public sealed class HearthHttpService : BackgroundService
                     catch (ObjectDisposedException) { break; }
                     catch (OperationCanceledException) { break; }
 
-                    // Bounded concurrency: refuse new requests if too many
-                    // are already in flight rather than spawning unbounded
-                    // Task.Run instances.
-                    if (!await _requestLimiter.WaitAsync(0).ConfigureAwait(false))
+                    // Bounded concurrency, one pool per kind of caller: refuse new
+                    // requests if too many are already in flight rather than
+                    // spawning unbounded Task.Run instances. Public reads have
+                    // their own pool so signed traffic cannot crowd them out.
+                    var limiter = IsPublicRequest(
+                        ctx.Request.HttpMethod.ToUpperInvariant(),
+                        ctx.Request.Url?.AbsolutePath ?? "",
+                        _opts.Map)
+                        ? _publicLimiter
+                        : _signedLimiter;
+                    if (!await limiter.WaitAsync(0).ConfigureAwait(false))
                     {
                         try
                         {
@@ -194,7 +223,7 @@ public sealed class HearthHttpService : BackgroundService
                     _ = Task.Run(async () =>
                     {
                         try { await HandleRequestAsync(ctx, stoppingToken).ConfigureAwait(false); }
-                        finally { _requestLimiter.Release(); }
+                        finally { limiter.Release(); }
                     }, stoppingToken);
                 }
             }
@@ -366,22 +395,25 @@ public sealed class HearthHttpService : BackgroundService
                 return;
             }
 
+            // Auth required for everything below. The signature is checked
+            // from the headers before the body is read (see the class
+            // summary); the body, if any, then lands in a temp file and the
+            // resulting BufferedBody is passed through to the route handler.
+            var auth = await AuthorizeAndReadBodyAsync(ctx, ct).ConfigureAwait(false);
+            if (auth.Body is null)
+            {
+                if (auth.Status == 0) return; // connection already aborted
+                await WriteJsonAsync(res, auth.Status, new { error = auth.Error });
+                return;
+            }
+            var body = auth.Body;
+
             // ----- Chat plane reads (protocol/chat-v1.md) -----
-            //
-            // Public on purpose. The only thing that ever lands in the ring
-            // buffer is admin broadcast (RCON say/announce + HTTP /chat/say +
-            // scheduled warnings + MOTD). Everything in the stream is already
-            // shouted at every joined player, so a public read endpoint leaks
-            // nothing extra.
-            //
-            // The in-game HearthHud overlay runs inside the player's game
-            // process and has no access to RconPassword, so HMAC would
-            // require shipping the secret to every client. If the game ever
-            // grows native chat or DMs, the public surface stays
-            // admin-broadcast-only and a separate authed /chat/recent/full
-            // can carry private channels.
+            // Admin broadcast history and the MOTD. Signed like every other
+            // admin read; nothing in the game or the app reads them unsigned.
             if (method == "GET" && path == "/api/v1/chat/recent")
             {
+                body.Dispose();
                 var sinceMs = ParseLongQuery(req.Url, "since", 0);
                 var limit = (int)ParseLongQuery(req.Url, "limit", 100);
                 var msgs = _chat.GetRecent(sinceMs, limit);
@@ -397,82 +429,12 @@ public sealed class HearthHttpService : BackgroundService
 
             if (method == "GET" && path == "/api/v1/chat/motd")
             {
+                body.Dispose();
                 await WriteJsonAsync(res, 200, new
                 {
                     instance = _identity.InstanceId,
                     msg = _chat.GetMotd(),
                 });
-                return;
-            }
-
-            // ----- Public chat ingest from player overlays -----
-            //
-            // The game has no native chat. Players type into the HearthHud
-            // overlay's ImGui InputText, the launcher relays the message here.
-            // Channel is forced to "player" and target to "all" by
-            // ChatService.BroadcastFromPlayer. Per-IP rate limit handled there.
-            //
-            // Body is bounded at 2 KB — bigger than any sensible chat message
-            // (the body itself caps at 512 bytes via NormalizeBody) but small
-            // enough that we can read it inline without the streaming buffer
-            // the authed routes use.
-            if (method == "POST" && path == "/api/v1/chat/player")
-            {
-                string rawBody;
-                try { rawBody = await ReadShortBodyAsync(req, maxBytes: 2048, ct).ConfigureAwait(false); }
-                catch (BodyTooLargeException)
-                {
-                    await WriteJsonAsync(res, 413, new { error = "payload too large" });
-                    return;
-                }
-                ChatPlayerRequest? plReq;
-                try
-                {
-                    plReq = JsonSerializer.Deserialize<ChatPlayerRequest>(rawBody, new JsonSerializerOptions
-                    {
-                        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-                        PropertyNameCaseInsensitive = true,
-                    });
-                }
-                catch (JsonException)
-                {
-                    await WriteJsonAsync(res, 400, new { error = "invalid json" });
-                    return;
-                }
-                if (plReq is null || string.IsNullOrWhiteSpace(plReq.Msg))
-                {
-                    await WriteJsonAsync(res, 400, new { error = "msg required" });
-                    return;
-                }
-                var clientIp = req.RemoteEndPoint?.Address?.ToString() ?? "";
-                var entry = _chat.BroadcastFromPlayer(clientIp, plReq.Sender ?? "Player", plReq.Msg);
-                if (entry is null)
-                {
-                    await WriteJsonAsync(res, 429, new { error = "rate limited" });
-                    return;
-                }
-                await WriteJsonAsync(res, 200, new { ok = true, ts = entry.Ts });
-                return;
-            }
-
-            // Auth required for everything below. Body (if any) is streamed
-            // to a temp file once and the resulting BufferedBody is passed
-            // through to the route handler — no full-body MemoryStream and
-            // no base64-via-header round trip (used to triple the memory
-            // footprint per upload).
-            BufferedBody? body;
-            try
-            {
-                body = await ValidateAuthAndBufferAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (BodyTooLargeException)
-            {
-                await WriteJsonAsync(res, 413, new { error = "payload too large" });
-                return;
-            }
-            if (body is null)
-            {
-                await WriteJsonAsync(res, 401, new { error = "unauthorized" });
                 return;
             }
 
@@ -640,7 +602,6 @@ public sealed class HearthHttpService : BackgroundService
             }
 
             // ----- Chat plane writes (protocol/chat-v1.md) -----
-            // GET /chat/recent + GET /chat/motd live above the auth gate.
             if (method == "POST" && path == "/api/v1/chat/say")
             {
                 var sayReq = await ParseJsonBodyAsync<ChatSayRequest>(body, ct).ConfigureAwait(false);
@@ -691,46 +652,55 @@ public sealed class HearthHttpService : BackgroundService
     }
 
     /// <summary>
-    /// Streams the request body (if any) to a temp file while computing
-    /// SHA256 inline. On signature mismatch / replay reuse / cap overflow,
-    /// the temp file is deleted and we return null. The body never lands
-    /// in a MemoryStream — uploads up to <see cref="HearthServerOptions.MaxUploadBytes"/>
-    /// cost one temp-file's worth of disk and an HMAC state.
+    /// Which accept-loop pool a request belongs to. Public = the reads that
+    /// answer without a signature (and the map routes, which only ever answer
+    /// "disabled" or public data). Everything else is signed.
     /// </summary>
-    private async Task<BufferedBody?> ValidateAuthAndBufferAsync(HttpListenerRequest req, CancellationToken ct)
+    internal static bool IsPublicRequest(string method, string path, MapOptions map)
     {
-        var tsHeader = req.Headers["X-Hearth-Timestamp"];
-        var sigHeader = req.Headers["X-Hearth-Signature"];
-        if (string.IsNullOrWhiteSpace(tsHeader) || string.IsNullOrWhiteSpace(sigHeader))
-            return null;
-        if (!long.TryParse(tsHeader, out var ts)) return null;
+        if (method != "GET") return false;
+        if (path is "/api/v1/health" or "/api/v1/players" or "/api/v1/manifest") return true;
+        if (path is "/map" or "/map/" or "/map/index.html") return true;
+        if (path == "/api/v1/map/state") return !map.Enabled || map.Public;
+        return false;
+    }
 
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        if (Math.Abs(now - ts) > ReplayWindowSeconds) return null;
+    internal readonly record struct AuthOutcome(BufferedBody? Body, int Status, string Error)
+    {
+        public static AuthOutcome Fail(int status, string error) => new(null, status, error);
+    }
 
-        if (req.ContentLength64 > _opts.MaxUploadBytes)
-            throw new BodyTooLargeException();
+    /// <summary>The HMAC-SHA256 signature over method, path, timestamp and body hash, lower hex.</summary>
+    internal static string ComputeSignature(byte[] key, string method, string path, long ts, string bodySha256Hex)
+    {
+        var canonical = $"{method}\n{path}\n{ts}\n{bodySha256Hex}";
+        return Convert.ToHexString(HMACSHA256.HashData(key, Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+    }
 
-        var path = req.Url?.AbsolutePath ?? "";
-        var method = req.HttpMethod.ToUpperInvariant();
+    private static bool IsSha256Hex(string? s)
+    {
+        if (s is null || s.Length != 64) return false;
+        foreach (var c in s)
+        {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        }
+        return true;
+    }
 
-        var buffered = await BufferBodyToDiskAsync(req, _opts.MaxUploadBytes, ct).ConfigureAwait(false);
-        // buffered.Sha256Hex is already lower-hex over the streamed bytes.
-
-        var canonical = $"{method}\n{path}\n{ts}\n{buffered.Sha256Hex}";
-        var expected = Convert.ToHexString(
-            HMACSHA256.HashData(_authKey, Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
-
-        var sigOk = CryptographicOperations.FixedTimeEquals(
+    private bool SignatureMatches(string method, string path, long ts, string bodySha, string sigHeader)
+    {
+        var expected = ComputeSignature(_authKey, method, path, ts, bodySha);
+        return CryptographicOperations.FixedTimeEquals(
             Encoding.ASCII.GetBytes(expected),
             Encoding.ASCII.GetBytes(sigHeader.ToLowerInvariant()));
+    }
 
-        if (!sigOk)
-        {
-            buffered.Dispose();
-            return null;
-        }
-
+    /// <summary>
+    /// Records an accepted signature; false if it was already used inside the
+    /// replay window.
+    /// </summary>
+    private bool TryConsumeSignature(string sigHeader, long ts, long now)
+    {
         var sigKey = sigHeader.ToLowerInvariant();
         lock (_seenSignaturesLock)
         {
@@ -743,30 +713,166 @@ public sealed class HearthHttpService : BackgroundService
                     .ToList();
                 foreach (var k in toRemove) _seenSignatures.Remove(k);
             }
-            if (_seenSignatures.ContainsKey(sigKey))
-            {
-                buffered.Dispose();
-                return null;
-            }
+            if (_seenSignatures.ContainsKey(sigKey)) return false;
             _seenSignatures[sigKey] = ts;
+            return true;
         }
-
-        return buffered;
     }
 
     /// <summary>
-    /// Stream the request body into a temp file while hashing in 64 KB
-    /// chunks. Never allocates a buffer the size of the body. Throws
-    /// <see cref="BodyTooLargeException"/> if the stream exceeds the cap
-    /// mid-read.
+    /// Checks the request's signature from its headers before reading the
+    /// body, then reads the body into a temp file. A body of up to
+    /// <see cref="SmallBodyMaxBytes"/> is read into memory under
+    /// <see cref="SmallBodyReadTimeout"/>, hashed and verified, and only
+    /// written to disk once the signature holds. A larger body must carry
+    /// <see cref="ContentShaHeader"/>: the signature and the replay check run
+    /// on that declared hash first, then the body streams to disk (at most
+    /// <see cref="UploadConcurrentRequests"/> at once) and must hash to the
+    /// declared value. Any temp file is deleted on every failure path.
     /// </summary>
-    private static async Task<BufferedBody> BufferBodyToDiskAsync(HttpListenerRequest req, long maxBytes, CancellationToken ct)
+    private async Task<AuthOutcome> AuthorizeAndReadBodyAsync(HttpListenerContext ctx, CancellationToken ct)
+    {
+        var req = ctx.Request;
+        var tsHeader = req.Headers["X-Hearth-Timestamp"];
+        var sigHeader = req.Headers["X-Hearth-Signature"];
+        if (string.IsNullOrWhiteSpace(tsHeader) || string.IsNullOrWhiteSpace(sigHeader))
+            return AuthOutcome.Fail(401, "unauthorized");
+        if (!long.TryParse(tsHeader, out var ts)) return AuthOutcome.Fail(401, "unauthorized");
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (Math.Abs(now - ts) > ReplayWindowSeconds) return AuthOutcome.Fail(401, "unauthorized");
+
+        var path = req.Url?.AbsolutePath ?? "";
+        var method = req.HttpMethod.ToUpperInvariant();
+
+        // A body must say how long it is: no chunked uploads, so the size
+        // decision below is made before the first byte.
+        long length = 0;
+        if (req.HasEntityBody)
+        {
+            if (req.ContentLength64 < 0) return AuthOutcome.Fail(411, "content length required");
+            length = req.ContentLength64;
+        }
+        if (length > _opts.MaxUploadBytes) return AuthOutcome.Fail(413, "payload too large");
+
+        var declaredRaw = req.Headers[ContentShaHeader];
+        string? declared = null;
+        if (!string.IsNullOrWhiteSpace(declaredRaw))
+        {
+            declared = declaredRaw.Trim().ToLowerInvariant();
+            if (!IsSha256Hex(declared)) return AuthOutcome.Fail(401, "unauthorized");
+        }
+
+        if (length > SmallBodyMaxBytes)
+        {
+            if (declared is null) return AuthOutcome.Fail(428, UpdateAppMessage);
+            if (!SignatureMatches(method, path, ts, declared, sigHeader) || !TryConsumeSignature(sigHeader, ts, now))
+                return AuthOutcome.Fail(401, "unauthorized");
+            if (!await _uploadLimiter.WaitAsync(0).ConfigureAwait(false))
+                return AuthOutcome.Fail(503, UploadBusyMessage);
+            try
+            {
+                BufferedBody streamed;
+                try
+                {
+                    streamed = await StreamBodyToDiskAsync(req.InputStream, length, ct).ConfigureAwait(false);
+                }
+                catch (IncompleteBodyException)
+                {
+                    return AuthOutcome.Fail(400, "incomplete body");
+                }
+                if (!string.Equals(streamed.Sha256Hex, declared, StringComparison.Ordinal))
+                {
+                    streamed.Dispose();
+                    return AuthOutcome.Fail(401, "unauthorized");
+                }
+                return new AuthOutcome(streamed, 200, "");
+            }
+            finally
+            {
+                _uploadLimiter.Release();
+            }
+        }
+
+        // Small or empty body: read it whole, under a deadline, before deciding.
+        byte[] bytes;
+        if (length == 0)
+        {
+            bytes = Array.Empty<byte>();
+        }
+        else
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(SmallBodyReadTimeout);
+            // HttpListener reads do not always observe a token, so a reader
+            // that stalls past the deadline gets its connection closed.
+            using var abortOnDeadline = deadline.Token.Register(() =>
+            {
+                try { ctx.Response.Abort(); } catch { }
+            });
+            try
+            {
+                bytes = await ReadExactAsync(req.InputStream, (int)length, deadline.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or IncompleteBodyException or IOException or HttpListenerException or ObjectDisposedException)
+            {
+                if (deadline.IsCancellationRequested && !ct.IsCancellationRequested) return AuthOutcome.Fail(0, "");
+                return AuthOutcome.Fail(400, "incomplete body");
+            }
+        }
+
+        var sha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        if (declared is not null && !string.Equals(declared, sha, StringComparison.Ordinal))
+            return AuthOutcome.Fail(401, "unauthorized");
+        if (!SignatureMatches(method, path, ts, sha, sigHeader) || !TryConsumeSignature(sigHeader, ts, now))
+            return AuthOutcome.Fail(401, "unauthorized");
+
+        return new AuthOutcome(await WriteTempBodyAsync(bytes, sha, ct).ConfigureAwait(false), 200, "");
+    }
+
+    private static string NewTempUploadPath()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), "hearth-uploads");
         Directory.CreateDirectory(tempDir);
-        var tempPath = Path.Combine(tempDir, $"upload-{Guid.NewGuid():N}.bin");
+        return Path.Combine(tempDir, $"upload-{Guid.NewGuid():N}.bin");
+    }
 
-        long total = 0;
+    private static async Task<byte[]> ReadExactAsync(Stream input, int length, CancellationToken ct)
+    {
+        var buffer = new byte[length];
+        int total = 0;
+        while (total < length)
+        {
+            int n = await input.ReadAsync(buffer.AsMemory(total, length - total), ct).ConfigureAwait(false);
+            if (n <= 0) throw new IncompleteBodyException();
+            total += n;
+        }
+        return buffer;
+    }
+
+    private static async Task<BufferedBody> WriteTempBodyAsync(byte[] bytes, string sha, CancellationToken ct)
+    {
+        var tempPath = NewTempUploadPath();
+        try
+        {
+            await File.WriteAllBytesAsync(tempPath, bytes, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            try { File.Delete(tempPath); } catch { }
+            throw;
+        }
+        return new BufferedBody(tempPath, sha, bytes.LongLength);
+    }
+
+    /// <summary>
+    /// Stream exactly <paramref name="length"/> bytes into a temp file while
+    /// hashing in 64 KB chunks. Never allocates a buffer the size of the body.
+    /// The temp file is deleted if the body ends early or anything throws.
+    /// </summary>
+    private static async Task<BufferedBody> StreamBodyToDiskAsync(Stream input, long length, CancellationToken ct)
+    {
+        var tempPath = NewTempUploadPath();
         string sha;
         try
         {
@@ -774,18 +880,15 @@ public sealed class HearthHttpService : BackgroundService
                 tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, useAsync: true);
             using var hasher = SHA256.Create();
             var buf = new byte[64 * 1024];
-            if (req.ContentLength64 != 0)
+            long total = 0;
+            while (total < length)
             {
-                while (true)
-                {
-                    int n = await req.InputStream.ReadAsync(buf, ct).ConfigureAwait(false);
-                    if (n <= 0) break;
-                    total += n;
-                    if (total > maxBytes)
-                        throw new BodyTooLargeException();
-                    hasher.TransformBlock(buf, 0, n, null, 0);
-                    await fs.WriteAsync(buf.AsMemory(0, n), ct).ConfigureAwait(false);
-                }
+                int want = (int)Math.Min(buf.Length, length - total);
+                int n = await input.ReadAsync(buf.AsMemory(0, want), ct).ConfigureAwait(false);
+                if (n <= 0) throw new IncompleteBodyException();
+                total += n;
+                hasher.TransformBlock(buf, 0, n, null, 0);
+                await fs.WriteAsync(buf.AsMemory(0, n), ct).ConfigureAwait(false);
             }
             hasher.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
             sha = Convert.ToHexString(hasher.Hash!).ToLowerInvariant();
@@ -796,7 +899,7 @@ public sealed class HearthHttpService : BackgroundService
             throw;
         }
 
-        return new BufferedBody(tempPath, sha, total);
+        return new BufferedBody(tempPath, sha, length);
     }
 
     /// <summary>
@@ -805,7 +908,7 @@ public sealed class HearthHttpService : BackgroundService
     /// <see cref="MarkConsumed"/> (route renamed it into permanent storage
     /// and owns it from that point on).
     /// </summary>
-    private sealed class BufferedBody : IDisposable
+    internal sealed class BufferedBody : IDisposable
     {
         public string TempPath { get; }
         public string Sha256Hex { get; }
@@ -830,7 +933,7 @@ public sealed class HearthHttpService : BackgroundService
         }
     }
 
-    private sealed class BodyTooLargeException : Exception { }
+    private sealed class IncompleteBodyException : Exception { }
 
     /// <summary>
     /// Best-effort one-shot of
@@ -1012,31 +1115,6 @@ public sealed class HearthHttpService : BackgroundService
     private sealed class AdminJoinTicketRequest
     {
         public string SteamId { get; set; } = "";
-    }
-
-    private sealed class ChatPlayerRequest
-    {
-        public string Msg { get; set; } = "";
-        public string? Sender { get; set; }
-    }
-
-    private static async Task<string> ReadShortBodyAsync(HttpListenerRequest req, int maxBytes, CancellationToken ct)
-    {
-        if (!req.HasEntityBody) return "";
-        if (req.ContentLength64 > maxBytes) throw new BodyTooLargeException();
-        var buffer = new byte[Math.Min(maxBytes, 4096)];
-        using var ms = new MemoryStream();
-        int total = 0;
-        var stream = req.InputStream;
-        while (true)
-        {
-            var read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
-            if (read <= 0) break;
-            total += read;
-            if (total > maxBytes) throw new BodyTooLargeException();
-            ms.Write(buffer, 0, read);
-        }
-        return req.ContentEncoding.GetString(ms.ToArray());
     }
 
     private static object SerializeEntry(ModEntry e) => new

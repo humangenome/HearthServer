@@ -180,15 +180,39 @@ public sealed class RconHostedService : IHostedService
 
     private string BuildStatus()
     {
-        var conn = _state.Connection;
-        return conn is null
-            ? $"instance={_opts.InstanceId} plugin=disconnected"
-            : $"instance={_opts.InstanceId} plugin=connected pid={conn.PluginPid} version={conn.PluginVersion} players={_state.EffectivePlayerCount}";
+        // Same "online" rule as /api/v1/health: the plugin is pinging or the game process is up.
+        // The old "plugin=disconnected" line told an admin nothing about the world.
+        var heartbeatTimeout = TimeSpan.FromSeconds(Math.Max(1, _opts.PluginHeartbeatTimeoutSeconds));
+        var running = _state.HasFreshHeartbeat(heartbeatTimeout) || GameProcessProbe.IsAlive(_opts.GamePidFile);
+        var name = string.IsNullOrWhiteSpace(_opts.ServerName) ? $"Hearth - {_opts.InstanceId}" : _opts.ServerName.Trim();
+        return FormatStatus(name, running, _state.EffectivePlayerCount, _opts.MaxPlayers, HearthVersionInfo.HearthVersion);
     }
 
-    private string BuildPlayers()
+    private string BuildPlayers() =>
+        FormatPlayers(_state.Players, _opts.MaxPlayers, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+    internal static string FormatStatus(string serverName, bool worldRunning, int players, int maxPlayers, string version) =>
+        $"{serverName}: world {(worldRunning ? "running" : "not running")}, {players} of {maxPlayers} players, Hearth {version}";
+
+    // One line per player: name and time on the server. The reply used to be a count with a
+    // builder's note.
+    internal static string FormatPlayers(IReadOnlyList<PlayerSnapshot> players, int maxPlayers, long nowUnixMs)
     {
-        var n = _state.EffectivePlayerCount;
-        return n == 0 ? "no players online" : $"{n} player(s) online (per-player names land in Phase 2)";
+        if (players.Count == 0)
+            return "no players online";
+        var lines = players.Select(p =>
+        {
+            var name = string.IsNullOrEmpty(p.DisplayName) ? p.HearthUserId : p.DisplayName;
+            return $"{name}  {FormatOnlineFor(nowUnixMs - p.ConnectedAtUnixMs)}";
+        });
+        return $"{players.Count} of {maxPlayers} players online\n" + string.Join("\n", lines);
+    }
+
+    private static string FormatOnlineFor(long ms)
+    {
+        var minutes = Math.Max(0, ms) / 60_000;
+        if (minutes < 1) return "just joined";
+        if (minutes < 60) return $"{minutes}m";
+        return $"{minutes / 60}h {minutes % 60:00}m";
     }
 }
