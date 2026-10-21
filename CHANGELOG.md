@@ -4,6 +4,10 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.96] - 2026-10-21
+
+Version-lockstep release for the Hearth app 0.1.96 (its Console tab shows the Host, Port, Admin password and Connect bar again). The server is the same as 0.1.95.
+
 ## [0.1.95] - 2026-10-21
 
 Hardening of the admin HTTP routes. A signed request with a body over 64 KB, such as a world upload, now sends its SHA-256 in `X-Hearth-Content-Sha256`, and without it the server answers that the Hearth app needs updating (Hearth app 0.1.95 sends it). Public reads (health, players, manifest) have their own request slots, separate from the signed routes, and only one world upload runs at a time. `GET /api/v1/chat/recent` and `GET /api/v1/chat/motd` now need the admin signature, and the unused `POST /api/v1/chat/player` is removed; admin messages still go out through RCON `say` and `announce`. Also: RCON `players` lists each player's name and time on the server, and `status` says whether the world is running.
