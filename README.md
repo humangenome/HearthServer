@@ -24,9 +24,9 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 - Applies the game's 21 gameplay settings (raids, spoilage, damage, village needs and the rest) from a text file through the game's own setters, because the in-game menu cannot save them on a dedicated host
 - Writes each player's map exploration into the world, which the game only does on a machine that renders, and keeps Travel Signs linked
 - Build-locked crash guards for the current Bellwright build (quest rewards, map icons, harvesting, roads, the build menu), applied at launch and checked byte for byte
-- Source RCON with `say`, `announce`, `motd`, player list and world snapshots; snapshot download and restore over a signed HTTP API
+- Source RCON for the server status, the player list, a save on request and world snapshots; snapshot download and restore over a signed HTTP API
 - Answers Source server query, so server lists, monitors and bots see the name, map and player count
-- Bans, the restart schedule and an admin audit log, kept in SQLite across restarts
+- A list of world snapshots and an audit log of snapshot and restore actions, kept in SQLite across restarts
 - A supervisor that relaunches the game if it crashes, and `-Stop` / `-Restart` switches that ask the game to save first
 
 ## What it does not do
@@ -94,7 +94,7 @@ Tagged releases (`vX.Y.Z`) build, test and attach both archives through GitHub A
 src/server/HearthServer              the supervisor (entry point)
 src/server/Hearth.SourceQuery        A2S responder
 src/server/Hearth.Rcon               Source RCON server
-src/server/Hearth.Persistence        SQLite store (bans, schedule, audit)
+src/server/Hearth.Persistence        SQLite store (snapshot list, audit log)
 src/shared/Hearth.Protocol           wire types shared with the player app
 src/shared/Hearth.Abstractions       shared interfaces
 src/native/Hearth.GameplaySettings   server-side gameplay settings (C++)
