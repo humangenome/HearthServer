@@ -19,7 +19,7 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 
 - Runs Bellwright with no GPU, no screen and no Steam login, and takes direct connections on a UDP port
 - A fourth player place: the game counts its own host as one of its four places and sends world data to only three joiners; the host package frees the hidden host's place and sends a fourth player that data
-- Ties each character to the player's Steam account, not to the name typed in the app, and leaves a player who drops to the game's own rejoin handling instead of freezing their character
+- Ties each character to the computer the player joins from, not to the name typed in the app, and leaves a player who drops to the game's own rejoin handling instead of freezing their character
 - Protects the world on disk: every autosave is checked, a player record the game drops while that player is offline is put back, a save rotation that slides back to a starter world is repaired before launch, and a save left as zeros by a power loss is replaced by the newest intact copy
 - Applies the game's 21 gameplay settings (raids, spoilage, damage, village needs and the rest) from a text file through the game's own setters, because the in-game menu cannot save them on a dedicated host
 - Writes each player's map exploration into the world, which the game only does on a machine that renders, and keeps Travel Signs linked
