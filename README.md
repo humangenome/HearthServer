@@ -76,7 +76,7 @@ Several servers on one machine: give each its own package folder and gameplay po
 
 ## Build
 
-Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0). `HearthSaveGuard.exe` is written in Rust, so the full release payload also needs a [Rust toolchain](https://rustup.rs/). The native host helpers (`HearthGameplaySettings.dll`, `HearthFogReveal.dll`, `HearthFourthSeat.dll`) are C++ built with MinGW-w64 through CMake; the prebuilt DLLs are tracked under `dist/ue4ss-server` and the sources under `src/native`.
+Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0). `HearthSaveGuard.exe` is written in Rust, so the full release payload also needs a [Rust toolchain](https://rustup.rs/). The native host helpers (`HearthGameplaySettings.dll`, `HearthFogReveal.dll`, `HearthFourthSeat.dll`) are C++ built with MinGW-w64 through CMake; the prebuilt DLLs are tracked under `dist/ue4ss-server` and the sources under `src/native`.
 
 ```bash
 dotnet restore HearthServer.sln
