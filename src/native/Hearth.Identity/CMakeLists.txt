@@ -9,6 +9,7 @@ if(WIN32)
   add_library(HearthIdentity SHARED
     src/IdentityPlugin.cpp
     src/IdentityCore.cpp
+    src/JoinGateCore.cpp
   )
   target_compile_definitions(HearthIdentity PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
   if(MSVC)
@@ -28,9 +29,12 @@ if(WIN32)
   )
 endif()
 
-# the decision core also builds and runs on Linux (Checks): tests/identity_core_test.cpp
+# the decision cores also build and run on Linux (Checks): tests/identity_core_test.cpp, tests/join_gate_test.cpp
 if(NOT WIN32)
   add_executable(identity_core_test tests/identity_core_test.cpp src/IdentityCore.cpp)
   target_include_directories(identity_core_test PRIVATE src)
   target_compile_options(identity_core_test PRIVATE -Wall -Wextra -Werror -O1)
+  add_executable(join_gate_test tests/join_gate_test.cpp src/JoinGateCore.cpp src/IdentityCore.cpp)
+  target_include_directories(join_gate_test PRIVATE src)
+  target_compile_options(join_gate_test PRIVATE -Wall -Wextra -Werror -O1)
 endif()

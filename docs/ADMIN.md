@@ -23,6 +23,7 @@ The `Hearth` block carries the per-instance config. At minimum set:
 - `GameplayPort` and the query, RCON and HTTP ports (see ports below)
 - `RconPassword`: required for RCON and the admin API
 - `ServerName`: shown in server query and server lists
+- `JoinPassword`: optional. Empty means anyone with the address can join. When set, Hearth asks each player for it and the server refuses a join without it before the player gets a character. Takes effect at the next start.
 - `MaxPlayers`: up to 4, the game's own limit
 - `AdminSteamIds`: Steam64 IDs that get the game's host flag in the world, the one Bellwright normally gives the player who hosts. The player must also prove the admin password: they add the server through its admin link or save the matching RCON password in Hearth. A Steam64 alone never grants it; HearthServer checks a one-use ticket from the app against the connection Bellwright accepted before the host sets the flag.
 
@@ -60,7 +61,7 @@ HearthServer exposes Source RCON on the RCON port:
 
 How a server finds a player's character, and how it follows their Steam account from v0.1.97, is in the Hearth repository's [docs/WORLDS.md](https://github.com/HumanGenome/Hearth/blob/main/docs/WORLDS.md). The name field in the app is a display name, not a character picker.
 
-Importing another server's world brings the world with it: buildings, settlements, map progress. The characters inside it stay bound to their original Steam64 IDs, so a new player joins that world as a new character.
+Importing another server's world brings the world with it: buildings, settlements, map progress. Their characters come with it, and you join as a new character in that world. Each of their players gets their character back by making their first join from the PC they played on before.
 
 To move a world, take a snapshot on the source (`save snapshot`), download it (`GET /api/v1/snapshots/<id>/download`), and swap it in on the destination with `POST /api/v1/snapshots/import-restore`. Do not copy save files in directly: restore clears the world-protection baseline and offline-player ledger as part of the swap, and a direct file copy leaves the previous baseline in place, so protection can read the import as a regression and roll it back.
 

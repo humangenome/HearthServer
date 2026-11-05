@@ -78,6 +78,8 @@ public static class Program
             builder.Services.AddHostedService(sp => sp.GetRequiredService<ChatService>());
             builder.Services.AddHostedService<NamedPipeServerService>();
             builder.Services.AddHostedService<HeartbeatWatchdogService>();
+            // Join password file for the bw_ident host mod; written before the query starts advertising the flag.
+            builder.Services.AddHostedService<JoinGateFileService>();
             builder.Services.AddHostedService<SourceQueryHostedService>();
             builder.Services.AddHostedService<RconHostedService>();
             builder.Services.AddHostedService<HearthProcessSupervisorService>();

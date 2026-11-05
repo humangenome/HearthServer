@@ -17,6 +17,17 @@
 // <root>\HearthServer\data\identity\steam-map.tsv ("steam64<TAB>first computer id" lines). Log: <Logs>\bw_identity.log,
 // never the token. Build-locked to Bellwright 24840601 (SizeOfImage plus the prologue of every function it calls or
 // hooks); on any other build it installs nothing and says so.
+//
+// Join password (2026-11-02, Hearth:JoinPassword): the same hook also refuses a join that does not carry the
+// server's password. HearthServer writes <root>\HearthServer\data\join-gate.txt on every start ("open", or "v1 " and
+// the salted SHA-256 of the owner's password; JoinGateCore.hpp); the Hearth app already sends the player's saved or typed
+// password as ?HearthKey=. A refused join gets the game's own refusal path: ErrorMessage is set through the game's own
+// FString::operator=(const TCHAR*), the very call AMistOasisGameMode::PreLogin makes for "MistSessionFull", so the text
+// lives in the game's own memory and the engine frees it as usual. This module never writes an FString's buffer or
+// fields itself: the engine frees ErrorMessage with its own allocator, so a refusal text from any other heap would crash
+// the whole game on the first wrong password. The game then sends the failure to the player and logs "PreLogin failure"; nothing is keyed,
+// so a refused player gets no character record. A refused join is not given an identity swap and does not use up its
+// identity token.
 #include <windows.h>
 
 #include <cstdarg>
@@ -29,6 +40,7 @@
 #include <string>
 
 #include "IdentityCore.hpp"
+#include "JoinGateCore.hpp"
 
 namespace
 {
@@ -39,6 +51,7 @@ constexpr std::uintptr_t kExpectedImageSize = 0x0ce02000;
 constexpr std::uintptr_t kRvaPreLogin = 0x064A6F60;           // AMistOasisGameMode::PreLogin (hooked)
 constexpr std::uintptr_t kRvaUniqueIdFromString = 0x03F54A30; // FUniqueNetIdRepl::UniqueIdFromString(FName, const FString&)
 constexpr std::uintptr_t kRvaFNameCtor = 0x013BB710;          // FName::FName(const TCHAR*, EFindName)
+constexpr std::uintptr_t kRvaFStringAssign = 0x0120CF80;      // FString::operator=(const TCHAR*), the game's own refusal write
 
 constexpr unsigned char kPreLoginPrologue[16] = {
     0x40, 0x53,                   // push rbx
@@ -50,6 +63,17 @@ constexpr unsigned char kPreLoginPrologue[16] = {
 };
 constexpr unsigned char kUniqueIdFromStringPrologue[10] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x20};
 constexpr unsigned char kFNameCtorPrologue[10] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x30};
+constexpr unsigned char kFStringAssignPrologue[15] = {
+    0x48, 0x89, 0x5C, 0x24, 0x18, // mov [rsp+18h], rbx
+    0x48, 0x89, 0x74, 0x24, 0x20, // mov [rsp+20h], rsi
+    0x57,                         // push rdi
+    0x48, 0x83, 0xEC, 0x30,       // sub rsp, 30h
+};
+
+// What a refused join is told. The Bellwright client shows its own generic "could not join" message for any text it
+// does not know (UMistGameClientSubsystem::GetErrorMessage maps only its MistSession* keys), so this reaches the server's
+// game log ("PreLogin failure: ...") and nothing on the player's screen.
+constexpr wchar_t kRefusalText[] = L"HearthJoinPasswordRefused";
 
 // UE5 FString = TArray<TCHAR>: data pointer, count including the terminating zero, capacity.
 struct FStringRaw
@@ -63,22 +87,30 @@ using PreLoginFn = void (*)(void* self, const FStringRaw* options, const FString
     FStringRaw* errorMessage);
 using UniqueIdFromStringFn = void (*)(void* repl, std::uint64_t typeName, const FStringRaw* contents);
 using FNameCtorFn = void* (*)(void* name, const wchar_t* text, int findType);
+using FStringAssignFn = FStringRaw* (*)(FStringRaw* self, const wchar_t* text);
 
 std::uintptr_t g_base = 0;
 PreLoginFn g_originalPreLogin = nullptr;
 UniqueIdFromStringFn g_uniqueIdFromString = nullptr;
 FNameCtorFn g_fnameCtor = nullptr;
+FStringAssignFn g_fstringAssign = nullptr;
 bool g_installTried = false;
 bool g_installed = false;
 std::wstring g_logPath;
 std::wstring g_keyPath;
 std::wstring g_mapPath;
+std::wstring g_gatePath;
 std::string g_key;
 std::map<std::string, std::string> g_map;
 FILETIME g_keyTime{};
 FILETIME g_mapTime{};
 std::set<std::string> g_usedNonces;
 unsigned long long g_joins = 0, g_swaps = 0;
+hearth::joingate::Config g_gate;          // Open until HearthServer's file says otherwise
+FILETIME g_gateTime{};
+bool g_gateFileSeen = false;
+hearth::joingate::Limiter g_gateLimiter;
+unsigned long long g_gateAllowed = 0, g_gateRefused = 0;
 
 std::wstring EnvOr(const wchar_t* name, const std::wstring& fallback)
 {
@@ -108,6 +140,7 @@ void ResolvePaths()
     const std::wstring root = ParentDir(logs);
     g_keyPath = root + L"\\HearthServer\\data\\identity\\token.key";
     g_mapPath = root + L"\\HearthServer\\data\\identity\\steam-map.tsv";
+    g_gatePath = root + L"\\HearthServer\\data\\join-gate.txt";
 }
 
 void Log(const char* format, ...)
@@ -211,6 +244,61 @@ void RefreshServerFiles()
     }
 }
 
+const char* GateModeName(hearth::joingate::Mode mode)
+{
+    switch (mode)
+    {
+    case hearth::joingate::Mode::Open: return "open (no password)";
+    case hearth::joingate::Mode::Locked: return "ON (password required)";
+    default: return "file unreadable (every join refused)";
+    }
+}
+
+// HearthServer's join-gate.txt. No file = an older HearthServer or a self-host without one: open, as before. A file that
+// cannot be read right now (being replaced) keeps the last state; a file that reads but makes no sense refuses every join.
+void RefreshGate()
+{
+    WIN32_FILE_ATTRIBUTE_DATA attr{};
+    if (g_gatePath.empty()) return;
+    if (!GetFileAttributesExW(g_gatePath.c_str(), GetFileExInfoStandard, &attr))
+    {
+        const DWORD err = GetLastError();
+        if ((err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) && g_gateFileSeen)
+        {
+            g_gateFileSeen = false;
+            g_gateTime = FILETIME{};
+            g_gate = hearth::joingate::Config{};
+            Log("join gate: file gone, open (no password)");
+        }
+        return;
+    }
+    std::string text;
+    bool changed = false;
+    if (!ReadSmallFile(g_gatePath, text, g_gateTime, changed) || !changed) return;
+    const auto before = g_gate.mode;
+    g_gate = hearth::joingate::ParseGateFile(text);
+    if (!g_gateFileSeen || before != g_gate.mode) Log("join gate: %s", GateModeName(g_gate.mode));
+    g_gateFileSeen = true;
+}
+
+bool IsEmptyFString(const FStringRaw* s)
+{
+    if (!s || !IsReadable(s, sizeof(*s))) return true;
+    if (!s->data || s->num <= 1) return true;
+    return !IsReadable(s->data, sizeof(wchar_t)) || s->data[0] == 0;
+}
+
+// The masked address for the log: "203.0.113.x".
+std::string MaskAddress(const std::string& address)
+{
+    const std::string key = hearth::joingate::AddressKey(address);
+    const auto dot = key.find_last_of('.');
+    if (dot != std::string::npos && key.find(':') == std::string::npos) return key.substr(0, dot) + ".x";
+    const auto colon = key.find_last_of(':');
+    if (colon != std::string::npos) return key.substr(0, colon) + ":x";
+    return "?";
+}
+
 std::string Narrow(const FStringRaw* s)
 {
     if (!s || !s->data || s->num <= 0 || s->num > 8192 || !IsReadable(s->data, static_cast<std::size_t>(s->num) * 2)) return "";
@@ -234,38 +322,64 @@ std::string Short(const std::string& id)
 // ---- the hook ------------------------------------------------------------------------------------------------------
 void HookPreLogin(void* self, const FStringRaw* options, const FStringRaw* address, void* uniqueId, FStringRaw* errorMessage)
 {
+    bool refuse = false;
     try
     {
         ++g_joins;
         RefreshServerFiles();
+        RefreshGate();
         const std::string opts = Narrow(options);
-        const auto d = hearth::identity::Decide(opts, g_key, g_map, static_cast<std::int64_t>(std::time(nullptr)), g_usedNonces);
-        if (!d.nonce.empty()) g_usedNonces.insert(d.nonce);
         const std::string steam = hearth::identity::OptionValue(opts, "PlayerId");
         const std::string steamTail = steam.size() > 4 ? steam.substr(steam.size() - 4) : steam;
-        if (d.swap && uniqueId && g_uniqueIdFromString && g_fnameCtor)
+
+        // 1. the join password, before anything else looks at the join
+        const std::string from = Narrow(address);
+        const auto gate = hearth::joingate::Check(g_gate, opts, from, static_cast<std::int64_t>(std::time(nullptr)), g_gateLimiter);
+        if (!gate.allow)
         {
-            std::wstring wide(d.to.begin(), d.to.end());
-            FStringRaw contents{wide.data(), static_cast<std::int32_t>(wide.size() + 1), static_cast<std::int32_t>(wide.size() + 1)};
-            alignas(8) unsigned char nameBuf[16] = {};
-            g_fnameCtor(nameBuf, L"NULL", 1 /* FNAME_Add */);
-            std::uint64_t nameBits = 0;
-            std::memcpy(&nameBits, nameBuf, sizeof(nameBits));
-            g_uniqueIdFromString(uniqueId, nameBits, &contents);
-            ++g_swaps;
-            Log("join steam ...%s from %s: %s -> %s", steamTail.c_str(), Short(hearth::identity::OptionValue(opts, "Name")).c_str(),
-                d.reason.c_str(), Short(d.to).c_str());
+            refuse = true;
+            ++g_gateRefused;
+            Log("join steam ...%s from %s: %s", steamTail.c_str(), MaskAddress(from).c_str(), gate.reason.c_str());
         }
         else
         {
-            Log("join steam ...%s: %s", steamTail.c_str(), d.reason.c_str());
+            if (g_gate.mode == hearth::joingate::Mode::Locked) ++g_gateAllowed;
+
+            // 2. the character follows the Steam account (only for a join that may come in)
+            const auto d = hearth::identity::Decide(opts, g_key, g_map, static_cast<std::int64_t>(std::time(nullptr)), g_usedNonces);
+            if (!d.nonce.empty()) g_usedNonces.insert(d.nonce);
+            const char* pw = g_gate.mode == hearth::joingate::Mode::Locked ? "password OK; " : "";
+            if (d.swap && uniqueId && g_uniqueIdFromString && g_fnameCtor)
+            {
+                std::wstring wide(d.to.begin(), d.to.end());
+                FStringRaw contents{wide.data(), static_cast<std::int32_t>(wide.size() + 1), static_cast<std::int32_t>(wide.size() + 1)};
+                alignas(8) unsigned char nameBuf[16] = {};
+                g_fnameCtor(nameBuf, L"NULL", 1 /* FNAME_Add */);
+                std::uint64_t nameBits = 0;
+                std::memcpy(&nameBits, nameBuf, sizeof(nameBits));
+                g_uniqueIdFromString(uniqueId, nameBits, &contents);
+                ++g_swaps;
+                Log("join steam ...%s from %s: %s%s -> %s", steamTail.c_str(), Short(hearth::identity::OptionValue(opts, "Name")).c_str(),
+                    pw, d.reason.c_str(), Short(d.to).c_str());
+            }
+            else
+            {
+                Log("join steam ...%s: %s%s", steamTail.c_str(), pw, d.reason.c_str());
+            }
         }
     }
     catch (...)
     {
-        Log("identity check failed inside the join (join goes on unchanged)");
+        // never fail open on a passworded server, never throw into the game
+        refuse = g_gate.mode != hearth::joingate::Mode::Open;
+        Log("join check failed inside the join (%s)", refuse ? "refused: a password is set" : "join goes on unchanged");
     }
+
+    // The refusal goes in BEFORE the game's own checks, so the game's listeners see it. The game only ever assigns
+    // ErrorMessage with the same operator= (MistSessionLoading / Banned / Full), which frees ours through its allocator.
+    if (refuse && errorMessage && g_fstringAssign) g_fstringAssign(errorMessage, kRefusalText);
     g_originalPreLogin(self, options, address, uniqueId, errorMessage);
+    if (refuse && errorMessage && g_fstringAssign && IsEmptyFString(errorMessage)) g_fstringAssign(errorMessage, kRefusalText);
 }
 
 void Install()
@@ -274,18 +388,20 @@ void Install()
     ResolvePaths();
     if (!ReadModuleBase())
     {
-        Log("install refused: not Bellwright build 24840601 (module or SizeOfImage differs)");
+        Log("install refused: not Bellwright build 24840601 (module or SizeOfImage differs; join password NOT enforced)");
         return;
     }
     if (!PrologueMatches(kRvaPreLogin, kPreLoginPrologue, sizeof(kPreLoginPrologue)) ||
         !PrologueMatches(kRvaUniqueIdFromString, kUniqueIdFromStringPrologue, sizeof(kUniqueIdFromStringPrologue)) ||
-        !PrologueMatches(kRvaFNameCtor, kFNameCtorPrologue, sizeof(kFNameCtorPrologue)))
+        !PrologueMatches(kRvaFNameCtor, kFNameCtorPrologue, sizeof(kFNameCtorPrologue)) ||
+        !PrologueMatches(kRvaFStringAssign, kFStringAssignPrologue, sizeof(kFStringAssignPrologue)))
     {
-        Log("install refused: a prologue does not match build 24840601");
+        Log("install refused: a prologue does not match build 24840601 (no identity swap, join password NOT enforced)");
         return;
     }
     g_uniqueIdFromString = reinterpret_cast<UniqueIdFromStringFn>(g_base + kRvaUniqueIdFromString);
     g_fnameCtor = reinterpret_cast<FNameCtorFn>(g_base + kRvaFNameCtor);
+    g_fstringAssign = reinterpret_cast<FStringAssignFn>(g_base + kRvaFStringAssign);
     auto* target = reinterpret_cast<unsigned char*>(g_base + kRvaPreLogin);
     auto* trampoline = static_cast<unsigned char*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline)
@@ -313,8 +429,9 @@ void Install()
     FlushInstructionCache(GetCurrentProcess(), target, sizeof(kPreLoginPrologue));
     g_installed = true;
     RefreshServerFiles();
-    Log("installed: PreLogin hooked; token key %s; steam map %u players", g_key.empty() ? "MISSING (no swaps)" : "loaded",
-        static_cast<unsigned>(g_map.size()));
+    RefreshGate();
+    Log("installed: PreLogin hooked; token key %s; steam map %u players; join gate %s", g_key.empty() ? "MISSING (no swaps)" : "loaded",
+        static_cast<unsigned>(g_map.size()), GateModeName(g_gate.mode));
 }
 } // namespace
 
@@ -328,8 +445,10 @@ extern "C" __declspec(dllexport) int HearthIdentity_Service(void*)
     if (g_installed && now - lastStatus >= 600000)
     {
         lastStatus = now;
-        Log("status: joins=%llu swaps=%llu map=%u key=%s", g_joins, g_swaps, static_cast<unsigned>(g_map.size()),
-            g_key.empty() ? "missing" : "ok");
+        RefreshGate();
+        Log("status: joins=%llu swaps=%llu map=%u key=%s gate=%s allowed=%llu refused=%llu", g_joins, g_swaps,
+            static_cast<unsigned>(g_map.size()), g_key.empty() ? "missing" : "ok", GateModeName(g_gate.mode), g_gateAllowed,
+            g_gateRefused);
     }
     return 0;
 }

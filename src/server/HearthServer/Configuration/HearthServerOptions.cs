@@ -49,20 +49,24 @@ public sealed class HearthServerOptions
     /// the native path (the ?Password= option in the launch URL is dropped by
     /// the game's internal map travel, the native check sees a mismatch, and
     /// the process self-terminates with "appError: Couldn't spawn player").
-    /// Password enforcement routes through HearthAuth.lua only (see
-    /// <see cref="HearthAuthPassword"/>). Lua, A2S, and native (HearthPlugin.cpp)
-    /// all ignore this field. Field is kept for binary appsettings.json
-    /// compatibility only; do NOT set it.
+    /// The join password is <see cref="JoinPassword"/>; A2S and the host mods
+    /// ignore this field. Kept for appsettings.json compatibility only; do NOT
+    /// set it.
     /// </summary>
     public string ServerPassword { get; set; } = "";
 
     /// <summary>
-    /// Password enforced by HearthAuth.lua's K2_PostLogin hook for
-    /// incoming remote clients. Written by the panel into appsettings.json.
-    /// Empty string means open server (no password gate). The listen-server
-    /// host is positively detected and exempt from the gate. Used by
-    /// SourceQueryHostedService for the A2S PasswordRequired flag so the
-    /// Steam server browser correctly advertises passworded instances.
+    /// The join password (2026-11-02). Empty = open server. When set, a player gets in only if their Hearth app sends
+    /// it with the join (the app asks for it when the server query says the server is passworded). HearthServer writes
+    /// its salted hash to data/join-gate.txt on every start (JoinGateFileService); the bw_ident host mod refuses a join
+    /// without it inside the game's own login check, before the player gets a character. Spaces around it are ignored.
+    /// Also sets the A2S "password required" flag. Takes effect at the next start.
+    /// </summary>
+    public string JoinPassword { get; set; } = "";
+
+    /// <summary>
+    /// LEGACY name for <see cref="JoinPassword"/>, read only when JoinPassword is empty (an older config that set it
+    /// keeps its password). Nothing else reads it: the HearthAuth.lua gate it was meant for was never built.
     /// </summary>
     public string HearthAuthPassword { get; set; } = "";
 

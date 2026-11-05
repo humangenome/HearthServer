@@ -11,13 +11,13 @@ namespace HearthServer.Services;
 /// <see cref="HearthServerOptions.PluginHeartbeatTimeoutSeconds"/>, log a warning;
 /// future work hooks process supervision into this to restart the Bellwright instance.
 ///
-/// Password enforcement model:
-///   Password enforcement lives in HearthAuth.lua's K2_PostLogin hook on
-///   incoming remote clients. The native Hearth.dll ApproveLogin hook is
-///   INTENTIONALLY disabled (see HearthProcessSupervisorService.EmitPluginConfig
-///   for the Bellwright crash-loop rationale). EmitPluginConfig always emits an
-///   empty ServerPassword to plugin-config.json, so the native gate has
-///   nothing to enforce.
+/// Password enforcement model (2026-11-02):
+///   The join password (Hearth:JoinPassword) is enforced by the bw_ident host
+///   mod inside the game's own login check, from data/join-gate.txt (see
+///   JoinGateFileService); this watchdog never stops the game over it. The
+///   native Hearth.dll ApproveLogin path stays disabled (see
+///   HearthProcessSupervisorService.EmitPluginConfig): EmitPluginConfig always
+///   emits an empty ServerPassword to plugin-config.json.
 ///
 ///   The legacy <see cref="CheckServerPasswordReady"/> path is kept as a
 ///   defensive bug-detector: if the plugin EVER reports
@@ -71,7 +71,6 @@ public sealed class HeartbeatWatchdogService : BackgroundService
             {
                 CheckHeartbeatStale();
                 CheckServerPasswordReady();
-                CheckHearthAuthLuaReady();
             }
             catch (Exception ex)
             {
@@ -80,194 +79,12 @@ public sealed class HeartbeatWatchdogService : BackgroundService
         }
     }
 
-    private static readonly TimeSpan LuaStatusBootstrapGrace = TimeSpan.FromSeconds(45);
-    // Wider grace for the no-connection-at-all case: covers the cold-
-    // start window where the game process is launching but Hearth.dll hasn't
-    // connected the pipe yet. Bellwright cold launches can take 30-60s on a
-    // panel-managed Win Server box. After this window without a pipe,
-    // HearthServer concludes UE4SS / HearthLoader / Hearth.dll never
-    // loaded successfully and fail-closes.
-    private static readonly TimeSpan NoConnectionFailClosedGrace = TimeSpan.FromSeconds(180);
-    private DateTimeOffset _lastLuaFailClosedWarnAt = DateTimeOffset.MinValue;
-    private readonly DateTimeOffset _serverStartedAt = DateTimeOffset.UtcNow;
-
-    // The "no-connection-window-started-at" anchor. Reset whenever we observe
-    // a live connection. Without this reset, a long-lived HearthServer that
-    // briefly loses its pipe (e.g. game process crash + relaunch driven by
-    // HearthServer's own supervisor, or by the panel's PowerShell) would
-    // skip the cold-start grace on the relaunch and fail-closed immediately
-    // even though the new game process needs its own 30-60s cold launch.
-    // Initialized to _serverStartedAt so the very first game launch gets the
-    // full grace window from HearthServer process startup.
-    private DateTimeOffset _noConnSince = DateTimeOffset.UtcNow;
-
-    private void CheckHearthAuthLuaReady()
-    {
-        // Fail-closed for the Lua-only password-enforcement model.
-        // If HearthAuthPassword is configured but the Lua gate isn't
-        // reporting ready, kill the game to prevent the server from
-        // running open without a gate. HearthAuth.lua writes
-        // HearthServer/.hearth-auth-status with key=value pairs:
-        //   ready=0|1
-        //   passwordConfigured=0|1
-        //   updated=<unix>
-        //   reason=<short string>
-        //
-        // Fail-closed paths:
-        //   1. No pipe connection at all (UE4SS never loaded, HearthLoader
-        //      failed, Hearth.dll never connected) past NoConnectionFailClosedGrace
-        //      since HearthServer process start. Use path-scoped KillGame
-        //      (only effective on standalone — panel deploys log loudly).
-        //   2. Pipe connection exists but HearthAuth status is not ready
-        //      past LuaStatusBootstrapGrace since handshake. Use BOTH
-        //      path-scoped KillGame AND PluginPid-based kill.
-        if (string.IsNullOrEmpty(_opts.HearthAuthPassword)) return;
-
-        var conn = _state.Connection;
-        if (conn is not null)
-        {
-            // Live connection observed. Reset the no-connection anchor so
-            // that any FUTURE drop gets a fresh 180s grace window. This is
-            // the fix for the case where the anchor was the DI construction
-            // time, which meant a long-running HearthServer would skip grace
-            // on a later game restart and immediately fail-closed during the
-            // new game's legitimate cold-launch window.
-            _noConnSince = DateTimeOffset.UtcNow;
-        }
-        if (conn is null)
-        {
-            // Grace window since we last had a connection (or since
-            // HearthServer process startup if we've never had one).
-            var sinceConnLost = DateTimeOffset.UtcNow - _noConnSince;
-            if (sinceConnLost < NoConnectionFailClosedGrace) return;
-
-            var noConnNow = DateTimeOffset.UtcNow;
-            var noConnSinceWarn = noConnNow - _lastLuaFailClosedWarnAt;
-            if (noConnSinceWarn > TimeSpan.FromSeconds(15))
-            {
-                _log.LogCritical(
-                    "FAIL-CLOSED: HearthAuthPassword is configured but Hearth.dll has NEVER connected to HearthServer's IPC " +
-                    "pipe past {Grace}s grace. UE4SS / HearthLoader / Hearth.dll likely did not load. Without the plugin and " +
-                    "the Lua gate, the passworded server cannot enforce its password. Stopping Bellwright (path-scoped only — " +
-                    "panel-managed deploys with empty GameInstallRoot will see this log but require panel-side recovery, " +
-                    "PluginPid path is unavailable without a connection). " +
-                    "Diagnose: check Bellwright.log / UE4SS.log for UE4SS bootstrap, HearthAuth.log absent, HearthServerRuntime.log absent.",
-                    NoConnectionFailClosedGrace.TotalSeconds);
-                _lastLuaFailClosedWarnAt = noConnNow;
-            }
-            try
-            {
-                _coordinator.KillGame(TimeSpan.FromSeconds(10));
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "FAIL-CLOSED (no-conn): KillGame threw");
-            }
-            return;
-        }
-        var sinceConnect = DateTimeOffset.UtcNow - conn.ConnectedAt;
-        if (sinceConnect < LuaStatusBootstrapGrace) return;
-
-        // Status file lives next to appsettings.json, which sits in
-        // HearthServer's working dir. We can derive it from the
-        // running process. On panel deploys the panel starts
-        // HearthServer.exe with `-WorkingDirectory $hearthDir` so the
-        // exe directory IS the appsettings directory. On standalone
-        // self-hosts the assumption may not hold; ContentRootPath
-        // would be more correct in the future, but adding a host
-        // dependency here is more risk than it's worth right now.
-        string statusPath;
-        try
-        {
-            var baseDir = AppContext.BaseDirectory;
-            statusPath = Path.Combine(baseDir, ".hearth-auth-status");
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "HearthAuth status path resolve failed");
-            return;
-        }
-
-        var (ready, passwordConfigured, reason, exists) = ReadLuaStatus(statusPath);
-        // Stale-file protection: HearthServerRuntime/main.lua atomically
-        // overwrites .hearth-auth-status with ready=0,reason=runtime_init
-        // BEFORE HearthAuth runs, on every game process start (see the
-        // write_not_ready_at pass at the top of that script). If runtime
-        // can't overwrite (file lock + all retries fail), it calls
-        // error(...) to abort HearthServerRuntime entirely — HearthLoader
-        // and HearthAuth never load, Hearth.dll never injects, no pipe
-        // handshake happens, and the no-connection fail-closed path in
-        // CheckHearthAuthLuaReady (above) takes the game down via pid-file.
-        // So any .hearth-auth-status the watchdog reads here with
-        // ready=1 + passwordConfigured=1 was written by THIS game
-        // process's HearthAuth.lua post-handshake; no file mtime
-        // freshness check needed.
-        if (exists && passwordConfigured && ready) return;
-
-        var now = DateTimeOffset.UtcNow;
-        var sinceWarn = now - _lastLuaFailClosedWarnAt;
-        if (sinceWarn > TimeSpan.FromSeconds(15))
-        {
-            _log.LogCritical(
-                "FAIL-CLOSED: HearthAuthPassword is configured but HearthAuth.lua status is not ready " +
-                "(exists={Exists} ready={Ready} passwordConfigured={PwConfigured} reason='{Reason}' path={Path}). " +
-                "Stopping Bellwright to prevent the passworded server from running open without the Lua password gate. " +
-                "Investigate UE4SS load failure / HearthAuth.lua install / mods.txt ordering; the supervisor will " +
-                "relaunch the game on the next loop.",
-                exists, ready, passwordConfigured, reason, statusPath);
-            _lastLuaFailClosedWarnAt = now;
-        }
-
-        try
-        {
-            // Path-scoped KillGame is best-effort on panel-managed deploys
-            // (GameInstallRoot is empty), so also try the PID-based kill
-            // path via the active pipe connection. PluginPid is the game
-            // process that loaded Hearth.dll (Hearth.dll calls
-            // GetCurrentProcessId in its handshake), so if we have an
-            // active pipe handshake, we know the exact PID to kill.
-            _coordinator.KillGame(TimeSpan.FromSeconds(10));
-            TryKillByPluginPid(conn.PluginPid);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "FAIL-CLOSED (Lua): KillGame / KillByPluginPid threw");
-        }
-    }
-
-    private (bool ready, bool passwordConfigured, string reason, bool exists) ReadLuaStatus(string path)
-    {
-        try
-        {
-            if (!File.Exists(path))
-            {
-                return (false, false, "file_missing", false);
-            }
-            var lines = File.ReadAllLines(path);
-            bool ready = false;
-            bool passwordConfigured = false;
-            string reason = "";
-            foreach (var line in lines)
-            {
-                var eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                var key = line.Substring(0, eq).Trim();
-                var value = line.Substring(eq + 1).Trim();
-                switch (key)
-                {
-                    case "ready": ready = value == "1"; break;
-                    case "passwordConfigured": passwordConfigured = value == "1"; break;
-                    case "reason": reason = value; break;
-                }
-            }
-            return (ready, passwordConfigured, reason, true);
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "HearthAuth status read failed: {Path}", path);
-            return (false, false, "read_error", false);
-        }
-    }
+    // The HearthAuth.lua fail-closed killer that stood here (CheckHearthAuthLuaReady) is gone (2026-11-02). It waited for
+    // a Lua gate and a Hearth.dll pipe connection that the Bellwright host never had, so with HearthAuthPassword set it
+    // would have stopped the game through the pid file about 3 minutes after every start (the panel never set it, which
+    // is why the Lock Password reached nothing). The join password is now
+    // enforced inside the game's own login check by the bw_ident host mod (HearthIdentity.dll) from
+    // data/join-gate.txt, which JoinGateFileService writes; a refusal there never stops the server.
 
     private static readonly string[] HearthKillProcessNameWhitelist = new[]
     {

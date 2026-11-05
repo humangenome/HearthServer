@@ -239,12 +239,10 @@ public sealed class HearthProcessSupervisorService : BackgroundService
         // option in the launch URL is dropped by the game's internal map
         // travel from the menu -> the play level, leaving the host's URL
         // with no password while the native check still expects one).
-        // Password enforcement now lives in HearthAuth.lua's K2_PostLogin
-        // hook, which gates remote clients only and exempts the listen host.
-        // Plugin sees no ServerPassword -> treats the server as open ->
-        // no native enforcement -> no crash loop. _opts.ServerPassword
-        // is the legacy field; _opts.HearthAuthPassword is what
-        // HearthAuth.lua reads from appsettings.json directly.
+        // The join password (_opts.JoinPassword) is enforced by the bw_ident
+        // host mod inside the game's own login check (JoinGateFileService
+        // writes its file), never through this native path. Plugin sees no
+        // ServerPassword -> no native enforcement -> no crash loop.
         var payload = new
         {
             InstanceId = _opts.InstanceId,

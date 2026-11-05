@@ -61,14 +61,9 @@ public sealed class SourceQueryHostedService : IHostedService, IAsyncDisposable
         SteamAppId: 1812450,                          // real Steam AppID — written as 64-bit GameID in EDF
         PlayerCount: _state.EffectivePlayerCount,
         MaxPlayers: _opts.MaxPlayers,
-        // Reflect the Lua-side HearthAuth gate's configured password.
-        // HearthAuthPassword is the field the panel populates and that
-        // HearthAuth.lua actually enforces. The legacy ServerPassword
-        // field is intentionally ignored here for consistency with
-        // HearthAuth.lua, which dropped the legacy fallback (reading
-        // ServerPassword would only matter for the native-enforcement
-        // crash path we're pivoting away from).
-        PasswordRequired: !string.IsNullOrEmpty(_opts.HearthAuthPassword),
+        // The join password the bw_ident host mod enforces (JoinPassword, or the legacy
+        // HearthAuthPassword). The Hearth app asks the player for it when this is set.
+        PasswordRequired: JoinGateFileService.PasswordRequired(_opts),
         VacSecured: false,
         Version: $"hearth-{HearthVersionInfo.HearthVersion}/bw-{HearthVersionInfo.HearthBuild}",
         GameplayPort: _opts.GameplayPort,
