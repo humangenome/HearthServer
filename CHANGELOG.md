@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.98] - 2026-11-05
+
+- Join password: set JoinPassword in HearthServer\appsettings.json and only players who enter it can join. Hearth asks each player for it when they connect; a player without it is turned away before the game makes a character for them. Takes effect at the next start.
+- HearthAuthPassword from the old sample settings now counts as JoinPassword. Before, setting it could stop the game a few minutes after start.
+
 ## [0.1.97] - 2026-11-05
 
 - Characters follow each player's Steam account, checked with Steam on every join.
