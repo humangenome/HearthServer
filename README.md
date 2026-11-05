@@ -13,17 +13,18 @@
 
 [Bellwright](https://store.steampowered.com/app/1812450/) has no dedicated server. Its multiplayer is co-op for up to four people, hosted from one player's copy of the game. HearthServer adds a Bellwright dedicated server: it runs the game headless on a Windows machine with a public IP and port, and players join it by address through the [Hearth app](https://github.com/HumanGenome/Hearth). This repo is for the person running the server; players only need the app.
 
-This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog`, `bw_seat4`), their native helpers, the signature packs and the launch script. The player app is closed source.
+This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog`, `bw_seat4`, `bw_pause`, `bw_ident`), their native helpers, the signature packs and the launch script. The player app is closed source.
 
 ## What it does
 
 - Runs Bellwright with no GPU, no screen and no Steam login, and takes direct connections on a UDP port
 - A fourth player place: the game counts its own host as one of its four places and sends world data to only three joiners; the host package frees the hidden host's place and sends a fourth player that data
-- Ties each character to the computer the player joins from, not to the name typed in the app, and leaves a player who drops to the game's own rejoin handling instead of freezing their character
+- Ties each character to the player's Steam account, checked with Steam on every join, so a player can change PCs and keep their character; leaves a player who drops to the game's own rejoin handling instead of freezing their character
 - Protects the world on disk: every autosave is checked, a player record the game drops while that player is offline is put back, a save rotation that slides back to a starter world is repaired before launch, and a save left as zeros by a power loss is replaced by the newest intact copy
 - Applies the game's 21 gameplay settings (raids, spoilage, damage, village needs and the rest) from a text file through the game's own setters, because the in-game menu cannot save them on a dedicated host
+- Pauses the world while nobody is online, after saving it, and lets it run again the moment a player joins; set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json` to keep the world running
 - Writes each player's map exploration into the world, which the game only does on a machine that renders, and keeps Travel Signs linked
-- Build-locked crash guards for the current Bellwright build (quest rewards, map icons, harvesting, roads, the build menu), applied at launch and checked byte for byte
+- Build-locked crash guards for the current Bellwright build (quest rewards, map icons, harvesting, roads, the build menu, crafting, dialogue, villager tools), applied at launch and checked byte for byte
 - Source RCON for the server status, the player list, a save on request and world snapshots; snapshot download and restore over a signed HTTP API
 - Answers Source server query, so server lists, monitors and bots see the name, map and player count
 - A list of world snapshots and an audit log of snapshot and restore actions, kept in SQLite across restarts
@@ -42,7 +43,8 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 | OS | Windows 10 version 1909 or newer, Windows 11, or Windows Server 2022. Windows Server 2019 is not supported (Bellwright needs Windows build 18363 or newer) |
 | Game files | A Bellwright installation on the host from your own Steam copy (about 23 GB) |
 | Ports | One UDP port for gameplay and one for server query, two TCP ports for RCON and the admin API |
-| Hardware | No GPU. Plan on 3 to 4 GB of RAM and one to two CPU cores per server; the game simulates its villages whether or not anyone is online |
+| Hardware | No GPU. Plan on 3 to 4 GB of RAM and one to two CPU cores per server |
+| Steam check | steamclient64.dll, tier0_s64.dll and vstdlib_s64.dll from Valve's Steamworks redistributable (SteamCMD: +login anonymous +app_update 1007), folder set in appsettings.json under Identity:SteamClientPath. Without them, characters stay tied to the PC. |
 
 ## Ports
 
@@ -51,7 +53,7 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 | base (default `7777`) | UDP | Gameplay, the port players connect to |
 | base + 2 (default `7779`) | UDP | Server query (Source A2S) |
 | base + 3 (default `7780`) | TCP | Source RCON |
-| base + 4 (default `7781`) | TCP | Admin HTTP API (snapshots, players) |
+| base + 4 (default `7781`) | TCP | Admin HTTP API (snapshots, players, the Steam check) |
 
 Open the two UDP ports on the host firewall and forward them if the server sits behind NAT. Open the TCP ports only for the people who should reach them. `base + 1` is a local name, not a listening port.
 
@@ -101,7 +103,7 @@ src/native/Hearth.GameplaySettings   server-side gameplay settings (C++)
 src/native/Hearth.FogReveal          map exploration on a host with no screen (C++)
 src/native/Hearth.FourthSeat         world data for the fourth player (C++)
 src/tools/Hearth.SaveGuard           save protection (Rust, HearthSaveGuard.exe)
-dist/ue4ss-server                    the UE4SS host layout: settings, signatures, bw_host, bw_fog, bw_seat4
+dist/ue4ss-server                    the UE4SS host layout: settings, signatures, bw_host, bw_fog, bw_seat4, bw_pause, bw_ident
 dist/engine-ini                      Engine.ini reference templates
 vendor/ue4ss                         the pinned UE4SS core (checked by hash at release)
 scripts/host-instance.ps1            the launch script
