@@ -4,6 +4,16 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.97] - 2026-11-05
+
+- Characters follow each player's Steam account, checked with Steam on every join.
+- On its first start, a server reads its last 14 days of logs to learn which PC each player has been using, so existing characters carry over.
+- Players on an older Hearth join as before.
+- Pauses the world while nobody is online, after saving it, and lets it run again the moment a player joins; set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json` to keep the world running
+- Fixed crashes in the game's own code: changing a crafting amount or priority, two in NPC dialogue, one in a villager's tool check.
+- The game no longer tries to start Steam on the server. A server has no Steam client, and the tries filled most of the game log.
+- Self-hosted servers: The Steam check needs three files from Valve's Steamworks redistributable: steamclient64.dll, tier0_s64.dll and vstdlib_s64.dll (SteamCMD: +login anonymous +app_update 1007). Set their folder in appsettings.json under Identity:SteamClientPath. Without them, characters stay tied to the PC as before.
+
 ## [0.1.96] - 2026-10-21
 
 Version-lockstep release for the Hearth app 0.1.96 (its Console tab shows the Host, Port, Admin password and Connect bar again). The server is the same as 0.1.95.
