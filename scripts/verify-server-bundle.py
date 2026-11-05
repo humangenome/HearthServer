@@ -52,6 +52,13 @@ REQUIRED_ENTRIES = (
     # (isolated mod, switched on in mods.txt).
     "ue4ss/Mods/bw_seat4/HearthFourthSeat.dll",
     "ue4ss/Mods/bw_seat4/Scripts/main.lua",
+    # bw_pause: pauses the world while nobody is connected (isolated mod, switched on in
+    # mods.txt; off per server with "PauseWhenEmpty": false or Logs\bw_pause.off).
+    "ue4ss/Mods/bw_pause/Scripts/main.lua",
+    # bw_ident: a returning player's character follows their Steam account (isolated mod, switched on in
+    # mods.txt; needs HearthServer's identity token key, does nothing without it).
+    "ue4ss/Mods/bw_ident/HearthIdentity.dll",
+    "ue4ss/Mods/bw_ident/Scripts/main.lua",
     # The 5 PDB-derived AOB signatures are mandatory on UE5.7. Without them
     # UE4SS falls back to its built-in scanner, hits the GUObjectArray trap and
     # hangs at "Waiting for object construction".
@@ -182,6 +189,8 @@ def verify(path):
              "HearthFogReveal.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
             ("ue4ss/mods/bw_seat4/hearthfourthseat.dll",
              "HearthFourthSeat.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
+            ("ue4ss/mods/bw_ident/hearthidentity.dll",
+             "HearthIdentity.dll", MIN_GAMEPLAY_SETTINGS_DLL_BYTES),
             ("redist/d3d10warp.dll", "redist/d3d10warp.dll", MIN_WARP_BYTES),
             ("host-instance.ps1", "host-instance.ps1", MIN_HOST_SCRIPT_BYTES),
         )
@@ -257,7 +266,7 @@ def thread_safety(zf, sizes):
         return []
     with tempfile.TemporaryDirectory() as tmp:
         files = []
-        for mod in ("bw_host", "bw_fog", "bw_seat4"):
+        for mod in ("bw_host", "bw_fog", "bw_seat4", "bw_pause", "bw_ident"):
             key = "ue4ss/mods/{}/scripts/main.lua".format(mod)
             if key not in sizes:
                 continue

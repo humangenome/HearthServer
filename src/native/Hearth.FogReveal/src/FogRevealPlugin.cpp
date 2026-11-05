@@ -16,6 +16,12 @@
 // file; this DLL validates the actor and writes the bytes.  No game code is called here.
 //
 // Build-locked to Bellwright 24840601 (SizeOfImage + AMapFog::GetFogAtLocation prologue).
+//
+// API 2 (2026-10-22, bw_fog v0.1.5): the request may carry counts=0, which skips the whole-map
+// count (every pixel into two histograms); bw_fog asks for it only at boot and every Nth stamp.
+// Every status now carries api=2 and us=<microseconds this call spent here>, so the host's
+// timing line can tell this call's own cost from the file handling around it.  A request
+// without counts= behaves exactly as API 1.
 #include <windows.h>
 
 #include <algorithm>
@@ -161,6 +167,7 @@ struct Request
     int size = 0;
     int value = 255;
     int fill = -1;   // test only: overwrite every reveal byte with this value before stamping
+    int counts = 1;  // 0 = skip the whole-map count (revealed, hist0, hist1)
     std::vector<Stamp> stamps;
 };
 
@@ -187,6 +194,7 @@ bool ParseRequest(const std::wstring& path, Request& request, std::string& error
         else if (key == "size") request.size = std::atoi(value.c_str());
         else if (key == "value") request.value = std::atoi(value.c_str());
         else if (key == "fill") request.fill = std::atoi(value.c_str());
+        else if (key == "counts") request.counts = std::atoi(value.c_str()) != 0 ? 1 : 0;
         else if (key == "stamp")
         {
             Stamp stamp{};
@@ -229,8 +237,21 @@ long long StampDisc(unsigned char* data, int n, int bytesPerPixel, int channels,
     return changed;
 }
 
+constexpr int kApiLevel = 2;
+
+long long MicrosSince(const LARGE_INTEGER& start)
+{
+    LARGE_INTEGER now{}, freq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    if (freq.QuadPart <= 0) return -1;
+    return (now.QuadPart - start.QuadPart) * 1000000LL / freq.QuadPart;
+}
+
 void Service()
 {
+    LARGE_INTEGER started{};
+    QueryPerformanceCounter(&started);
     const std::wstring dir = ModuleDirectory();
     const std::wstring requestPath = EnvOr(L"HEARTH_FOG_REVEAL_REQUEST", dir + L"\\fog-reveal-request.txt");
     const std::wstring statusPath = EnvOr(L"HEARTH_FOG_REVEAL_STATUS", dir + L"\\fog-reveal-status.txt");
@@ -306,7 +327,7 @@ void Service()
     long long revealed = 0;
     long long hist0[256] = {};
     long long hist1[256] = {};
-    for (long long i = 0; i < pixels; ++i)
+    for (long long i = 0; request.counts && i < pixels; ++i)
     {
         const unsigned char b0 = reveal.data[i * 2];
         const unsigned char b1 = reveal.data[i * 2 + 1];
@@ -315,7 +336,7 @@ void Service()
         if (b0 || b1) ++revealed;
     }
     std::ostringstream histText;
-    for (int channel = 0; channel < 2; ++channel)
+    for (int channel = 0; request.counts && channel < 2; ++channel)
     {
         const long long* hist = channel == 0 ? hist0 : hist1;
         histText << "hist" << channel << "=";
@@ -338,8 +359,10 @@ void Service()
     std::ostringstream body;
     body << "state=ok\r\nsize=" << fogSize << "\r\nstamps=" << request.stamps.size()
          << "\r\nchanged=" << changedReveal << "\r\nchanged_permanent=" << changedPermanent
-         << "\r\npermanent=" << (permanentUsable ? 1 : 0) << "\r\nrevealed=" << revealed
-         << "\r\npixels=" << pixels << "\r\n" << histText.str();
+         << "\r\npermanent=" << (permanentUsable ? 1 : 0);
+    if (request.counts) body << "\r\nrevealed=" << revealed << "\r\npixels=" << pixels << "\r\n" << histText.str();
+    else body << "\r\ncounts=skipped\r\n";
+    body << "api=" << kApiLevel << "\r\nus=" << MicrosSince(started) << "\r\n";
     WriteStatus(statusPath, body.str());
 }
 } // namespace

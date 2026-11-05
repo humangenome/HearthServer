@@ -33,6 +33,8 @@ if #files == 0 then
         "dist/ue4ss-server/Mods/bw_host/Scripts/main.lua",
         "dist/ue4ss-server/Mods/bw_fog/Scripts/main.lua",
         "dist/ue4ss-server/Mods/bw_seat4/Scripts/main.lua",
+        "dist/ue4ss-server/Mods/bw_pause/Scripts/main.lua",
+        "dist/ue4ss-server/Mods/bw_ident/Scripts/main.lua",
     }
 end
 
@@ -55,6 +57,12 @@ local GAME_SCHEDULERS = {
     atBoot = true,
 }
 local PUMP_REGISTRARS = { LoopInGameThreadWithDelay = true, LoopInGameThreadAfterFrames = true }
+-- Lua 5.4 instructions that write register A and that the scan below does not model (it clears the
+-- register so a stale name or function cannot be used through it)
+local WRITES_A = {}
+for name in ([[LOADI LOADF LOADFALSE LFALSESKIP LOADTRUE LOADNIL GETI ADDI ADDK SUBK MULK MODK POWK DIVK IDIVK
+    BANDK BORK BXORK SHRI SHLI ADD SUB MUL MOD POW DIV IDIV BAND BOR BXOR SHL SHR UNM BNOT NOT LEN CONCAT
+    TESTSET VARARG]]):gmatch("%S+") do WRITES_A[name] = true end
 -- UE4SS functions that run on the caller's own Lua stack (object lookups and reads): allowed in
 -- background code for now (coordinator's option 1, 2026-10-18); counted for the record.
 local UE4SS_READS = { FindAllOf = true, FindFirstOf = true, StaticFindObject = true, FindObject = true,
@@ -99,10 +107,16 @@ local function parse(text)
             if pc then
                 local regs, comment = args:match("^(.-)%s*;%s*(.*)$")
                 if not regs then regs, comment = args, "" end
-                local nums = {}
-                for n in regs:gmatch("%-?%d+") do nums[#nums + 1] = tonumber(n) end
+                -- operands are registers, constants or counts; luac marks a constant operand with a trailing
+                -- "k" (SETFIELD 1 2 3k: store constant 3). Reading 3k as register 3 bound table fields to
+                -- whatever function happened to sit in register 3 (2026-10-27, hearth-gate-parse-flaw).
+                local nums, ks = {}, {}
+                for tok in regs:gmatch("%S+") do
+                    local n, k = tok:match("^(%-?%d+)(k?)$")
+                    if n then nums[#nums + 1] = tonumber(n); ks[#nums] = (k == "k") end
+                end
                 cur.code[#cur.code + 1] = { pc = tonumber(pc), line = tonumber(ln), op = op, a = nums[1], b = nums[2],
-                    c = nums[3], comment = comment or "" }
+                    c = nums[3], bk = ks[2] or false, ck = ks[3] or false, comment = comment or "" }
             end
         elseif cur and section == "locals" then
             local name, s, e = line:match("^%s+%d+%s+(%S+)%s+(%d+)%s+(%d+)")
@@ -222,7 +236,7 @@ local function analyze(path)
                 local src = reg[B] or {}
                 reg[A] = { name = nm, scope = scope, closure = src.closure, global = src.global, tbl = src.tbl }
             elseif op == "SELF" then
-                local m = ins.comment:match('"([^"]*)"') or (reg[C] and reg[C].str)
+                local m = ins.comment:match('"([^"]*)"') or (not ins.ck and reg[C] and reg[C].str)
                 if m then push(methods, p, { m, ins.line }) end
                 reg[A] = {}; reg[A + 1] = {}
             elseif op == "CLOSURE" then
@@ -236,7 +250,7 @@ local function analyze(path)
                 if ln then reg[A].tblName, reg[A].tblScope = ln, p end
             elseif op == "SETFIELD" then
                 local field = ins.comment:match('"([^"]*)"')
-                local src = reg[C] or {}
+                local src = (not ins.ck and reg[C]) or {}
                 if field and src.closure then
                     local base, scope = nameOfReg(A, pc)
                     if base then bind(key(scope, base .. "." .. field), src.closure)
@@ -244,7 +258,7 @@ local function analyze(path)
                 end
             elseif op == "SETTABLE" then
                 local field = reg[B] and reg[B].str
-                local src = reg[C] or {}
+                local src = (not ins.ck and reg[C]) or {}
                 if field and src.closure then
                     if reg[A] and reg[A].env then bind(key("G", field), src.closure)
                     else
@@ -255,7 +269,7 @@ local function analyze(path)
                 end
             elseif op == "SETTABUP" then
                 local up, field = ins.comment:match('^(%S+) "([^"]*)"')
-                local src = reg[C] or {}
+                local src = (not ins.ck and reg[C]) or {}
                 if up and field and src.closure then
                     if up == "_ENV" then bind(key("G", field), src.closure)
                     else bind(key(scopeOf(p, up, false), up .. "." .. field), src.closure) end
@@ -264,6 +278,12 @@ local function analyze(path)
                 local nm = p.upvals[B + 1]
                 local src = reg[A] or {}
                 if nm and src.closure then bind(key(scopeOf(p, nm, false), nm), src.closure) end
+            elseif WRITES_A[op] then
+                -- a value the gate does not follow (a number, a computed value, an array slot): the register
+                -- no longer holds the name or function it held before, so a later store or call through it
+                -- must not use that stale entry
+                reg[A] = {}
+                if op == "LOADNIL" and B then for r = A + 1, A + B do reg[r] = {} end end
             elseif op == "CALL" or op == "TAILCALL" then
                 local callee = reg[A] or {}
                 local cname = callee.global or (callee.name and callee.name:match("([%w_]+)$"))

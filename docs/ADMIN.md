@@ -58,7 +58,7 @@ HearthServer exposes Source RCON on the RCON port:
 
 ## Worlds and characters
 
-A character is bound to the Steam account that created it. The client joins with `?Name=steam_<steamid64>` as the login identity and carries the typed display name separately, so Bellwright resolves the persistent player from the Steam identity. The name field in the app is a display name, not a character picker, and there is no supported way to reassign a saved character to a different Steam account.
+How a server finds a player's character, and how it follows their Steam account from v0.1.97, is in the Hearth repository's [docs/WORLDS.md](https://github.com/HumanGenome/Hearth/blob/main/docs/WORLDS.md). The name field in the app is a display name, not a character picker.
 
 Importing another server's world brings the world with it: buildings, settlements, map progress. The characters inside it stay bound to their original Steam64 IDs, so a new player joins that world as a new character.
 

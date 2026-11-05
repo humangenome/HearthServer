@@ -162,30 +162,73 @@ function Wait-GameOwnSave([int]$gamePid, [string]$savePath) {
   $secs = [int]((Get-Date) - $t0).TotalSeconds
   if ($ok) { L ('save before stop: the game''s own save landed after ' + $secs + ' s') } else { L ('save before stop: no game save within ' + $secs + ' s (stopping anyway)') }
 }
+# A Stop that lands seconds after the game's autosave has asked for a save that never came: "NOT confirmed
+# within 20 s" (lab pg1 2026-10-26: own save 18:48:45.4, request 18:48:48, nothing new before the kill;
+# nothing lost). The cause is not known: read 2026-10-30, the game's Save waits for a running save rather
+# than refusing, and it drops a request silently when the cheat component's controller has no player state.
+# When the game saved in
+# the last RecentS seconds: let that save finish (file unchanged StableS s and SettleS s old), then ask; if
+# nothing lands, ask once more; if still nothing, the game's own save of a few seconds ago is the world we
+# keep ("confirmed (game autosave N s before the stop)"). Same idea as Sundial's mirror case. Timings in
+# one table so the behaviour test can shrink them.
+$script:StopSaveTimings = @{ RecentS = 30; FinishMaxS = 12; StableS = 3; SettleS = 8; WaitS = 20; RetryWaitS = 12; PollMs = 500 }
+function Get-SaveWriteTime([string]$savePath) {
+  if (Test-Path -LiteralPath $savePath) { try { return (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
+  return [datetime]::MinValue
+}
+function Request-SaveAndWait([string]$marker, [int]$gamePid, [string]$savePath, [datetime]$was, [int]$seconds) {
+  Set-Content -LiteralPath $marker -Value ((Get-Date).ToString('o')) -ErrorAction SilentlyContinue
+  $end = (Get-Date).AddSeconds($seconds)
+  while ((Get-Date) -lt $end) {
+    Start-Sleep -Milliseconds $script:StopSaveTimings.PollMs
+    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) { return $false }
+    if ((Get-SaveWriteTime $savePath) -gt $was) { return $true }
+  }
+  return $false
+}
+function Wait-OwnSaveFinished([int]$gamePid, [string]$savePath) {
+  $t = $script:StopSaveTimings
+  $sig = $null; $since = Get-Date
+  $end = (Get-Date).AddSeconds($t.FinishMaxS)
+  while ((Get-Date) -lt $end) {
+    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) { return }
+    $item = Get-Item -LiteralPath $savePath -ErrorAction SilentlyContinue
+    $cur = ''; if ($item) { $cur = [string]$item.LastWriteTimeUtc.Ticks + '|' + [string]$item.Length }
+    if ($cur -ne $sig) { $sig = $cur; $since = Get-Date }
+    $age = ((Get-Date).ToUniversalTime() - (Get-SaveWriteTime $savePath)).TotalSeconds
+    if (((Get-Date) - $since).TotalSeconds -ge $t.StableS -and $age -ge $t.SettleS) { return }
+    Start-Sleep -Milliseconds $t.PollMs
+  }
+}
 function Save-WorldBeforeKill([int]$gamePid, [int]$port, [string]$savePath) {
   if ($gamePid -le 0 -or $port -le 0 -or [string]::IsNullOrWhiteSpace($savePath)) { return }
   $proc = Get-Process -Id $gamePid -ErrorAction SilentlyContinue
   if (-not $proc -or $proc.ProcessName -notlike 'BellwrightGame*') { return }
   if (Test-HostHelperStalled) { Wait-GameOwnSave $gamePid $savePath; return }
+  $t = $script:StopSaveTimings
   $marker = Join-Path $logDir ('hearth_force_save_' + $port + '.marker')
-  $was = [datetime]::MinValue
-  if (Test-Path -LiteralPath $savePath) { try { $was = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
-  Set-Content -LiteralPath $marker -Value ((Get-Date).ToString('o')) -ErrorAction SilentlyContinue
-  $ok = $false
-  $end = (Get-Date).AddSeconds(20)
-  while ((Get-Date) -lt $end) {
-    Start-Sleep -Milliseconds 500
-    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) { break }
-    $now = [datetime]::MinValue
-    if (Test-Path -LiteralPath $savePath) { try { $now = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc } catch {} }
-    if ($now -gt $was) { $ok = $true; break }
+  $was = Get-SaveWriteTime $savePath
+  $ownAge = -1
+  if ($was -ne [datetime]::MinValue) { $ownAge = [int][math]::Max(0, ((Get-Date).ToUniversalTime() - $was).TotalSeconds) }
+  $recent = ($ownAge -ge 0 -and $ownAge -le $t.RecentS)
+  if ($recent) {
+    L ('save before stop: the game saved ' + $ownAge + ' s ago; letting that save finish before asking')
+    Wait-OwnSaveFinished $gamePid $savePath
+    $was = Get-SaveWriteTime $savePath
+  }
+  $ok = Request-SaveAndWait $marker $gamePid $savePath $was $t.WaitS
+  $retried = $false
+  if (-not $ok -and $recent -and (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) {
+    $retried = $true
+    L 'save before stop: no new save after the request; asking once more'
+    $ok = Request-SaveAndWait $marker $gamePid $savePath $was $t.RetryWaitS
   }
   if ($ok) {
     # never kill on the tick the rename landed: wait until size and time stop moving
     $sig = ''
     $end2 = (Get-Date).AddSeconds(8)
     while ((Get-Date) -lt $end2) {
-      Start-Sleep -Milliseconds 500
+      Start-Sleep -Milliseconds $t.PollMs
       $item = Get-Item -LiteralPath $savePath -ErrorAction SilentlyContinue
       if (-not $item) { break }
       $cur = [string]$item.LastWriteTimeUtc + '|' + [string]$item.Length
@@ -194,7 +237,10 @@ function Save-WorldBeforeKill([int]$gamePid, [int]$port, [string]$savePath) {
     }
   }
   Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-  if ($ok) { L 'save before stop: confirmed' } else { L 'save before stop: NOT confirmed within 20 s (stopping anyway)' }
+  if ($ok -and $retried) { L 'save before stop: confirmed (asked again after the game''s own save)' }
+  elseif ($ok) { L 'save before stop: confirmed' }
+  elseif ($recent) { L ('save before stop: confirmed (game autosave ' + $ownAge + ' s before the stop)') }
+  else { L ('save before stop: NOT confirmed within ' + $t.WaitS + ' s (stopping anyway)') }
 }
 function Read-PidFile([string]$path) {
   $p = 0
@@ -465,6 +511,11 @@ sg.FoliageQuality=0
 net.UseAdaptiveNetUpdateFrequency=1
 net.TrackQueuedActorThreshold=1
 net.TrackQueuedActorThresholdOwner=1
+
+; A host has no Steam client, so the game's Steam layer can never start, and the game asks for it four times around every
+; autosave: most of the log by bytes (measured 2026-10-29). Off, as in dist/engine-ini/Engine.host.ini.
+[OnlineSubsystemSteam]
+bEnabled=false
 
 [Core.Log]
 ; The game logs "GetTargets called on quest ... but player was null" under LogGame
@@ -1063,6 +1114,104 @@ public class BwInj {
     Buffer.BlockCopy(expected,0,trampoline,5,expected.Length);
     return InstallEntryTrampoline(pid,imageBase,rva,"UMistUIManager::CreateTemporaryContext null-manager guard",expected,trampoline,19,expected.Length);
   }
+  // Game-code crashes on build 24840601, read from real crash reports and named with the game's symbols. In each one the
+  // game follows a pointer that is empty at that moment; each guard does what the game does when there is nothing to act on.
+  private static string NullThisGuard(int pid, long imageBase, long rva, string label, byte[] expected){
+    // A 15-byte prologue with an empty this: return without doing anything.
+    byte[] trampoline = new byte[]{
+      0x48,0x85,0xC9,                         // test rcx,rcx
+      0x74,0x1C,                              // je return_void
+      0x00,0x00,0x00,0x00,0x00,              // original prologue (filled below)
+      0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,
+      0x49,0xBB,                              // mov r11,function+15
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x41,0xFF,0xE3,                         // jmp r11
+      0xC3                                    // return_void
+    };
+    Buffer.BlockCopy(expected,0,trampoline,5,expected.Length);
+    return InstallEntryTrampoline(pid,imageBase,rva,label,expected,trampoline,22,expected.Length);
+  }
+  public static string PatchInfiniteCraftingAmountNullData(int pid, long imageBase){
+    // A player's "keep crafting" amount reaches the structure's data by GUID. When that lookup or its cast finds nothing, the
+    // broker still calls this with this==null and the host crashes reading +0x3E0.
+    const long rva = 0x6432140;
+    return NullThisGuard(pid,imageBase,rva,"UMistTownRecipeInfiniteCraftingStructureData::ServerSetInfiniteCraftingAmount null-data guard",new byte[]{
+      0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x54,0x24,0x10,0x57,0x48,0x83,0xEC,0x20
+    });
+  }
+  public static string PatchInfiniteCraftingPriorityNullData(int pid, long imageBase){
+    // The same broker path as the amount, for the priority (reads +0x388 first).
+    const long rva = 0x6432220;
+    return NullThisGuard(pid,imageBase,rva,"UMistTownRecipeInfiniteCraftingStructureData::ServerSetInfiniteCraftingPriority null-data guard",new byte[]{
+      0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x54,0x24,0x10,0x57,0x48,0x83,0xEC,0x20
+    });
+  }
+  public static string PatchTalkExitNullState(int pid, long imageBase){
+    // A dialogue's exit writes 1 through the template's pointer at +0xC0. With no talk running that pointer is empty and the
+    // host crashes writing address 0. The whole function is these 14 bytes, so the trampoline replaces it.
+    const long rva = 0x6775AE0;
+    byte[] expected = new byte[]{
+      0x48,0x8B,0x81,0xC0,0x00,0x00,0x00,0xC7,0x00,0x01,0x00,0x00,0x00,0xC3
+    };
+    byte[] trampoline = new byte[]{
+      0x48,0x8B,0x81,0xC0,0x00,0x00,0x00,     // mov rax,[rcx+0xC0]
+      0x48,0x85,0xC0,                         // test rax,rax
+      0x74,0x06,                              // je return_void
+      0xC7,0x00,0x01,0x00,0x00,0x00,          // mov dword ptr [rax],1
+      0xC3,                                   // return_void
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 // continuation slot, unused: nothing returns to the old body
+    };
+    return InstallEntryTrampoline(pid,imageBase,rva,"UMistTalkTemplate::TalkExit null-state guard",expected,trampoline,19,expected.Length);
+  }
+  public static string PatchPlayerTalkSetTextNullTarget(int pid, long imageBase){
+    // UMistPlayerTalkComponent::SetText calls a virtual function on the object at +0x130 without checking it. Patched inside the
+    // function, at +0x14F: with nothing there, skip the call and carry on to its end. The call itself stays in the game's code.
+    const long rva = 0x676650F;
+    byte[] expected = new byte[]{
+      0x48,0x8B,0x8B,0x30,0x01,0x00,0x00,0x0F,0x28,0xD6,0x48,0x8B,0xD6
+    };
+    byte[] trampoline = new byte[]{
+      0x48,0x8B,0x8B,0x30,0x01,0x00,0x00,     // mov rcx,[rbx+0x130]
+      0x48,0x85,0xC9,                         // test rcx,rcx
+      0x74,0x13,                              // je skip_call
+      0x0F,0x28,0xD6,                         // movaps xmm2,xmm6
+      0x48,0x8B,0xD6,                         // mov rdx,rsi
+      0x49,0xBB,                              // mov r11,site+13 (the game's own mov rax,[rcx]; call [rax+0x5E8])
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x41,0xFF,0xE3,                         // jmp r11
+      0x49,0xBB,                              // skip_call: mov r11,site+22 (after the call)
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x41,0xFF,0xE3                          // jmp r11
+    };
+    Buffer.BlockCopy(BitConverter.GetBytes(imageBase+rva+22),0,trampoline,33,8);
+    return InstallEntryTrampoline(pid,imageBase,rva,"UMistPlayerTalkComponent::SetText null-target guard",expected,trampoline,20,expected.Length);
+  }
+  public static string PatchActiveOrdersNullOwner(int pid, long imageBase){
+    // A villager's tool check asks for the harvesting orders of a component whose pointer at +0x170 is empty, and the host
+    // crashes reading address 0. Hand back an empty list: no orders, no tools needed.
+    const long rva = 0x67CE350;
+    byte[] expected = new byte[]{
+      0x40,0x55,0x53,0x56,0x57,0x41,0x55,0x41,0x56,0x48,0x8D,0x6C,0x24,0xD1
+    };
+    byte[] trampoline = new byte[]{
+      0x48,0x8B,0x81,0x70,0x01,0x00,0x00,     // mov rax,[rcx+0x170]
+      0x48,0x85,0xC0,                         // test rax,rax
+      0x74,0x1B,                              // je empty_list
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,     // original prologue (filled below)
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x49,0xBB,                              // mov r11,GetActiveOrders+14
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x41,0xFF,0xE3,                         // jmp r11
+      0x31,0xC0,                              // empty_list: xor eax,eax
+      0x48,0x89,0x02,                         // mov [rdx],rax (the returned array: no data)
+      0x48,0x89,0x42,0x08,                    // mov [rdx+8],rax (count and capacity 0)
+      0x48,0x8B,0xC2,                         // mov rax,rdx
+      0xC3                                    // ret
+    };
+    Buffer.BlockCopy(expected,0,trampoline,12,expected.Length);
+    return InstallEntryTrampoline(pid,imageBase,rva,"UMistTownHarvestingComponent::GetActiveOrders null-owner guard",expected,trampoline,28,expected.Length);
+  }
   public static string PatchMaxSessionPlayers(int pid, long imageBase, int sessionPlayers){
     // GetMaxSessionPlayers() returns max(1, min(4, GMistMaxSessionPlayers)), a hard
     // cap of 4 people per session. AMistOasisGameMode::PreLogin refuses a join with
@@ -1305,6 +1454,16 @@ function Start-HostWithRetry {
       L ('native road-placement null-context patch: ' + $roadRes)
       $uiRes = [BwInj]::PatchTemporaryUiContextNullManager($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
       L ('native settlement-UI null-manager patch: ' + $uiRes)
+      $craftAmountRes = [BwInj]::PatchInfiniteCraftingAmountNullData($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
+      L ('native infinite-crafting amount null-data patch: ' + $craftAmountRes)
+      $craftPriorityRes = [BwInj]::PatchInfiniteCraftingPriorityNullData($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
+      L ('native infinite-crafting priority null-data patch: ' + $craftPriorityRes)
+      $talkExitRes = [BwInj]::PatchTalkExitNullState($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
+      L ('native talk-exit null-state patch: ' + $talkExitRes)
+      $talkTextRes = [BwInj]::PatchPlayerTalkSetTextNullTarget($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
+      L ('native talk-text null-target patch: ' + $talkTextRes)
+      $ordersRes = [BwInj]::PatchActiveOrdersNullOwner($cpid, $gameProc0.MainModule.BaseAddress.ToInt64())
+      L ('native active-orders null-owner patch: ' + $ordersRes)
     } catch { L ('native player-map/crash patch EXCEPTION: ' + $_.Exception.Message) }
     #
     # SESSION CAPACITY PATCH (build 24840601): Bellwright caps a session at 4

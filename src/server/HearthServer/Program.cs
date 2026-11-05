@@ -62,6 +62,15 @@ public static class Program
             builder.Services.AddSingleton<HearthRestartCoordinator>();
             builder.Services.AddSingleton<SaveProtectionService>();
             builder.Services.AddSingleton<AdminJoinTicketService>();
+            // Character follows the Steam account (HearthIdentity host mod): token key, Steam map, Steam ticket check.
+            var identityOn = builder.Configuration.GetSection("Hearth:Identity").GetValue("Enabled", true);
+            if (identityOn)
+            {
+                builder.Services.AddSingleton<IdentityTokenService>();
+                builder.Services.AddSingleton<SteamIdentityMapService>();
+                builder.Services.AddSingleton<ISteamTicketVerifier, SteamGameServerTicketVerifier>();
+                builder.Services.AddHostedService<IdentityStartupService>();
+            }
 
             builder.Services.AddSingleton<SaveOrchestratorService>();
             builder.Services.AddSingleton<ChatService>();

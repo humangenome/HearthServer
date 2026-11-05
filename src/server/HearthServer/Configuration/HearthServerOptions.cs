@@ -145,6 +145,49 @@ public sealed class HearthServerOptions
 
     /// <summary>Live web map. See protocol/map-v1.md.</summary>
     public MapOptions Map { get; set; } = new();
+
+    /// <summary>
+    /// A returning player's character follows their Steam account (HearthIdentity host mod). The app asks
+    /// POST /api/v1/identity/token with a Steam session ticket; once Steam has checked it, HearthServer signs a
+    /// short-lived token the join carries, and the host mod points that Steam ID at the first computer id recorded
+    /// for it in the identity folder.
+    /// </summary>
+    public IdentityOptions Identity { get; set; } = new();
+}
+
+public sealed class IdentityOptions
+{
+    /// <summary>Master switch for the token route and the Steam-to-first-computer map.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Folder for token.key and steam-map.tsv, relative to HearthServer's folder unless rooted.</summary>
+    public string Directory { get; set; } = "data/identity";
+
+    /// <summary>
+    /// The Steam API library used for the anonymous Steam game-server login that checks tickets. Empty = the game's own
+    /// copy beside HearthServer (in Engine\Binaries\ThirdParty\Steamworks\Steamv161\Win64).
+    /// </summary>
+    public string SteamApiPath { get; set; } = "";
+
+    /// <summary>
+    /// steamclient64.dll for the game-server login (a Steam game server needs it; Valve's Steamworks redistributable,
+    /// app 1007, anonymous SteamCMD, has it with tier0_s64 and vstdlib_s64 beside it). The file or the folder holding it; a
+    /// host that keeps one shared copy sets this. Empty = one beside HearthServer, or the installed Steam client's. None
+    /// found = Steam checks stay off and players keep the character of the computer they join from.
+    /// </summary>
+    public string SteamClientPath { get; set; } = "";
+
+    /// <summary>Bellwright's Steam app id; tickets are checked for this app.</summary>
+    public uint SteamAppId { get; set; } = 1812450;
+
+    /// <summary>How long a signed join token stays valid (the host mod refuses anything over 600).</summary>
+    public int TokenLifetimeSeconds { get; set; } = 600;
+
+    /// <summary>Token requests allowed per source address per minute.</summary>
+    public int MaxTokenRequestsPerMinute { get; set; } = 6;
+
+    /// <summary>How long to wait for Steam's answer on one ticket.</summary>
+    public int SteamCheckTimeoutSeconds { get; set; } = 15;
 }
 
 public sealed class ChatOptions

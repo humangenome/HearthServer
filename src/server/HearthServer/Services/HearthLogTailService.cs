@@ -73,7 +73,7 @@ public sealed class HearthLogTailService : BackgroundService
         @"LogUWE:\s+Logout : Player .* is exiting",
         RegexOptions.Compiled);
     private static readonly Regex CredentialQueryRegex = new(
-        @"(?<prefix>[?&](?:HearthKey|HearthAdminTicket)=)[^?&\s""]+",
+        @"(?<prefix>[?&](?:HearthKey|HearthAdminTicket|HearthIdToken)=)[^?&\s""]+",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex AdminTicketRegex = new(
         @"[?&]HearthAdminTicket=(?<token>[0-9a-f]{64})(?:[?&\s""]|$)",
@@ -101,16 +101,23 @@ public sealed class HearthLogTailService : BackgroundService
     private string? _activeLogPath;
     private static readonly TimeSpan LoginIdentityCacheTtl = TimeSpan.FromMinutes(45);
 
+    private readonly IdentityTokenService? _identityTokens;
+    private readonly SteamIdentityMapService? _identityMap;
+
     public HearthLogTailService(
         ILogger<HearthLogTailService> log,
         IOptions<HearthServerOptions> opts,
         PipeServerState state,
-        AdminJoinTicketService adminJoinTickets)
+        AdminJoinTicketService adminJoinTickets,
+        IdentityTokenService? identityTokens = null,
+        SteamIdentityMapService? identityMap = null)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
         _adminJoinTickets = adminJoinTickets;
+        _identityTokens = identityTokens;
+        _identityMap = identityMap;
         _loginIdentityCachePath = ResolveLoginIdentityCachePath(_opts.LoginIdentityCachePath);
     }
 
@@ -258,6 +265,7 @@ public sealed class HearthLogTailService : BackgroundService
             return;
         }
         var loginMatch = LoginNameRegex.Match(line);
+        if (trackPlayerEvents && loginMatch.Success) RecordVerifiedComputer(line);
         if (trackPlayerEvents && loginMatch.Success)
         {
             TrackLoginRequest(
@@ -558,6 +566,26 @@ public sealed class HearthLogTailService : BackgroundService
             Path.Combine(gameUserDir, "bw-ue.log"),
             Path.Combine(gameUserDir, "Saved", "Logs", "Bellwright.log"),
         };
+
+    /// <summary>
+    /// A login carrying a valid identity token (HearthServer signed it after Steam checked the player) teaches the
+    /// Steam-to-first-computer map that Steam ID's computer, if it has none yet. Untokened logins never do: their
+    /// ?PlayerId is only what the client says.
+    /// </summary>
+    internal bool RecordVerifiedComputer(string line)
+    {
+        if (_identityTokens is null || _identityMap is null) return false;
+        var m = Regex.Match(line, @"LogNet:\s+Login request:\s+(?<opts>\?\S+)");
+        if (!m.Success) return false;
+        var opts = m.Groups["opts"].Value;
+        var token = SteamIdentityMapService.OptionValue(opts, "HearthIdToken");
+        var steam = SteamIdentityMapService.OptionValue(opts, "PlayerId");
+        var computer = SteamIdentityMapService.OptionValue(opts, "Name");
+        if (token is null || steam is null || computer is null) return false;
+        // The game logs the line when the login arrives; the token was fresh then. Allow its full lifetime here.
+        if (!_identityTokens.Verify(token, steam)) return false;
+        return _identityMap.RecordFirst(steam, computer);
+    }
 
     internal static string RedactCredentialQueryValues(string line) =>
         CredentialQueryRegex.Replace(line, "${prefix}<redacted>");

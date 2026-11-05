@@ -1,4 +1,24 @@
--- bw_host v0.18.61: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+-- bw_host v0.18.64: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   v0.18.64: the r19 release: v0.18.63 plus the Travel Sign pass that walks each class once instead of looking
+--              every object up by path (a join froze the world up to 6.2 s, three times; 2026-10-30 full pass).
+--   v0.18.63: a Stop's save request goes to a controller with a player state, and one line says
+--              which was picked (2026-10-30, identity lab: "NOT confirmed within 20 s" with nothing logged).
+--   v0.18.62: game-thread time is measured and one search cost is cut (2026-10-25).
+--              Boot (2026-10-26): the save request is served from the game-thread pump
+--              every 2 s from the first frame (a Stop in the first two minutes after a
+--              start used to kill unsaved), and the travel-sign provider check runs 40
+--              per background pass (sign providers first), so the background loop is no
+--              longer blocked 70-130 s after "listen server UP".
+--              Joined walls (2026-10-26): the wall the game joins into another and destroys
+--              is logged ("wall joined into ...") and dropped from the rebuild, scans and
+--              rechecks; only the wall that grew is rebuilt (it read "0 -> 0" and "1 without").
+--              The pump times every queued callback by label and counts the object
+--              lookups made inside them (by path: StaticFindObject; walks: FindAllOf),
+--              and logs one "gt 60s:" line a minute when any ran. The 10/24 fog lab
+--              read 50-70 ms for one lookup by path of a joiner's object on the game
+--              thread (inference from bw_fog's timing). The travel-sign repair looked
+--              up every remote pawn once per sign, three passes after every join; it
+--              now looks each pawn (and the blueprint library) up once per batch.
 --   v0.18.61: game-thread work runs from one game-thread pump; the background
 --              service loop no longer calls UE4SS's ExecuteInGameThread, any
 --              hook registration or any game function (2026-10-18). In UE4SS b50986bd ExecuteInGameThread writes to the Lua
@@ -414,6 +434,10 @@ end
 -- Global (uppercase) table: the main chunk is at Lua's 200-active-locals limit.
 GAME_THREAD_WATCH = { items = {}, n = 0, ranAt = os.time(), runs = 0, callbacks = 0, failures = 0,
     started = false, startErr = nil, booted = false, bootSteps = {}, stallAfter = 60, stalledSince = nil }
+-- v0.18.62: game-thread time per callback label (W.tm) and the lookups made inside callbacks
+-- (W.lk), logged once a minute ("gt 60s:"); W.inPump is true only while a queued callback runs.
+-- Created on first use: a bigger table constructor here moves the main chunk's constants, which
+-- tests/host-thread-safety.test.lua misreads as a background call into the walls code.
 local function executeInGameThreadSafe(label, callback, onError)
     local W = GAME_THREAD_WATCH
     local entry = { label = label, cb = callback, onError = onError }
@@ -438,21 +462,84 @@ function GAME_THREAD_WATCH.pump()
         end
         log("game-thread pump running (boot steps " .. tostring(#W.bootSteps) .. ")")
     end
+    -- v0.18.62: the save request (force-save marker) is read here every 2 s, from the first frame,
+    -- not from the background service loop: that loop is busy for 70-130 s after the host comes
+    -- up, so a Stop in the first two minutes was never saved ("save-and-quit NOT confirmed").
+    local nowS = os.time()
+    if W.saveService and nowS - (W.saveCheckT or 0) >= 2 then
+        W.saveCheckT = nowS
+        local okS, errS = pcall(W.saveService)
+        if not okS and not W.saveServiceErrLogged then
+            W.saveServiceErrLogged = true
+            log("force-save service ERROR (request remains pending): " .. tostring(errS))
+        end
+    end
     if W.n == 0 then return end
     local fresh = {}
     -- no function calls and no new tables between the read and the swap
     local items, n = W.items, W.n
     W.items = fresh
     W.n = 0
+    if not W.tm then W.tm = {}; W.tmSince = os.time(); W.tmEvery = 60 end
+    -- the Lua thread the game thread runs us on (UE4SS keeps it apart from the background loop's)
+    if coroutine and coroutine.running then W.gtCo = coroutine.running() end
     for i = 1, n do
         local e = items[i]
         W.callbacks = W.callbacks + 1
+        local t0 = os.clock()
+        W.inPump = true
         local ok, err = pcall(e.cb)
+        W.inPump = false
+        local ms = (os.clock() - t0) * 1000
+        local label = tostring(e.label)
+        local m = W.tm[label]
+        if not m then m = { n = 0, ms = 0, max = 0 }; W.tm[label] = m end
+        m.n = m.n + 1; m.ms = m.ms + ms
+        if ms > m.max then m.max = ms end
         if not ok then
             W.failures = W.failures + 1
-            log("game-thread callback failed label=" .. tostring(e.label) .. " err=" .. tostring(err))
+            log("game-thread callback failed label=" .. label .. " err=" .. tostring(err))
             if e.onError then pcall(e.onError, err) end
         end
+    end
+    pcall(GAME_THREAD_WATCH.timingLine)
+end
+-- v0.18.62: one line a minute with the game-thread time per callback label (calls, total and worst
+-- ms) and the lookups made inside callbacks. os.clock is wall time under the C runtime UE4SS uses.
+function GAME_THREAD_WATCH.timingLine()
+    local W = GAME_THREAD_WATCH
+    local now = os.time()
+    if not W.tm or now - W.tmSince < W.tmEvery then return end
+    local rows = {}
+    for label, m in pairs(W.tm) do rows[#rows + 1] = { label = label, m = m } end
+    if #rows > 0 then
+        table.sort(rows, function(a, b) return a.m.ms > b.m.ms end)
+        local parts, total = {}, 0
+        for _, r in ipairs(rows) do
+            total = total + r.m.ms
+            parts[#parts + 1] = string.format("%s n=%d ms=%.0f max=%.0f", r.label, r.m.n, r.m.ms, r.m.max)
+        end
+        local lk = W.lk or { path = 0, pathMs = 0, walk = 0, walkMs = 0, pathMax = 0 }
+        log(string.format("gt %ds: total_ms=%.0f lookups path=%d (%.0f ms, worst %.0f) walks=%d (%.0f ms) | %s",
+            now - W.tmSince, total, lk.path, lk.pathMs, lk.pathMax, lk.walk, lk.walkMs, table.concat(parts, " | ")))
+    end
+    W.tm = {}
+    W.lk = { path = 0, pathMs = 0, walk = 0, walkMs = 0, pathMax = 0 }
+    W.tmSince = now
+end
+-- v0.18.62: count a lookup made inside a queued game-thread callback (kind "path" or "walk")
+function GAME_THREAD_WATCH.lookup(kind, ms)
+    local W = GAME_THREAD_WATCH
+    if not W.inPump then return end
+    -- a background lookup made while a callback happens to run is not game-thread time
+    if W.gtCo and coroutine and coroutine.running and coroutine.running() ~= W.gtCo then return end
+    if not W.lk then W.lk = { path = 0, pathMs = 0, walk = 0, walkMs = 0, pathMax = 0 } end
+    local lk = W.lk
+    if kind == "path" then
+        lk.path = lk.path + 1; lk.pathMs = lk.pathMs + ms
+        if ms > lk.pathMax then lk.pathMax = ms end
+    else
+        lk.walk = lk.walk + 1; lk.walkMs = lk.walkMs + ms
     end
 end
 -- A registration that must run on the game thread at start-up (NotifyOnNewObject and the like):
@@ -523,7 +610,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.61  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.64  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -681,7 +768,9 @@ local function objClassName(obj)
 end
 
 local function safeFindAll(className)
+    local t0 = GAME_THREAD_WATCH.inPump and os.clock() or nil
     local ok, arr = pcall(function() return FindAllOf(className) end)
+    if t0 then GAME_THREAD_WATCH.lookup("walk", (os.clock() - t0) * 1000) end
     if ok and arr then return arr end
     return {}
 end
@@ -733,10 +822,36 @@ ObjRef.resolve = function(fullName, baseClassName)
     local path = ObjRef.pathFromFullName(fullName)
     if not path then return nil end
     local obj = nil
+    local t0 = GAME_THREAD_WATCH.inPump and os.clock() or nil
     pcall(function() obj = StaticFindObject(path) end)
+    if t0 then GAME_THREAD_WATCH.lookup("path", (os.clock() - t0) * 1000) end
     if not (obj and obj.IsValid and obj:IsValid()) then return nil end
     if baseClassName and not ObjRef.derivesFrom(obj, baseClassName) then return nil end
     return obj
+end
+
+-- One walk per game-thread callback instead of one lookup by path per object. A lookup by path costs 50-90 ms on this
+-- build, and the repair looks up every sign's component and providers, in three passes after each join: real servers
+-- froze for 3.6 s (26 signs) to 6.2 s (43 signs), three times per join ("gt" lines, 2026-10-29). A walk costs about 80 ms
+-- whatever it finds. Objects are only used inside this callback, never across frames. A batch under walkMin signs keeps
+-- the lookup by path, which is cheaper there. A name the walk does not list falls back to the lookup by path.
+ObjRef.walkMin = 3
+ObjRef.resolveInBatch = function(batch, key, className)
+    if (batch.size or 0) < ObjRef.walkMin then return ObjRef.resolve(key, className) end
+    batch.walked = batch.walked or {}
+    local byName = batch.walked[className]
+    if not byName then
+        byName = {}
+        for _, obj in ipairs(safeFindAll(className)) do
+            local name = nil
+            pcall(function() name = objFullName(obj) end)
+            if name then byName[name] = obj end
+        end
+        batch.walked[className] = byName
+    end
+    local obj = byName[key]
+    if obj and obj.IsValid and obj:IsValid() then return obj end
+    return ObjRef.resolve(key, className)
 end
 
 local travelSignPending = {}
@@ -757,6 +872,7 @@ local travelSignPlayerSyncNextT = 0
 local travelSignPlayerSyncReason = "none"
 local TRAVEL_SIGN_DISCOVERY_SCAN_PASSES = 8
 local TRAVEL_SIGN_DISCOVERY_SCAN_INTERVAL = 60
+local TRAVEL_SIGN_PROVIDER_BATCH = 40
 
 local function travelSignObjectKey(obj)
     local key = objFullName(obj)
@@ -870,10 +986,15 @@ local function retryTravelSignComponent(item, reason)
     queueTravelSignKey(item.key, item.retries + 1, item.playerSync)
 end
 
-local function repairTravelSignComponent(item)
+local function repairTravelSignComponent(item, batch)
     -- Game thread. Resolve every object here, from its path, and never reuse a
     -- handle that was produced on the async loop or on an earlier tick.
-    local component = ObjRef.resolve(item.key, "MistFastTravelComponent")
+    -- v0.18.62: batch holds what this one game-thread callback already looked up (the
+    -- remote pawns and the blueprint library), so a pass over N signs looks each pawn up
+    -- once instead of N times. It lives for this callback only, never across frames.
+    batch = batch or {}
+    batch.pawns = batch.pawns or {}
+    local component = ObjRef.resolveInBatch(batch, item.key, "MistFastTravelComponent")
     if not component then
         travelSignSeen[item.key] = "invalid"
         return
@@ -898,7 +1019,7 @@ local function repairTravelSignComponent(item)
 
     local providers = {}
     for _, providerKey in ipairs(travelSignProvidersByOwner[ownerKey] or {}) do
-        local provider = ObjRef.resolve(providerKey, "MistMapIconProviderComponent")
+        local provider = ObjRef.resolveInBatch(batch, providerKey, "MistMapIconProviderComponent")
         if provider and travelSignObjectKey(ownerOf(provider)) == ownerKey then
             table.insert(providers, provider)
         end
@@ -908,7 +1029,11 @@ local function repairTravelSignComponent(item)
         return
     end
 
-    local library = StaticFindObject("/Script/Mist.Default__MistBlueprintLibrary")
+    local library = batch.library
+    if not (library and library.IsValid and library:IsValid()) then
+        library = StaticFindObject("/Script/Mist.Default__MistBlueprintLibrary")
+        batch.library = library
+    end
     if not (library and library.IsValid and library:IsValid()) then
         retryTravelSignComponent(item, "blueprint-library-missing")
         return
@@ -923,8 +1048,12 @@ local function repairTravelSignComponent(item)
     local playerSync = item.playerSync or travelSignRemotePlayerCount > 0
     if playerSync then
         for _, playerKey in ipairs(travelSignRemotePlayers) do
-            local player = ObjRef.resolve(playerKey, "Pawn")
-            if player then
+            local player = batch.pawns[playerKey]
+            if player == nil then
+                player = ObjRef.resolve(playerKey, "Pawn") or false
+                batch.pawns[playerKey] = player
+            end
+            if player and player.IsValid and player:IsValid() then
                 local playerOk, playerErr = pcall(function()
                     player:ServerRepairTravelComponent(component)
                 end)
@@ -1030,7 +1159,19 @@ local function serviceTravelSignDiscoveryImpl(now)
     if travelSignDiscoveryQueued or now < travelSignDiscoveryNextT then return end
     travelSignDiscoveryNextT = now + 3
 
+    -- v0.18.62: at most TRAVEL_SIGN_PROVIDER_BATCH other providers per pass, sign providers always.
+    -- The first scan queues 800-2,700 map-icon providers and one lookup by path each kept this
+    -- background loop busy for 70-130 s after the host came up (no joins served, no save read).
     for providerKey in pairs(travelSignProviderPending) do
+        if providerKey:find("FastTravelSign", 1, true) then
+            local result = rememberTravelSignProvider(providerKey)
+            if result ~= "wait" then travelSignProviderPending[providerKey] = nil end
+        end
+    end
+    local batch = 0
+    for providerKey in pairs(travelSignProviderPending) do
+        if batch >= TRAVEL_SIGN_PROVIDER_BATCH then break end
+        batch = batch + 1
         local result = rememberTravelSignProvider(providerKey)
         if result ~= "wait" then travelSignProviderPending[providerKey] = nil end
     end
@@ -1077,9 +1218,10 @@ local function serviceTravelSignDiscoveryImpl(now)
     travelSignPending = {}
     travelSignDiscoveryQueued = true
     local queued, err = executeInGameThreadSafe("travel-sign-discovery", function()
+        local looked = { size = #batch }
         for _, item in ipairs(batch) do
             travelSignPendingByKey[item.key] = nil
-            local ok, itemErr = pcall(function() repairTravelSignComponent(item) end)
+            local ok, itemErr = pcall(function() repairTravelSignComponent(item, looked) end)
             if not ok then retryTravelSignComponent(item, itemErr) end
         end
         travelSignDiscoveryQueued = false
@@ -3684,7 +3826,6 @@ local preHostSuppressionT = 0
 local postHostGameInstanceMissingLogged = false
 local loopHeartbeatT = 0
 local serviceJoinersErrorLogged = false
-local forceSaveServiceErrorLogged = false
 local FORCE_SAVE_MARKER_NAME = "hearth_force_save_" .. tostring(GAME_PORT) .. ".marker"
 local FORCE_SAVE_MARKERS = {}
 local forceSaveLogDir = type(LOG) == "string" and LOG:match("^(.*)[/\\][^/\\]+$") or nil
@@ -3702,23 +3843,75 @@ local function isLiveObject(obj)
     return valid == true
 end
 
-local function resolveForcedSaveComponent()
-    local component = nil
-    pcall(function() component = cachedFirst("MistCheatingComponent") end)
-    if isLiveObject(component) then return component end
-
-    for _, candidate in ipairs(safeFindAll("MistCheatingComponent")) do
-        if isLiveObject(candidate) then
-            objCache["MistCheatingComponent"] = candidate
-            return candidate
-        end
-    end
-    return nil
+-- v0.18.63: a save request can be dropped with no error. UMistCheatingComponent::Save does nothing when
+-- its controller has no player state (CanCheat), and AMistOasisGameMode::Save skips the Auto slot while
+-- the host's own pawn is in a battle. So the request goes to a controller that has a player state, the
+-- host's own first, and one line says what was picked, so a Stop's "NOT confirmed" can be explained.
+-- With no such controller the pick is the first live component, as before.
+local function forcedSaveOwner(candidate)
+    local owner, hasState, isLocal = nil, false, false
+    pcall(function() owner = candidate:GetOuter() end)
+    if not isLiveObject(owner) then return nil, false, false end
+    pcall(function() hasState = isLiveObject(owner.PlayerState) end)
+    pcall(function() isLocal = owner:IsLocalController() == true end)
+    return owner, hasState, isLocal
 end
 
+local function resolveForcedSaveComponent()
+    local cached = nil
+    pcall(function() cached = cachedFirst("MistCheatingComponent") end)
+    local candidates = {}
+    if isLiveObject(cached) then candidates[1] = cached end
+    for _, candidate in ipairs(safeFindAll("MistCheatingComponent")) do
+        candidates[#candidates + 1] = candidate
+    end
+
+    local firstLive, withState, hostOwn, hostOwner = nil, nil, nil, nil
+    for _, candidate in ipairs(candidates) do
+        if isLiveObject(candidate) then
+            local owner, hasState, isLocal = forcedSaveOwner(candidate)
+            local entry = { component = candidate, owner = owner, hasState = hasState, isLocal = isLocal }
+            firstLive = firstLive or entry
+            if isLocal then hostOwner = owner end
+            if hasState then withState = withState or entry end
+            if hasState and isLocal then hostOwn = hostOwn or entry end
+        end
+    end
+    local pick = hostOwn or withState or firstLive
+    if not pick then return nil end
+    pick.hostOwner = hostOwner
+    objCache["MistCheatingComponent"] = pick.component
+    return pick.component, pick
+end
+
+local function forcedSavePickLine(info)
+    local ownerName = "unknown"
+    if info.owner then ownerName = tostring(objFullName(info.owner):match("[^%.:]+$") or "unknown") end
+    local battle = "no_pawn"
+    if info.hostOwner then
+        local pawn = nil
+        pcall(function() pawn = info.hostOwner.Pawn end)
+        if isLiveObject(pawn) then
+            battle = "unknown"
+            pcall(function()
+                local actor = pawn:GetBattleActor()
+                if actor == nil then battle = "no" else battle = isLiveObject(actor) and "yes" or "no" end
+            end)
+        end
+    else
+        battle = "unknown"
+    end
+    return "force-save picked " .. ownerName
+        .. " player_state=" .. (info.hasState and "yes" or "no")
+        .. " host=" .. (info.isLocal and "yes" or "no")
+        .. " host_pawn_battle=" .. battle
+end
+
+-- v0.18.62: runs on the game thread, from the pump (GAME_THREAD_WATCH.saveService below), every 2 s.
+-- Same markers, same save call, same log lines as before; the panel confirms the save by the save
+-- file's write time.
 local function serviceForcedSave()
-    if forceSaveQueued or (t - forceSaveLastCheckT) < 5 then return end
-    forceSaveLastCheckT = t
+    if forceSaveQueued then return end
     local markerFound = false
     for _, markerPath in ipairs(FORCE_SAVE_MARKERS) do
         local marker = io.open(markerPath, "r")
@@ -3731,31 +3924,31 @@ local function serviceForcedSave()
     if not markerFound then return end
 
     log("force-save marker detected for gameplay port " .. tostring(GAME_PORT))
-    local component = resolveForcedSaveComponent()
+    local component, pickInfo = resolveForcedSaveComponent()
     if not component then
-        log("force-save marker pending: MistCheatingComponent unavailable")
+        local nowS = os.time()
+        if nowS - (forceSaveLastCheckT or 0) >= 30 then
+            forceSaveLastCheckT = nowS
+            log("force-save marker pending: MistCheatingComponent unavailable")
+        end
         return
     end
 
     forceSaveQueued = true
-    local queued = executeInGameThreadSafe("force-save", function()
-        log("force-save game-thread callback entered")
-        local ok, err = pcall(function()
-            component:Save(4, "TEMP") -- EMistSaveSlot::Auto
-        end)
-        forceSaveQueued = false
-        if ok then
-            for _, markerPath in ipairs(FORCE_SAVE_MARKERS) do pcall(os.remove, markerPath) end
-            log("force-save requested through MistCheatingComponent slot=Auto name=TEMP")
-        else
-            log("force-save request failed: " .. tostring(err))
-        end
-    end, function() forceSaveQueued = false end)
-    if not queued then
-        forceSaveQueued = false
-        log("force-save request could not be queued")
+    log("force-save game-thread callback entered")
+    log(forcedSavePickLine(pickInfo))
+    local ok, err = pcall(function()
+        component:Save(4, "TEMP") -- EMistSaveSlot::Auto
+    end)
+    forceSaveQueued = false
+    if ok then
+        for _, markerPath in ipairs(FORCE_SAVE_MARKERS) do pcall(os.remove, markerPath) end
+        log("force-save requested through MistCheatingComponent slot=Auto name=TEMP")
+    else
+        log("force-save request failed: " .. tostring(err))
     end
 end
+GAME_THREAD_WATCH.saveService = serviceForcedSave
 
 function GAMEPLAY_SETTINGS.readStatus()
     if not GAMEPLAY_SETTINGS.status or #GAMEPLAY_SETTINGS.status == 0 then return "state=unmanaged" end
@@ -3938,11 +4131,7 @@ loop50.mainLoopBody = function()
                 serviceJoinersErrorLogged = true
                 log("serviceJoiners ERROR (continuing loop): " .. tostring(err))
             end
-            local saveOk, saveErr = pcall(serviceForcedSave)
-            if not saveOk and not forceSaveServiceErrorLogged then
-                forceSaveServiceErrorLogged = true
-                log("force-save service ERROR (request remains pending): " .. tostring(saveErr))
-            end
+            -- v0.18.62: the force-save marker is served by the game-thread pump (serviceForcedSave)
             local settingsOk, settingsErr = pcall(GAMEPLAY_SETTINGS.service)
             if not settingsOk then
                 log("gameplay settings service ERROR: " .. tostring(settingsErr))
@@ -4409,7 +4598,9 @@ sw.resolve = function(fullName)
     local path = sw.pathOf(fullName)
     if not path then return nil end
     local o = nil
+    local t0 = GAME_THREAD_WATCH.inPump and os.clock() or nil
     pcall(function() o = StaticFindObject(path) end)
+    if t0 then GAME_THREAD_WATCH.lookup("path", (os.clock() - t0) * 1000) end
     if sw.valid(o) then return o end
     return nil
 end
@@ -4509,6 +4700,18 @@ sw.placerOf = function(ctx)
     return nil
 end
 -- Post-hook of every wall edit RPC: rebuild when the edit changed the wall.
+-- v0.18.62: after ServerCombineSplines, the wall whose point count grew is the one that stays;
+-- the other was joined into it. Returns survivor, gone, or nil when that cannot be told.
+sw.combineOutcome = function(a1, a2)
+    local pre = sw.combinePre or {}
+    if not (a1 and a2 and sw.isWall(a1) and sw.isWall(a2)) then return nil end
+    local n1, n2 = objFullName(a1), objFullName(a2)
+    if pre[n1] == nil or pre[n2] == nil or n1 == n2 then return nil end
+    local g1, g2 = sw.numPoints(a1) > pre[n1], sw.numPoints(a2) > pre[n2]
+    if g1 and not g2 then return a1, a2 end
+    if g2 and not g1 then return a2, a1 end
+    return nil
+end
 sw.afterWallEdit = function(ctx, actor, why)
     if not sw.wbOn() or not sw.isWall(actor) then return end
     local ev = nil
@@ -4725,6 +4928,11 @@ sw.install = function()
             sw.preVersion = nil
             sw.beforeEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
             sw.beforeEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
+            -- v0.18.62: each wall's point count before the join (the post-hook tells the two apart)
+            sw.combinePre = {}
+            for _, a in ipairs({ sw.swParam(splineActor1), sw.swParam(splineActor2) }) do
+                if a and sw.isWall(a) then sw.combinePre[objFullName(a)] = sw.numPoints(a) end
+            end
             sw.swLog(string.format("#%d ServerCombineSplines owner=%s clientVersions=%s,%s | first %s | second %s",
                 sw.calls, sw.swOwner(ctx), tostring(sw.swParam(splineVersion1)), tostring(sw.swParam(splineVersion2)),
                 sw.swActor(sw.swParam(splineActor1)), sw.swActor(sw.swParam(splineActor2))))
@@ -4734,8 +4942,28 @@ sw.install = function()
             sw.afterEdit(sw.swParam(splineActor1), "ServerCombineSplines first")
             sw.afterEdit(sw.swParam(splineActor2), "ServerCombineSplines second")
         end)
-        pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor1), "walls combined:")
-        pcall(sw.afterWallEdit, ctx, sw.swParam(splineActor2), "walls combined:")
+        -- v0.18.62: the game joins the smaller wall into the bigger one (AddSpline copies its points)
+        -- and destroys it; the destroyed one stays findable until garbage collection. Rebuild only the
+        -- wall that grew, and treat the other like a wall taken down: logged, never scanned or
+        -- rechecked again. If neither or both grew (a rejected join), the old way: look at both.
+        local a1, a2 = sw.swParam(splineActor1), sw.swParam(splineActor2)
+        local survivor, gone = nil, nil
+        pcall(function() survivor, gone = sw.combineOutcome(a1, a2) end)
+        if survivor and gone then
+            pcall(function()
+                local goneName = objFullName(gone)
+                sw.wb.removed[goneName] = true
+                sw.wb.recheck[goneName] = nil
+                sw.wbLog("wall joined into " .. objFullName(survivor):gsub("^.-PersistentLevel%.", "") .. ": "
+                    .. goneName:gsub("^.-PersistentLevel%.", "") .. " (points=" .. tostring(sw.combinePre[goneName])
+                    .. ") is gone, not rebuilt")
+            end)
+            pcall(sw.afterWallEdit, ctx, survivor, "walls combined:")
+        else
+            pcall(sw.afterWallEdit, ctx, a1, "walls combined:")
+            pcall(sw.afterWallEdit, ctx, a2, "walls combined:")
+        end
+        sw.combinePre = nil
     end)
     -- v0.18.61: a player taking a wall down (the game's Disassemble -> RemoveSegment, which on a
     -- 2-point wall destroys the actor without touching its points). Until now nothing logged it,

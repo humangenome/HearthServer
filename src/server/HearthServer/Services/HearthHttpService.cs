@@ -67,6 +67,10 @@ public sealed class HearthHttpService : BackgroundService
     private readonly InstanceIdentityProvider _identity;
     private readonly ChatService _chat;
     private readonly AdminJoinTicketService _adminJoinTickets;
+    private readonly IdentityTokenService? _identityTokens;
+    private readonly ISteamTicketVerifier? _steamTickets;
+    private readonly Dictionary<string, Queue<long>> _identityRequests = new(StringComparer.Ordinal);
+    private readonly object _identityRequestsLock = new();
     private readonly byte[] _authKey;
     private readonly SemaphoreSlim _publicLimiter = new(PublicConcurrentRequests, PublicConcurrentRequests);
     private readonly SemaphoreSlim _signedLimiter = new(SignedConcurrentRequests, SignedConcurrentRequests);
@@ -86,7 +90,9 @@ public sealed class HearthHttpService : BackgroundService
         PipeServerState pipeState,
         InstanceIdentityProvider identity,
         ChatService chat,
-        AdminJoinTicketService adminJoinTickets)
+        AdminJoinTicketService adminJoinTickets,
+        IdentityTokenService? identityTokens = null,
+        ISteamTicketVerifier? steamTickets = null)
     {
         _log = log;
         _opts = opts.Value;
@@ -96,6 +102,8 @@ public sealed class HearthHttpService : BackgroundService
         _identity = identity;
         _chat = chat;
         _adminJoinTickets = adminJoinTickets;
+        _identityTokens = identityTokens;
+        _steamTickets = steamTickets;
         // The HTTP API auth secret is SHA256(RconPassword). Same trust tier
         // as RCON — if the customer has set an RCON password, they already
         // expose admin control of the world. Deriving from RconPassword
@@ -392,6 +400,14 @@ public sealed class HearthHttpService : BackgroundService
             if (method == "GET" && path == "/api/v1/map/state" && !_opts.Map.Enabled)
             {
                 await WriteJsonAsync(res, 404, new { error = "map disabled" });
+                return;
+            }
+
+            if (method == "POST" && path == "/api/v1/identity/token")
+            {
+                // Public: a player has no RCON password. Steam's own ticket check is the proof (the ticket only
+                // validates for the Steam ID that made it, and only while it is fresh), plus a per-address limit.
+                await HandleIdentityTokenAsync(req, res, ct).ConfigureAwait(false);
                 return;
             }
 
@@ -1115,6 +1131,97 @@ public sealed class HearthHttpService : BackgroundService
     private sealed class AdminJoinTicketRequest
     {
         public string SteamId { get; set; } = "";
+    }
+
+    private sealed class IdentityTokenRequest
+    {
+        public string SteamId { get; set; } = "";
+        public string Ticket { get; set; } = "";
+    }
+
+    internal const int IdentityRequestMaxBytes = 16 * 1024;
+
+    /// <summary>POST /api/v1/identity/token {"steam_id","ticket" (hex)} -> {"token","expires_unix"}.</summary>
+    private async Task HandleIdentityTokenAsync(HttpListenerRequest req, HttpListenerResponse res, CancellationToken ct)
+    {
+        if (!_opts.Identity.Enabled || _identityTokens is null || _steamTickets is null)
+        {
+            await WriteJsonAsync(res, 404, new { error = "identity tokens are off on this server" });
+            return;
+        }
+        var address = req.RemoteEndPoint?.Address?.ToString() ?? "?";
+        if (!TakeIdentityRequestSlot(address, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), Math.Max(1, _opts.Identity.MaxTokenRequestsPerMinute)))
+        {
+            res.Headers["Retry-After"] = "60";
+            await WriteJsonAsync(res, 429, new { error = "too many requests" });
+            return;
+        }
+        if (req.ContentLength64 is <= 0 or > IdentityRequestMaxBytes)
+        {
+            await WriteJsonAsync(res, 400, new { error = "a small JSON body is required" });
+            return;
+        }
+        IdentityTokenRequest? body;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(SmallBodyReadTimeout);
+            var buf = new byte[req.ContentLength64];
+            var read = 0;
+            while (read < buf.Length)
+            {
+                var n = await req.InputStream.ReadAsync(buf.AsMemory(read), cts.Token).ConfigureAwait(false);
+                if (n == 0) break;
+                read += n;
+            }
+            body = read == buf.Length
+                ? JsonSerializer.Deserialize<IdentityTokenRequest>(buf, new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+                    PropertyNameCaseInsensitive = true,
+                })
+                : null;
+        }
+        catch (Exception)
+        {
+            body = null;
+        }
+        byte[]? ticket = null;
+        if (body is not null && body.Ticket.Length is > 0 and <= 8192 && body.Ticket.Length % 2 == 0)
+        {
+            try { ticket = Convert.FromHexString(body.Ticket); } catch (FormatException) { ticket = null; }
+        }
+        if (body is null || !IdentityTokenService.IsValidSteam64(body.SteamId) || ticket is null)
+        {
+            await WriteJsonAsync(res, 400, new { error = "valid steam_id and hex ticket required" });
+            return;
+        }
+        var check = await _steamTickets.VerifyAsync(body.SteamId, ticket, ct).ConfigureAwait(false);
+        var tail = body.SteamId[^4..];
+        if (check.Outcome != SteamTicketOutcome.Ok)
+        {
+            _log.LogInformation("Identity: token refused for Steam ...{Tail}: {Detail}", tail, check.Detail);
+            await WriteJsonAsync(res, check.Outcome == SteamTicketOutcome.Unavailable ? 503 : 403,
+                new { error = check.Outcome == SteamTicketOutcome.Unavailable ? "Steam check unavailable, try again" : "Steam did not confirm this ticket" });
+            return;
+        }
+        var (token, expires) = _identityTokens.Issue(body.SteamId);
+        _log.LogInformation("Identity: token issued for Steam ...{Tail}", tail);
+        await WriteJsonAsync(res, 200, new { token, expires_unix = expires });
+    }
+
+    /// <summary>Sliding one-minute window per source address; true when this request may go ahead.</summary>
+    internal bool TakeIdentityRequestSlot(string address, long nowUnix, int perMinute)
+    {
+        lock (_identityRequestsLock)
+        {
+            if (_identityRequests.Count > 4096) _identityRequests.Clear();
+            if (!_identityRequests.TryGetValue(address, out var q)) _identityRequests[address] = q = new Queue<long>();
+            while (q.Count > 0 && q.Peek() <= nowUnix - 60) q.Dequeue();
+            if (q.Count >= perMinute) return false;
+            q.Enqueue(nowUnix);
+            return true;
+        }
     }
 
     private static object SerializeEntry(ModEntry e) => new

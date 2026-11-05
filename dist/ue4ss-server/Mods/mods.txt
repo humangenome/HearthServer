@@ -1,3 +1,5 @@
 bw_host : 1
 bw_fog : 1
 bw_seat4 : 1
+bw_pause : 1
+bw_ident : 1

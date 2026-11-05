@@ -354,5 +354,49 @@ check("a wall the player takes down is logged and never rechecked as a lost one 
     assert(a.onrep == runs and not has(w.logs, "recheck after the game's re%-solve"), "a removed wall was rechecked")
 end)
 
+check("two joined walls: only the wall that grew is rebuilt; the joined-away one is logged and never scanned or rechecked (v0.18.62)", function()
+    local now = 3000000
+    local w = newWorld()
+    local big = wall(w, "WallActor_C_4", 3, 2)
+    local small = wall(w, "WallActor_C_0", 2, 1)
+    local hooks, loops = loadMod(w, { clock = function() return now end,
+        players = { "Player_C /Game/Map.Map:PersistentLevel.Player_C_1" } })
+    for _, l in ipairs(loops) do l() end
+    local h = hooks.ServerCombineSplines
+    h[1](ctxFor(w.player), param(small), param(1), param(false), param(big), param(1))
+    -- the game (ServerCombineSplines -> AddSpline on the wall with more points): the big wall takes the
+    -- small one's points, and the small one is destroyed but stays findable until garbage collection
+    big.points = big.points + small.points
+    big.pieces = big.points - 1
+    big.EditVersion = big.EditVersion + 2
+    small.EditVersion = small.EditVersion + 1
+    small.kids = {}
+    local smallRuns, bigRuns = small.onrep, big.onrep
+    h[2](ctxFor(w.player), param(small), param(1), param(false), param(big))
+    assert(has(w.logs, "wall joined into WallActor_C_4: WallActor_C_0 %(points=2%) is gone, not rebuilt"), "join not logged")
+    assert(small.onrep == smallRuns, "the joined-away wall was rebuilt")
+    assert(big.onrep > bigRuns and #big.kids == big.pieces, "the wall that grew was not rebuilt with its sites")
+    assert(not has(w.logs, "walls combined: [^\n]*WallActor_C_0"), "the joined-away wall got a combined line")
+    -- the next sweep and the rechecks never count the gone wall as one without build sites
+    now = now + 30
+    for _, l in ipairs(loops) do l() end
+    now = now + 30
+    for _, l in ipairs(loops) do l() end
+    assert(small.onrep == smallRuns, "the joined-away wall was rechecked or healed")
+    local scan = has(w.logs, "scan: %d+ walls, %d+ without build sites")
+    assert(scan == nil or scan:find("0 without build sites", 1, true), "the scan counted the gone wall: " .. tostring(scan))
+end)
+
+check("a join the game refuses (neither wall grew) looks at both walls as before", function()
+    local w = newWorld()
+    local a = wall(w, "WallActor_C_7", 3, 2)
+    local b = wall(w, "WallActor_C_8", 2, 1)
+    local hooks = loadMod(w)
+    local h = hooks.ServerCombineSplines
+    h[1](ctxFor(w.player), param(a), param(1), param(false), param(b), param(1))
+    h[2](ctxFor(w.player), param(a), param(1), param(false), param(b))
+    assert(not has(w.logs, "wall joined into"), "a refused join was read as a join")
+end)
+
 os.remove(saveFile); os.remove(saveFile .. ".wallheal.bak"); os.remove(logFile); os.remove(tmpdir)
 print("Passed " .. passed .. " wall build-site checks (mocked engine; retail validation still required).")
