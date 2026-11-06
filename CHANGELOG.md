@@ -9,6 +9,16 @@ kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 - Join password: set JoinPassword in HearthServer\appsettings.json and only players who enter it can join. Hearth asks each player for it when they connect; a player without it is turned away before the game makes a character for them. Takes effect at the next start.
 - HearthAuthPassword from the old sample settings now counts as JoinPassword. Before, setting it could stop the game a few minutes after start.
 
+### Client
+
+#### Changed
+
+- If a server refuses your join password, Hearth forgets it and asks you again the next time you press Connect.
+
+#### Fixed
+
+- Hearth uses much less processor time while it waits in the background or in the tray.
+
 ## [0.1.97] - 2026-11-05
 
 - Characters follow each player's Steam account, checked with Steam on every join.
