@@ -13,11 +13,13 @@ kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 #### Changed
 
 - Hearth now runs on .NET 10. It updates in place: same install folder, server list and settings.
+- If a server refuses your join password, Hearth forgets it and asks you again the next time you press Connect.
 
 #### Fixed
 
 - A Windows user name with an accent, a non-Latin letter, ! or % no longer makes Hearth close and not come back when it updates. The update that brings this fix still uses the old update step, so if Hearth closes and does not reopen, run the latest installer once. Updates after this one work on their own.
 - A failed update waits 6 hours before it tries again, and the restart for an update no longer ends a Connect that is under way.
+- Hearth uses much less processor time while it waits in the background or in the tray.
 
 ## [0.1.98] - 2026-11-05
 
