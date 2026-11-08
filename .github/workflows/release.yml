@@ -84,8 +84,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
 
@@ -115,7 +115,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart('v')
-          $publish = "src/server/HearthServer/bin/Release/net8.0/win-x64/publish"
+          $publish = "src/server/HearthServer/bin/Release/net10.0/win-x64/publish"
           $exe = [Diagnostics.FileVersionInfo]::GetVersionInfo("$publish/HearthServer.exe")
           if ($exe.FileVersion -ne "$version.0" -or -not $exe.ProductVersion.StartsWith($version)) {
             throw "tag $version does not match HearthServer.exe FileVersion=$($exe.FileVersion), ProductVersion=$($exe.ProductVersion)"
@@ -126,7 +126,7 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $publish = "src/server/HearthServer/bin/Release/net8.0/win-x64/publish"
+          $publish = "src/server/HearthServer/bin/Release/net10.0/win-x64/publish"
           if (-not (Test-Path "$publish/HearthServer.exe")) { throw "server publish missing at $publish" }
           $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
           if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
