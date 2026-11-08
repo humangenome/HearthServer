@@ -4,6 +4,21 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.99] - 2026-11-08
+
+- Joining a world with many Travel Signs no longer freezes it for seconds. On a world with 43 signs the longest pause fell from 6 seconds to under half a second.
+
+### Client
+
+#### Changed
+
+- Hearth now runs on .NET 10. It updates in place: same install folder, server list and settings.
+
+#### Fixed
+
+- A Windows user name with an accent, a non-Latin letter, ! or % no longer makes Hearth close and not come back when it updates. The update that brings this fix still uses the old update step, so if Hearth closes and does not reopen, run the latest installer once. Updates after this one work on their own.
+- A failed update waits 6 hours before it tries again, and the restart for an update no longer ends a Connect that is under way.
+
 ## [0.1.98] - 2026-11-05
 
 - Join password: set JoinPassword in HearthServer\appsettings.json and only players who enter it can join. Hearth asks each player for it when they connect; a player without it is turned away before the game makes a character for them. Takes effect at the next start.
