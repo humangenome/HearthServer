@@ -1,13 +1,10 @@
 <Project>
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!-- Lets the pin below reach a package that only comes in through another one. -->
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Hosting -->
-    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
-    <PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
-
     <!-- Logging -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
     <PackageVersion Include="Serilog" Version="4.0.0" />
@@ -24,11 +21,8 @@
     <PackageVersion Include="MessagePackAnalyzer" Version="3.1.9" />
 
     <!-- Persistence -->
-    <PackageVersion Include="Microsoft.Data.Sqlite" Version="8.0.0" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.13" />
     <PackageVersion Include="Dapper" Version="2.1.35" />
-
-    <!-- Web (local admin API only, loopback) -->
-    <PackageVersion Include="Microsoft.AspNetCore.App.Ref" Version="8.0.0" />
 
     <!-- CLI -->
     <PackageVersion Include="Spectre.Console" Version="0.49.1" />
@@ -39,6 +33,9 @@
     <PackageVersion Include="Avalonia.Desktop" Version="11.3.22" />
     <PackageVersion Include="Avalonia.Themes.Fluent" Version="11.3.22" />
     <PackageVersion Include="Avalonia.Fonts.Inter" Version="11.3.22" />
+    <!-- Older Avalonia brought Tmds.DBus.Protocol 0.20.0 (GHSA-xrw6-gwf8-vvr9), and the .NET 10 SDK fails the build
+         on a vulnerable package that comes in that way. Pinned to a fixed version (transitive pinning is on). -->
+    <PackageVersion Include="Tmds.DBus.Protocol" Version="0.21.3" />
 
     <!-- Auto-update manifest signing (ed25519). Pure-managed, no native deps,
          no licensing friction. We only use the Ed25519Signer + Ed25519PublicKeyParameters

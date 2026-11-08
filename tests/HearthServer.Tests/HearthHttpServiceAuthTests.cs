@@ -14,6 +14,8 @@ namespace HearthServer.Tests;
 // Runs the real HTTP service on a loopback port and talks to it the way a
 // remote caller would: raw sockets for requests whose body never arrives, an
 // HttpClient for everything else.
+// Shares the upload temp folder with the lockout tests, so the two never run at the same time.
+[Collection("SourceGuard")]
 public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
 {
     private const string Password = "test-admin-password";

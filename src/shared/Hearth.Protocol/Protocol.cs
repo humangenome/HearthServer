@@ -4,7 +4,7 @@ namespace Hearth.Protocol;
 
 /// <summary>
 /// Wire protocol between Hearth.dll (UE4SS plugin loaded into the Bellwright
-/// process) and HearthServer.exe (.NET 8 supervisor). Bumped on any
+/// process) and HearthServer.exe (.NET 10 supervisor). Bumped on any
 /// breaking schema change.
 /// </summary>
 public static class ProtocolVersion

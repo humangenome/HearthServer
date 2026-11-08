@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Hearth.Rcon;
 using HearthServer.Configuration;
 using HearthServer.Static;
 using Microsoft.Extensions.Configuration;
@@ -71,6 +72,14 @@ public sealed class HearthHttpService : BackgroundService
     private readonly ISteamTicketVerifier? _steamTickets;
     private readonly Dictionary<string, Queue<long>> _identityRequests = new(StringComparer.Ordinal);
     private readonly object _identityRequestsLock = new();
+    // The identity rate table makes room at IdentityTableLimit (see MakeIdentityRoom). It grows past
+    // that only while every address in it is at its limit, and never past IdentityTableCeiling.
+    private const int IdentityTableLimit = 4096;
+    private const int IdentityTableCeiling = 65536;
+    private const int IdentityRoomBatch = IdentityTableLimit / 16;
+    private int _identityLookAgainAt = IdentityTableLimit;
+    private long _identityLookAgainUnix = long.MaxValue;
+    private bool _identityAllLimitedNoted;
     private readonly byte[] _authKey;
     private readonly SemaphoreSlim _publicLimiter = new(PublicConcurrentRequests, PublicConcurrentRequests);
     private readonly SemaphoreSlim _signedLimiter = new(SignedConcurrentRequests, SignedConcurrentRequests);
@@ -419,6 +428,13 @@ public sealed class HearthHttpService : BackgroundService
             if (auth.Body is null)
             {
                 if (auth.Status == 0) return; // connection already aborted
+                if (auth.Status == 429)
+                {
+                    // Turned away before the body was read: close rather than drain it.
+                    res.KeepAlive = false;
+                    res.Headers["Retry-After"] = Math.Max(1, SourceGuard.BlockedSeconds(
+                        SourceGuard.SourceOf(req.RemoteEndPoint), SourceGuard.NowMs())).ToString();
+                }
                 await WriteJsonAsync(res, auth.Status, new { error = auth.Error });
                 return;
             }
@@ -749,6 +765,13 @@ public sealed class HearthHttpService : BackgroundService
     private async Task<AuthOutcome> AuthorizeAndReadBodyAsync(HttpListenerContext ctx, CancellationToken ct)
     {
         var req = ctx.Request;
+
+        // An address turned away for wrong signatures (or wrong RCON passwords: the count is shared,
+        // it is the same password) is refused here, before a single body byte is read.
+        var source = SourceGuard.SourceOf(req.RemoteEndPoint);
+        var blocked = SourceGuard.BlockedSeconds(source, SourceGuard.NowMs());
+        if (blocked > 0) return AuthOutcome.Fail(429, $"too many wrong signatures from this address; try again in {blocked} s");
+
         var tsHeader = req.Headers["X-Hearth-Timestamp"];
         var sigHeader = req.Headers["X-Hearth-Signature"];
         if (string.IsNullOrWhiteSpace(tsHeader) || string.IsNullOrWhiteSpace(sigHeader))
@@ -782,8 +805,13 @@ public sealed class HearthHttpService : BackgroundService
         if (length > SmallBodyMaxBytes)
         {
             if (declared is null) return AuthOutcome.Fail(428, UpdateAppMessage);
-            if (!SignatureMatches(method, path, ts, declared, sigHeader) || !TryConsumeSignature(sigHeader, ts, now))
+            if (!SignatureMatches(method, path, ts, declared, sigHeader))
+            {
+                WrongSignature(source, sigHeader);
                 return AuthOutcome.Fail(401, "unauthorized");
+            }
+            if (!TryConsumeSignature(sigHeader, ts, now)) return AuthOutcome.Fail(401, "unauthorized");
+            SourceGuard.Success(source);
             if (!await _uploadLimiter.WaitAsync(0).ConfigureAwait(false))
                 return AuthOutcome.Fail(503, UploadBusyMessage);
             try
@@ -840,10 +868,31 @@ public sealed class HearthHttpService : BackgroundService
         var sha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         if (declared is not null && !string.Equals(declared, sha, StringComparison.Ordinal))
             return AuthOutcome.Fail(401, "unauthorized");
-        if (!SignatureMatches(method, path, ts, sha, sigHeader) || !TryConsumeSignature(sigHeader, ts, now))
+        if (!SignatureMatches(method, path, ts, sha, sigHeader))
+        {
+            WrongSignature(source, sigHeader);
             return AuthOutcome.Fail(401, "unauthorized");
+        }
+        if (!TryConsumeSignature(sigHeader, ts, now)) return AuthOutcome.Fail(401, "unauthorized");
+        SourceGuard.Success(source);
 
         return new AuthOutcome(await WriteTempBodyAsync(bytes, sha, ct).ConfigureAwait(false), 200, "");
+    }
+
+    /// <summary>
+    /// Counts a guess at the key: a well-formed signature (64 hex characters) with a fresh timestamp
+    /// that does not match. Callers reach here only after the timestamp check, so a stale timestamp
+    /// (a clock problem) never counts; neither do missing or malformed headers, a replay (two
+    /// identical signed requests inside one second share a signature), or a body that does not
+    /// match a correctly signed hash (whoever signed it holds the key). Five in ten minutes turn
+    /// the address away; the block is logged once, never with the signature.
+    /// </summary>
+    private void WrongSignature(string source, string sigHeader)
+    {
+        if (!IsSha256Hex(sigHeader.ToLowerInvariant())) return;
+        if (SourceGuard.Failure(source, SourceGuard.NowMs()))
+            _log.LogWarning("{BlockLine}", SourceGuard.BlockLine("http", source, SourceGuard.NowMs()));
+        if (SourceGuard.TakeNotice() is { } tableNotice) _log.LogWarning("{Notice}", tableNotice);
     }
 
     private static string NewTempUploadPath()
@@ -1213,15 +1262,89 @@ public sealed class HearthHttpService : BackgroundService
     /// <summary>Sliding one-minute window per source address; true when this request may go ahead.</summary>
     internal bool TakeIdentityRequestSlot(string address, long nowUnix, int perMinute)
     {
+        string? notice = null;
+        bool allowed;
         lock (_identityRequestsLock)
         {
-            if (_identityRequests.Count > 4096) _identityRequests.Clear();
-            if (!_identityRequests.TryGetValue(address, out var q)) _identityRequests[address] = q = new Queue<long>();
+            if (!_identityRequests.TryGetValue(address, out var q))
+            {
+                if (_identityRequests.Count >= IdentityTableLimit &&
+                    (_identityRequests.Count >= _identityLookAgainAt || nowUnix >= _identityLookAgainUnix))
+                    notice = MakeIdentityRoom(nowUnix, perMinute);
+                _identityRequests[address] = q = new Queue<long>();
+            }
             while (q.Count > 0 && q.Peek() <= nowUnix - 60) q.Dequeue();
-            if (q.Count >= perMinute) return false;
-            q.Enqueue(nowUnix);
-            return true;
+            allowed = q.Count < perMinute;
+            if (allowed) q.Enqueue(nowUnix);
         }
+        if (notice is not null) _log.LogWarning("{Notice}", notice);
+        return allowed;
+    }
+
+    /// <summary>
+    /// Makes room in a full identity rate table for a new address. First go the addresses with no
+    /// request in the last minute, then the longest-quiet addresses under their limit, a batch at a
+    /// time. An address at its limit is never dropped to make room: when every address left is at its
+    /// limit, the table keeps them all and grows (one log line, no addresses), up to the ceiling. Only
+    /// there does the limit nearest to running out make way. Returns the line to log, once.
+    /// </summary>
+    private string? MakeIdentityRoom(long nowUnix, int perMinute)
+    {
+        var quiet = new List<string>();
+        var open = new List<KeyValuePair<string, long>>();
+        string? soonest = null;
+        var soonestEase = long.MaxValue;
+        foreach (var (key, q) in _identityRequests)
+        {
+            while (q.Count > 0 && q.Peek() <= nowUnix - 60) q.Dequeue();
+            if (q.Count == 0) quiet.Add(key);
+            else if (q.Count >= perMinute)
+            {
+                var ease = q.Peek() + 60;
+                if (ease < soonestEase)
+                {
+                    soonestEase = ease;
+                    soonest = key;
+                }
+            }
+            else open.Add(new KeyValuePair<string, long>(key, q.Last()));
+        }
+        foreach (var key in quiet) _identityRequests.Remove(key);
+
+        var excess = _identityRequests.Count - (IdentityTableLimit - IdentityRoomBatch);
+        if (excess > 0 && open.Count > 0)
+        {
+            open.Sort((a, b) => a.Value.CompareTo(b.Value));
+            for (var i = 0; i < excess && i < open.Count; i++) _identityRequests.Remove(open[i].Key);
+        }
+
+        if (_identityRequests.Count < IdentityTableLimit)
+        {
+            _identityLookAgainAt = IdentityTableLimit;
+            _identityLookAgainUnix = long.MaxValue;
+            _identityAllLimitedNoted = false;
+            return null;
+        }
+
+        // Every address left is at its limit.
+        string? notice = null;
+        if (!_identityAllLimitedNoted)
+        {
+            _identityAllLimitedNoted = true;
+            notice = $"identity rate table full: all {_identityRequests.Count} tracked addresses are at their limit; " +
+                     $"every limit is kept (up to {IdentityTableCeiling})";
+        }
+        if (_identityRequests.Count >= IdentityTableCeiling && soonest is not null)
+        {
+            _identityRequests.Remove(soonest);
+            _identityLookAgainAt = IdentityTableCeiling;
+        }
+        else
+        {
+            _identityLookAgainAt = Math.Min(IdentityTableCeiling, _identityRequests.Count + IdentityRoomBatch);
+        }
+        _identityLookAgainUnix = soonestEase;
+        return notice;
     }
 
     private static object SerializeEntry(ModEntry e) => new

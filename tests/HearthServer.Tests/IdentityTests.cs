@@ -287,6 +287,106 @@ public sealed class IdentityTests : IDisposable
         }
     }
 
+    // The identity route's per-address rate table: 4096 addresses before it makes room, 65536 at most.
+    // An address at its limit is turned away for the rest of its minute, and a flood of new addresses
+    // must not lift that.
+    private const int IdentityTableLimit = 4096;
+    private const int IdentityTableCeiling = 65536;
+
+    private static string Addr(int i) => $"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}";
+
+    private HearthHttpService NewIdleService(Microsoft.Extensions.Logging.ILogger<HearthHttpService>? log = null)
+    {
+        var opts = new HearthServerOptions
+        {
+            HttpPort = 0,
+            RconPassword = "test-admin-password",
+            HmacKeyPath = Path.Combine(_root, "hmac.key"),
+            AdminJoinTicketPath = Path.Combine(_root, "tickets.tsv"),
+            SaveDir = Path.Combine(_root, "saves"),
+            GamePidFile = "",
+        };
+        Directory.CreateDirectory(opts.SaveDir);
+        var o = Options.Create(opts);
+        var pipe = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var saves = new SaveOrchestratorService(NullLogger<SaveOrchestratorService>.Instance, o, pipe,
+            new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
+            new SaveProtectionService(NullLogger<SaveProtectionService>.Instance, o));
+        return new HearthHttpService(log ?? NullLogger<HearthHttpService>.Instance, o, new ConfigurationBuilder().Build(),
+            saves, pipe, new InstanceIdentityProvider(o),
+            new ChatService(NullLogger<ChatService>.Instance, new StaticMonitor(opts)),
+            new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance));
+    }
+
+    private static int IdentityTracked(HearthHttpService http)
+    {
+        var field = typeof(HearthHttpService).GetField("_identityRequests",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return ((System.Collections.ICollection)field.GetValue(http)!).Count;
+    }
+
+    [Fact]
+    public void A_flood_of_new_addresses_never_lifts_an_identity_rate_limit()
+    {
+        var http = NewIdleService();
+        const long t = 1_800_000_000;
+        const string busy = "203.0.113.77";
+        for (var i = 0; i < 4; i++) http.TakeIdentityRequestSlot(busy, t, 4).Should().BeTrue();
+        http.TakeIdentityRequestSlot(busy, t, 4).Should().BeFalse();
+
+        for (var i = 0; i < IdentityTableLimit * 3; i++) http.TakeIdentityRequestSlot(Addr(i), t, 4);
+
+        http.TakeIdentityRequestSlot(busy, t + 1, 4).Should().BeFalse("requests from many new addresses must not lift a limit");
+        IdentityTracked(http).Should().BeLessThanOrEqualTo(IdentityTableLimit, "addresses under their limit make room");
+    }
+
+    [Fact]
+    public void The_longest_quiet_identity_addresses_under_their_limit_make_room_first()
+    {
+        var http = NewIdleService();
+        const long t = 1_800_000_000;
+        const string busy = "203.0.113.77";
+        for (var i = 0; i < IdentityTableLimit - 1; i++) http.TakeIdentityRequestSlot(Addr(i), t, 4);
+        for (var i = 0; i < 3; i++) http.TakeIdentityRequestSlot(busy, t + 5, 4).Should().BeTrue();
+
+        http.TakeIdentityRequestSlot(Addr(IdentityTableLimit), t + 6, 4);
+        http.TakeIdentityRequestSlot(busy, t + 7, 4).Should().BeTrue();
+        http.TakeIdentityRequestSlot(busy, t + 7, 4).Should().BeFalse("the newest caller keeps its count; the oldest rows go");
+    }
+
+    [Fact]
+    public void A_table_full_of_limited_addresses_keeps_them_until_the_ceiling_then_drops_the_one_nearest_to_running_out()
+    {
+        var http = NewIdleService();
+        const long t = 1_800_000_000;
+        const string first = "203.0.113.77";
+        http.TakeIdentityRequestSlot(first, t, 1).Should().BeTrue();
+        for (var i = 0; i < IdentityTableCeiling - 1; i++) http.TakeIdentityRequestSlot(Addr(i), t + 10, 1);
+
+        IdentityTracked(http).Should().Be(IdentityTableCeiling, "every limited address is kept while the table grows");
+        http.TakeIdentityRequestSlot(first, t + 20, 1).Should().BeFalse();
+        http.TakeIdentityRequestSlot(Addr(0), t + 20, 1).Should().BeFalse();
+        http.TakeIdentityRequestSlot(Addr(IdentityTableCeiling - 2), t + 20, 1).Should().BeFalse();
+
+        http.TakeIdentityRequestSlot("198.51.100.9", t + 20, 1).Should().BeTrue();
+        IdentityTracked(http).Should().Be(IdentityTableCeiling, "the table never grows past its ceiling");
+        http.TakeIdentityRequestSlot(first, t + 20, 1).Should().BeTrue("at the ceiling the limit nearest to running out makes way");
+        IdentityTracked(http).Should().Be(IdentityTableCeiling);
+    }
+
+    [Fact]
+    public void A_table_full_of_limited_addresses_logs_one_line_with_no_address_in_it()
+    {
+        var log = new ListLogger<HearthHttpService>();
+        var http = NewIdleService(log);
+        const long t = 1_800_000_000;
+        for (var i = 0; i < IdentityTableLimit + 600; i++) http.TakeIdentityRequestSlot(Addr(i), t, 1);
+
+        log.Entries.Where(e => e.Text.StartsWith("identity rate table full", StringComparison.Ordinal))
+            .Select(e => e.Text).Should().Equal(
+                "identity rate table full: all 4096 tracked addresses are at their limit; every limit is kept (up to 65536)");
+    }
+
     private sealed class FakeVerifier : ISteamTicketVerifier
     {
         public SteamTicketResult Next { get; set; } = new(SteamTicketOutcome.Unavailable, "unset");
