@@ -4,6 +4,24 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.100] - 2026-11-13
+
+### Client
+
+#### Changed
+
+- Windows Defender could flag Hearth as a threat and remove it when Hearth started Bellwright for a join. Hearth now loads its join mod the way UE4SS's own install guide describes, with a file next to the game, and no longer reaches into the running game.
+- Hearth's join files are in your Bellwright folder only while you play on a Hearth server. When the game closes, Hearth takes them out again, so Bellwright started from Steam is the plain game.
+- Before every launch, Hearth checks its files in your game folder against the copies it shipped. If any were changed, it does not start the game and tells you which.
+- If your Bellwright folder already has your own UE4SS, Hearth leaves it alone and tells you what to move before you join.
+- If a Bellwright update ever changes how the game starts so that Hearth cannot load its join mod, Hearth tells you so and changes nothing in your game folder.
+- Older versions also started a second Hearth mod in your game that was meant to be switched off. It made Hearth's own settings folder with a Windows command, loaded one file of its own, and in a world it rebuilt your character's head if the game showed your character without one. It no longer starts. It sent nothing anywhere.
+
+#### Fixed
+
+- When Windows Security blocks an update download, Hearth now says so instead of "connection reset".
+- If Windows Security removed Hearth from your PC, install it again from your panel to get this version.
+
 ## [0.1.99] - 2026-11-08
 
 - Joining a world with many Travel Signs no longer freezes it for seconds. On a world with 43 signs the longest pause fell from 6 seconds to under half a second.
