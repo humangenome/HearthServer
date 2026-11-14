@@ -18,9 +18,10 @@ Cores are pinned independently:
 |------|-----------------|--------|-----------|
 | `client/UE4SS.dll` | `c8627a…` | shipped in launcher v0.1.37 | proven to load + run the client mods on players' fresh PCs |
 | `server/UE4SS.dll` | `2ad348…` | official `UE4SS_v3.0.1-1011-gb50986bd.zip` | includes safe invalid-field userdata and `IsValidField`; required by `bw_host` optional UObject probes |
+| `client/dwmapi.dll` | `8afd61…` | upstream RE-UE4SS `dwmapi.dll` proxy (the same file `HumanGenome/SundialServer` pins) | UE4SS's documented loader (https://docs.ue4ss.com/installation-guide.html); it loads `Win64\ue4ss\UE4SS.dll`. Bellwright imports `dwmapi.dll` itself, and the proxy forwards those calls to the system copy. |
 
 Full pins live in `.github/workflows/release.yml` (`UE4SS_CLIENT_SHA256` /
-`UE4SS_SERVER_SHA256`). The release build fails hard if a vendored DLL's hash
+`UE4SS_SERVER_SHA256` / `UE4SS_CLIENT_PROXY_SHA256`). The release build fails hard if a vendored DLL's hash
 doesn't match its pin.
 
 ## Moving a pin
