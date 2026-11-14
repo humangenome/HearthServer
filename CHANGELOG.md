@@ -4,6 +4,16 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.101] - 2026-11-14
+
+- Server backup fixes.
+
+### Client
+
+#### Removed
+
+- Hearth no longer includes the switched-off second mod.
+
 ## [0.1.100] - 2026-11-13
 
 ### Client
