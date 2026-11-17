@@ -6,13 +6,13 @@ kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 
 ## [0.1.101] - 2026-11-14
 
-- Server backup fixes.
+- Server backups now skip linked folders, so a backup only holds files from the server's own save folder. If you host your own server, update to 0.1.101.
 
 ### Client
 
 #### Removed
 
-- Hearth no longer includes the switched-off second mod.
+- Hearth no longer includes the second mod that older versions started by mistake. The next time you connect, Hearth removes the copy an older version left in your Bellwright folder, but only if it is exactly the copy Hearth put there, and never while the game is running.
 
 ## [0.1.100] - 2026-11-13
 
