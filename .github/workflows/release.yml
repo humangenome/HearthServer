@@ -55,7 +55,7 @@ jobs:
           {
             printf '%s\n' "$notes"
             printf '\n## Downloads\n\n'
-            printf '%s\n' "- \`HearthServer-Host-Windows-x64-$tag.zip\`: the complete host package (the supervisor, the UE4SS runtime with the \`bw_host\`, \`bw_fog\` and \`bw_seat4\` mods and their signature packs and native helpers, the Engine.ini templates and \`host-instance.ps1\`). Extract it, point the script at a Bellwright install, and you have a joinable server. See the repository README."
+            printf '%s\n' "- \`HearthServer-Host-Windows-x64-$tag.zip\`: the complete server download. Extract it, point \`host-instance.ps1\` at a Bellwright install, and players can join. Setup: see the README."
             printf '%s\n' "- \`HearthServer-Supervisor-Windows-x64-$tag.zip\`: the supervisor alone (\`HearthServer.exe\`, its .NET runtime and \`HearthSaveGuard.exe\`), for anyone who already runs the host runtime and only wants RCON, server query and the admin API."
             printf '\n---\n\n'
             printf 'Hosting: [SurvivalServers.com](%s) runs Hearth for you.\n' "$url"

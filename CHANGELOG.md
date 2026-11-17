@@ -21,7 +21,7 @@ kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 #### Changed
 
 - Windows Defender could flag Hearth as a threat and remove it when Hearth started Bellwright for a join. Hearth now loads its join mod the way UE4SS's own install guide describes, with a file next to the game, and no longer reaches into the running game.
-- Hearth's join files are in your Bellwright folder only while you play on a Hearth server. When the game closes, Hearth takes them out again, so Bellwright started from Steam is the plain game.
+- Hearth's join files are in your Bellwright folder only while you play on a Hearth server. When the game closes, Hearth takes them out again, so Bellwright started from Steam is the normal game.
 - Before every launch, Hearth checks its files in your game folder against the copies it shipped. If any were changed, it does not start the game and tells you which.
 - If your Bellwright folder already has your own UE4SS, Hearth leaves it alone and tells you what to move before you join.
 - If a Bellwright update ever changes how the game starts so that Hearth cannot load its join mod, Hearth tells you so and changes nothing in your game folder.
