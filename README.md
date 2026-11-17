@@ -11,30 +11,29 @@
 
 # HearthServer
 
-[Bellwright](https://store.steampowered.com/app/1812450/) has no dedicated server. Its multiplayer is co-op for up to four people, hosted from one player's copy of the game. HearthServer adds a Bellwright dedicated server: it runs the game headless on a Windows machine with a public IP and port, and players join it by address through the [Hearth app](https://github.com/HumanGenome/Hearth). This repo is for the person running the server; players only need the app.
+[Bellwright](https://store.steampowered.com/app/1812450/) has no dedicated server. Its multiplayer is co-op for up to four people, hosted from one player's copy of the game. HearthServer adds a Bellwright dedicated server. Players join it by IP with the [Hearth app](https://github.com/HumanGenome/Hearth).
 
-This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog`, `bw_seat4`, `bw_pause`, `bw_ident`), their native helpers, the signature packs and the launch script. The player app is closed source.
+This repo is the whole server side. The player app is closed source.
 
 ## What it does
 
-- Runs Bellwright with no GPU, no screen and no Steam login, and takes direct connections on a UDP port
-- A fourth player place: the game counts its own host as one of its four places and sends world data to only three joiners; the host package frees the hidden host's place and sends a fourth player that data
-- Ties each character to the player's Steam account, checked with Steam on every join, so a player can change PCs and keep their character; leaves a player who drops to the game's own rejoin handling instead of freezing their character
-- Protects the world on disk: every autosave is checked, a player record the game drops while that player is offline is put back, a save rotation that slides back to a starter world is repaired before launch, and a save left as zeros by a power loss is replaced by the newest intact copy
-- Applies the game's 21 gameplay settings (raids, spoilage, damage, village needs and the rest) from a text file through the game's own setters, because the in-game menu cannot save them on a dedicated host
-- Pauses the world while nobody is online, after saving it, and lets it run again the moment a player joins; set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json` to keep the world running
-- Writes each player's map exploration into the world, which the game only does on a machine that renders, and keeps Travel Signs linked
-- Build-locked crash guards for the current Bellwright build (quest rewards, map icons, harvesting, roads, the build menu, crafting, dialogue, villager tools), applied at launch and checked byte for byte
-- Source RCON for the server status, the player list, a save on request and world snapshots; snapshot download and restore over a signed HTTP API
-- Answers Source server query, so server lists, monitors and bots see the name, map and player count
-- A list of world snapshots and an audit log of snapshot and restore actions, kept in SQLite across restarts
-- A supervisor that relaunches the game if it crashes, and `-Stop` / `-Restart` switches that ask the game to save first
+- Runs Bellwright with no graphics card, no screen and no Steam login. Players join by IP
+- Up to 4 players. On a server, the game keeps one of its four places for a hidden host. HearthServer gives that place to a fourth player
+- Ties each character to the player's Steam account, so a player can change PCs and keep their character. A player who drops rejoins the game's normal way, so their character isn't stuck
+- Checks every autosave: puts back a character the game loses while its player is offline, repairs a save that went back to a starter world, and replaces a save damaged by a power cut with the newest good copy
+- Sets the game's 21 gameplay settings (raids, spoilage, damage, village needs and the rest) from a text file on the server
+- Pauses the world while nobody is online, after saving it, and runs again the moment a player joins
+- Saves each player's explored map and keeps Travel Signs linked
+- Stops crashes a server hits in quest rewards, map icons, harvesting, roads, the build menu, crafting, dialogue and villager tools
+- Server console (RCON): status, the player list, a save on request and world backups. Backups download and restore through the admin API
+- Shows up in server lists: monitoring tools and Discord bots see the name, map and player count
+- Keeps a list of world backups and a log of every backup and restore, across restarts
+- Crash restarts: starts Bellwright again if it crashes. `-Stop` and `-Restart` save the world first
 
 ## What it does not do
 
-- **It does not ship Bellwright.** You install the game files yourself from a Steam account that owns the game.
-- **It does not replace the player's game.** Everyone joining runs retail Bellwright with the Hearth app on top. Stock Bellwright cannot connect to a Hearth server.
-- **It does not follow a game update by itself.** Bellwright pins its engine internals per Steam build, so the signature packs, the native patches and the gameplay-settings helper are re-derived for each game patch. After a patch, wait for the next release before hosting.
+- **Every player needs the Hearth app to join.** It runs on top of their normal copy of Bellwright.
+- **After a Bellwright update, wait for a new HearthServer release.** Each game version needs its own HearthServer release.
 
 ## Requirements
 
@@ -43,7 +42,7 @@ This is the whole server side: the supervisor, the host mods (`bw_host`, `bw_fog
 | OS | Windows 10 version 1909 or newer, Windows 11, or Windows Server 2022. Windows Server 2019 is not supported (Bellwright needs Windows build 18363 or newer) |
 | Game files | A Bellwright installation on the host from your own Steam copy (about 23 GB) |
 | Ports | One UDP port for gameplay and one for server query, two TCP ports for RCON and the admin API |
-| Hardware | No GPU. Plan on 3 to 4 GB of RAM and one to two CPU cores per server |
+| Hardware | No graphics card. Plan on 3 to 4 GB of memory and 1 to 2 CPU cores per server |
 | Steam check | steamclient64.dll, tier0_s64.dll and vstdlib_s64.dll from Valve's Steamworks redistributable (SteamCMD: +login anonymous +app_update 1007), folder set in appsettings.json under Identity:SteamClientPath. Without them, characters stay tied to the PC. |
 
 ## Ports
@@ -62,7 +61,7 @@ Open the two UDP ports on the host firewall and forward them if the server sits 
 1. **Install Bellwright on the host.** Use SteamCMD with an account that owns the game (`+login <account> +app_update 1812450 validate`), or copy the `Bellwright` folder from your own Steam library. The game files are never modified.
 2. **Download `HearthServer-Host-Windows-x64-<version>.zip`** from the [latest release](https://github.com/HumanGenome/HearthServer/releases/latest) and extract it outside the game folder, for example `D:\HearthHost`.
 3. **Edit `HearthServer\appsettings.json`.** Set `ServerName`, `RconPassword`, `MaxPlayers` (up to 4) and the ports. Leave `GameInstallRoot` empty; the launch script owns the game process.
-4. **Start it** from an elevated PowerShell (elevation lets the script add the firewall rules; otherwise add them yourself):
+4. **Start it** from PowerShell run as administrator, so the script can add the firewall rules (or add them yourself):
 
    ```powershell
    Set-ExecutionPolicy -Scope Process Bypass
@@ -70,9 +69,9 @@ Open the two UDP ports on the host firewall and forward them if the server sits 
    ```
 
    The first boot takes a minute or two. The script logs to `Logs\host.log` and prints `Bellwright host UP` once the gameplay port is bound.
-5. **Hand players the address** as `ip:port`. They add it in the Hearth app and press Connect.
+5. **Give players the address** as `ip:port`. They add it in the Hearth app and press **Connect**.
 
-`.\host-instance.ps1 -Stop` asks the game to save, then stops everything; `-Restart` does the same for the game alone and keeps the supervisor up. Gameplay settings live in `HearthServer\data\gameplay-settings.cfg`: a template is written on the first start, and `managed=1` makes the server enforce it. RCON, worlds, snapshots and admin details are in [docs/ADMIN.md](docs/ADMIN.md).
+`.\host-instance.ps1 -Stop` saves the world, then stops everything. `-Restart` does the same for the game alone. Gameplay settings live in `HearthServer\data\gameplay-settings.cfg`: a template is written on the first start, and `managed=1` makes the server use it. To keep the world running with nobody online, set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json`. Console commands, worlds, backups and admin details are in [docs/ADMIN.md](docs/ADMIN.md).
 
 Several servers on one machine: give each its own package folder and gameplay port (7777, 7877, 7977 and so on) and pass `-CoresPerInstance 2` so each one runs on its own cores.
 
@@ -113,16 +112,16 @@ tests/                               .NET suites and the host-mod checks
 
 ## Releases
 
-- `HearthServer-Host-Windows-x64-<version>.zip` is the complete host package described above. This is the one to download.
+- `HearthServer-Host-Windows-x64-<version>.zip` is the complete server download. This is the one you want.
 - `HearthServer-Supervisor-Windows-x64-<version>.zip` is the supervisor alone (`HearthServer.exe`, its .NET runtime and `HearthSaveGuard.exe`) for anyone who already runs the host runtime.
 
-Neither archive contains Bellwright. The player app is published on [HumanGenome/Hearth](https://github.com/HumanGenome/Hearth).
+The player app is on [HumanGenome/Hearth](https://github.com/HumanGenome/Hearth).
 
 ## Hosting
 
 [SurvivalServers.com](https://www.survivalservers.com/services/game_servers/bellwright/?utm_source=github&utm_medium=readme&utm_campaign=hearthserver) runs Bellwright servers with HearthServer installed.
 
-## Community Note
+## Community note
 
 HearthServer is a community project and is not affiliated with or endorsed by the developers of Bellwright.
 
