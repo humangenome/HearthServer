@@ -121,6 +121,12 @@ jobs:
             throw "tag $version does not match HearthServer.exe FileVersion=$($exe.FileVersion), ProductVersion=$($exe.ProductVersion)"
           }
 
+      # .NET 9 and later mark an exe CET-compatible by default, and such an exe refuses to start on some
+      # Windows builds ("Your Windows doesn't fully support CET"). Directory.Build.props turns it off.
+      # This reads the flag on the exe this release ships, before anything is zipped.
+      - name: The published exe is not marked CET-compatible
+        run: python scripts/check-cet-compat.py src/server/HearthServer/bin/Release/net10.0/win-x64/publish/HearthServer.exe
+
       - name: Stage release artifact
         shell: pwsh
         run: |
