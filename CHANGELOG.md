@@ -4,6 +4,32 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.102] - 2026-11-20
+
+- A Hearth server now uses far less processor time. With nobody on, Hearth's own work fell from about a third of one CPU core to about 1%, and while the world is paused it is close to zero.
+- The server loads Steam's client files only from the folder set in Identity:SteamClientPath, only when Valve signed them, and, when it runs as administrator, only from a folder that ordinary accounts cannot change. If the setting is empty or a check fails, Steam checks stay off and the log says why.
+- A world zip with no world in it, or one that would unpack past the server's limits or nearly fill its disk, is now refused before the server stops, so the world keeps running.
+- The server now keeps at most the newest 20 snapshots, up to 4 GB in all (still none older than 30 days). MaxSnapshotsKept and MaxSnapshotBytes in appsettings.json change that.
+- A player leaving normally is no longer logged as an error, and the log now says when the server's Steam login drops and when it comes back.
+- Steam IDs that start 7656120, which Steam will give to newer accounts, now work for admins and Steam sign-ins.
+
+### Removed
+
+- The admin console's say, announce and motd commands. Bellwright never showed their messages to players.
+- The server's own web map page. It never had player positions to show.
+- An unused internal connection and the key file it kept. The server deletes the old key file on its next start.
+
+### Client
+
+#### Fixed
+
+- When you download a world backup, the save window suggests the name `hearth-<server>-<id>.zip`. It suggested `beacon-<server>-<id>.zip`.
+- When Hearth cannot save an update on your PC, because the disk is full or another program holds the file, it now says so instead of "connection reset".
+- If Windows Smart App Control blocks Hearth's join files when Bellwright starts, Hearth now starts the game once more by itself instead of giving up after a minute, and says so plainly if Windows blocks them again.
+- Hearth no longer starts Bellwright with administrator rights. If Hearth or the game is running as administrator, Connect stops before the game starts and says what to change, because Steam cannot connect to a game running as administrator.
+- App updates no longer get stuck when the connection drops during a download. The app tries again.
+- Installing, updating or removing Hearth no longer deletes files that a folder link inside Hearth's folder points to.
+
 ## [0.1.101] - 2026-11-14
 
 - Server backups now skip linked folders, so a backup only holds files from the server's own save folder. If you host your own server, update to 0.1.101.

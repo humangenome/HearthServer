@@ -54,7 +54,7 @@ This repo is the whole server side. The player app is closed source.
 | base + 3 (default `7780`) | TCP | Source RCON |
 | base + 4 (default `7781`) | TCP | Admin HTTP API (snapshots, players, the Steam check) |
 
-Open the two UDP ports on the host firewall and forward them if the server sits behind NAT. Open the TCP ports only for the people who should reach them. `base + 1` is a local name, not a listening port.
+Open the two UDP ports on the host firewall and forward them if the server sits behind NAT. Open the TCP ports only for the people who should reach them. `base + 1` is reserved and not used.
 
 ## Setup
 
