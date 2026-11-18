@@ -32,6 +32,9 @@ jobs:
       - name: Check the tag matches the version stamp
         run: bash scripts/check-version-stamp.sh "${{ github.ref_name }}"
 
+      - name: Licence-notice check (its own tests)
+        run: python3 scripts/test-verify-release-notices.py
+
       - name: Build the release body from the changelog
         shell: bash
         run: |
@@ -131,6 +134,13 @@ jobs:
           $saveGuard = "src/tools/Hearth.SaveGuard/target/release/HearthSaveGuard.exe"
           if (-not (Test-Path $saveGuard)) { throw "Bellwright save guard missing at $saveGuard" }
           Copy-Item $saveGuard "$publish/HearthSaveGuard.exe" -Force
+          # Licence notices go with every copy: our MIT licence, and the .NET runtime's licence and
+          # third-party notices (it ships self-contained), from the runtime packs it was published with.
+          # Into the publish folder, so both archives carry them.
+          if (-not (Test-Path "LICENSE")) { throw "LICENSE missing" }
+          Copy-Item LICENSE "$publish/LICENSE.txt" -Force
+          python scripts/stage-dotnet-notices.py $publish
+          if ($LASTEXITCODE -ne 0) { throw "could not stage the .NET licence notices - refusing to publish" }
           # Named for what it is: the supervisor only. The complete host
           # package is built below under its own name.
           Compress-Archive -Path "$publish/*" -DestinationPath "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
@@ -143,6 +153,8 @@ jobs:
           # wrong name. Assert the name and the layout.
           python scripts/verify-supervisor-archive.py "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
           if ($LASTEXITCODE -ne 0) { throw "supervisor archive failed verification - refusing to publish" }
+          python scripts/verify-release-notices.py supervisor "artifacts/HearthServer-Supervisor-Windows-x64-$tag.zip"
+          if ($LASTEXITCODE -ne 0) { throw "supervisor archive is missing a licence notice - refusing to publish" }
 
           # ----- Complete host package -----
           # The artifact that runs a joinable server. Same layout the managed
@@ -156,6 +168,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path stage/HearthServer, stage/ue4ss, stage/engine-ini, stage/redist | Out-Null
           Copy-Item -Recurse -Force "$publish/*" stage/HearthServer/
           Copy-Item $ue4ss stage/ue4ss/UE4SS.dll
+          # UE4SS is MIT: its notice goes beside the DLL.
+          Copy-Item licenses/UE4SS-LICENSE.txt stage/ue4ss/UE4SS-LICENSE.txt
           foreach ($required in @("dist/ue4ss-server/UE4SS-settings.ini", "dist/ue4ss-server/Mods", "dist/ue4ss-server/UE4SS_Signatures", "dist/engine-ini", "dist/redist", "dist/steam_appid.txt", "scripts/host-instance.ps1")) {
             if (-not (Test-Path $required)) { throw "$required missing - refusing to build a host package short its runtime" }
           }
@@ -175,9 +189,12 @@ jobs:
           Copy-Item -Recurse -Force dist/redist/* stage/redist/
           Copy-Item dist/steam_appid.txt stage/
           Copy-Item scripts/host-instance.ps1 stage/
+          Copy-Item LICENSE stage/LICENSE.txt
           Compress-Archive -Path stage/* -DestinationPath "artifacts/HearthServer-Host-Windows-x64-$tag.zip"
           python scripts/verify-server-bundle.py "artifacts/HearthServer-Host-Windows-x64-$tag.zip"
           if ($LASTEXITCODE -ne 0) { throw "host package failed verification - refusing to publish" }
+          python scripts/verify-release-notices.py host "artifacts/HearthServer-Host-Windows-x64-$tag.zip"
+          if ($LASTEXITCODE -ne 0) { throw "host package is missing a licence notice - refusing to publish" }
 
           Get-FileHash artifacts/*.zip -Algorithm SHA256 | ForEach-Object {
             "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
