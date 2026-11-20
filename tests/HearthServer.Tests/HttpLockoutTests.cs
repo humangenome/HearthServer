@@ -162,7 +162,7 @@ public sealed class HttpLockoutTests : IDisposable
                 GamePidFile = "",
             };
             var o = Options.Create(opts);
-            var pipe = new PipeServerState(NullLogger<PipeServerState>.Instance);
+            var pipe = new ServerState(NullLogger<ServerState>.Instance);
             var saves = new SaveOrchestratorService(
                 NullLogger<SaveOrchestratorService>.Instance, o, pipe,
                 new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
@@ -171,7 +171,6 @@ public sealed class HttpLockoutTests : IDisposable
                 log ?? NullLogger<HearthHttpService>.Instance, o,
                 new ConfigurationBuilder().Build(),
                 saves, pipe, new InstanceIdentityProvider(o),
-                new ChatService(NullLogger<ChatService>.Instance, new StaticMonitor(opts)),
                 new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance));
             var cts = new CancellationTokenSource();
             await service.StartAsync(cts.Token);
@@ -245,13 +244,5 @@ public sealed class HttpLockoutTests : IDisposable
             l.Stop();
             return port;
         }
-    }
-
-    private sealed class StaticMonitor : IOptionsMonitor<HearthServerOptions>
-    {
-        public StaticMonitor(HearthServerOptions value) => CurrentValue = value;
-        public HearthServerOptions CurrentValue { get; }
-        public HearthServerOptions Get(string? name) => CurrentValue;
-        public IDisposable? OnChange(Action<HearthServerOptions, string?> listener) => null;
     }
 }

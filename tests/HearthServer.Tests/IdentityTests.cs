@@ -56,6 +56,21 @@ public sealed class IdentityTests : IDisposable
     }
 
     [Fact]
+    public void A_Steam_ID_that_starts_7656120_gets_a_token_and_a_map_line()
+    {
+        const string newAccount = "76561200000000001";
+        var svc = new IdentityTokenService(Key, _root);
+        var (token, _) = svc.Issue(newAccount, nowUnix: 1_793_300_000);
+        svc.Verify(token, newAccount, 1_793_300_000).Should().BeTrue();
+        svc.Invoking(s => s.Issue("76561197960265728")).Should().Throw<ArgumentException>("account 0 is not a player");
+        svc.Invoking(s => s.Issue("76561202255233024")).Should().Throw<ArgumentException>("past the last account");
+
+        var map = new SteamIdentityMapService(Path.Combine(_root, "steam-map-new.tsv"));
+        map.RecordFirst(newAccount, FirstPc, 100).Should().BeTrue();
+        map.FirstComputerFor(newAccount).Should().Be(FirstPc);
+    }
+
+    [Fact]
     public void Token_service_mints_and_keeps_its_key_file()
     {
         var opts = Options.Create(new HearthServerOptions { Identity = new IdentityOptions { Directory = _root } });
@@ -128,7 +143,7 @@ public sealed class IdentityTests : IDisposable
             AdminJoinTicketPath = Path.Combine(_root, "admin-tickets.tsv"),
         });
         var tail = new HearthLogTailService(NullLogger<HearthLogTailService>.Instance, options,
-            new PipeServerState(NullLogger<PipeServerState>.Instance),
+            new ServerState(NullLogger<ServerState>.Instance),
             new AdminJoinTicketService(options, NullLogger<AdminJoinTicketService>.Instance), tokens, map);
         string Line(string name, string steam, string? token) =>
             "[2026.10.29-18.00.00:000][1]LogNet: Login request: ?Name=" + name + "?PlayerId=" + steam
@@ -164,13 +179,12 @@ public sealed class IdentityTests : IDisposable
         };
         Directory.CreateDirectory(opts.SaveDir);
         var o = Options.Create(opts);
-        var pipe = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var pipe = new ServerState(NullLogger<ServerState>.Instance);
         var saves = new SaveOrchestratorService(NullLogger<SaveOrchestratorService>.Instance, o, pipe,
             new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
             new SaveProtectionService(NullLogger<SaveProtectionService>.Instance, o));
         var http = new HearthHttpService(NullLogger<HearthHttpService>.Instance, o, new ConfigurationBuilder().Build(),
             saves, pipe, new InstanceIdentityProvider(o),
-            new ChatService(NullLogger<ChatService>.Instance, new StaticMonitor(opts)),
             new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance), tokens, verifier);
         using var cts = new CancellationTokenSource();
         await http.StartAsync(cts.Token);
@@ -216,6 +230,66 @@ public sealed class IdentityTests : IDisposable
 
             using (var limited = await Post($"{{\"steam_id\":\"{Player}\",\"ticket\":\"{new string('d', 64)}\"}}"))
                 limited.StatusCode.Should().Be((HttpStatusCode)429, "the fifth request in a minute from one address");
+        }
+        finally
+        {
+            cts.Cancel();
+            await http.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Token_route_takes_a_Steam_ID_that_starts_7656120_and_refuses_ones_outside_the_account_range()
+    {
+        var port = FreePort();
+        var verifier = new FakeVerifier();
+        var tokens = new IdentityTokenService(Key, _root);
+        var opts = new HearthServerOptions
+        {
+            HttpPort = port,
+            RconPassword = "test-admin-password",
+            HmacKeyPath = Path.Combine(_root, "hmac.key"),
+            AdminJoinTicketPath = Path.Combine(_root, "tickets.tsv"),
+            SaveDir = Path.Combine(_root, "saves"),
+            GamePidFile = "",
+            Identity = new IdentityOptions { MaxTokenRequestsPerMinute = 20 },
+        };
+        Directory.CreateDirectory(opts.SaveDir);
+        var o = Options.Create(opts);
+        var pipe = new ServerState(NullLogger<ServerState>.Instance);
+        var saves = new SaveOrchestratorService(NullLogger<SaveOrchestratorService>.Instance, o, pipe,
+            new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
+            new SaveProtectionService(NullLogger<SaveProtectionService>.Instance, o));
+        var http = new HearthHttpService(NullLogger<HearthHttpService>.Instance, o, new ConfigurationBuilder().Build(),
+            saves, pipe, new InstanceIdentityProvider(o),
+            new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance), tokens, verifier);
+        using var cts = new CancellationTokenSource();
+        await http.StartAsync(cts.Token);
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        try
+        {
+            async Task<HttpStatusCode> Post(string steamId)
+            {
+                var json = JsonSerializer.Serialize(new Dictionary<string, string> { ["steam_id"] = steamId, ["ticket"] = new string('a', 64) });
+                for (var i = 0; ; i++)
+                {
+                    try
+                    {
+                        using var r = await client.PostAsync($"http://127.0.0.1:{port}/api/v1/identity/token",
+                            new StringContent(json, Encoding.UTF8, "application/json"));
+                        return r.StatusCode;
+                    }
+                    catch (HttpRequestException) when (i < 50) { await Task.Delay(100); }
+                }
+            }
+
+            verifier.Next = new SteamTicketResult(SteamTicketOutcome.Ok, "Steam: OK");
+            (await Post("76561200000000001")).Should().Be(HttpStatusCode.OK);
+            verifier.LastSteamId.Should().Be("76561200000000001");
+            (await Post("76561202255233023")).Should().Be(HttpStatusCode.OK);
+            (await Post("76561197960265728")).Should().Be(HttpStatusCode.BadRequest, "account 0");
+            (await Post("76561202255233024")).Should().Be(HttpStatusCode.BadRequest, "past the last account");
+            (await Post("76561198000000001\n")).Should().Be(HttpStatusCode.BadRequest, "a trailing newline");
         }
         finally
         {
@@ -308,13 +382,12 @@ public sealed class IdentityTests : IDisposable
         };
         Directory.CreateDirectory(opts.SaveDir);
         var o = Options.Create(opts);
-        var pipe = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var pipe = new ServerState(NullLogger<ServerState>.Instance);
         var saves = new SaveOrchestratorService(NullLogger<SaveOrchestratorService>.Instance, o, pipe,
             new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
             new SaveProtectionService(NullLogger<SaveProtectionService>.Instance, o));
         return new HearthHttpService(log ?? NullLogger<HearthHttpService>.Instance, o, new ConfigurationBuilder().Build(),
             saves, pipe, new InstanceIdentityProvider(o),
-            new ChatService(NullLogger<ChatService>.Instance, new StaticMonitor(opts)),
             new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance));
     }
 
@@ -401,13 +474,6 @@ public sealed class IdentityTests : IDisposable
         }
     }
 
-    private sealed class StaticMonitor : IOptionsMonitor<HearthServerOptions>
-    {
-        public StaticMonitor(HearthServerOptions value) => CurrentValue = value;
-        public HearthServerOptions CurrentValue { get; }
-        public HearthServerOptions Get(string? name) => CurrentValue;
-        public IDisposable? OnChange(Action<HearthServerOptions, string?> listener) => null;
-    }
 
     private static int FreePort()
     {

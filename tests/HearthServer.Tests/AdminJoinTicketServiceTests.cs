@@ -95,6 +95,29 @@ public sealed class AdminJoinTicketServiceTests
     }
 
     [Fact]
+    public void AdminWhoseSteamIdStarts7656120GetsATicketAndOutOfRangeEntriesAreIgnored()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "hearth-admin-ticket-tests", Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(root, "tickets.tsv");
+        try
+        {
+            const string newAccount = "76561200000000001";
+            const string accountZero = "76561197960265728";
+            var service = Create(path, newAccount, accountZero);
+
+            var issued = service.Issue(newAccount, "203.0.113.42");
+            Assert.NotNull(issued);
+            Assert.True(service.ValidatePresented(issued!.Token, newAccount, "203.0.113.42:50000"));
+            Assert.Null(service.Issue(accountZero, "203.0.113.42"));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void NewProcessInstanceClearsPriorTickets()
     {
         var root = Path.Combine(Path.GetTempPath(), "hearth-admin-ticket-tests", Guid.NewGuid().ToString("N"));

@@ -78,7 +78,7 @@ public class HearthLogTailServiceTests
             ""
         }));
 
-        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var state = new ServerState(NullLogger<ServerState>.Instance);
         var service = CreateTailer(root, state);
 
         await service.StartAsync(CancellationToken.None);
@@ -115,7 +115,7 @@ public class HearthLogTailServiceTests
         var identityPath = Path.Combine(root, "login-identities.tsv");
         await File.WriteAllTextAsync(logPath, "");
 
-        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var state = new ServerState(NullLogger<ServerState>.Instance);
         var service = CreateTailer(root, state, identityPath);
 
         await service.StartAsync(CancellationToken.None);
@@ -158,7 +158,7 @@ public class HearthLogTailServiceTests
         var identityPath = Path.Combine(root, "login-identities.tsv");
         await File.WriteAllTextAsync(logPath, "");
 
-        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var state = new ServerState(NullLogger<ServerState>.Instance);
         var service = CreateTailer(root, state, identityPath);
 
         await service.StartAsync(CancellationToken.None);
@@ -200,7 +200,7 @@ public class HearthLogTailServiceTests
         var logPath = Path.Combine(root, "bw-ue.log");
         await File.WriteAllTextAsync(logPath, "");
 
-        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var state = new ServerState(NullLogger<ServerState>.Instance);
         var service = CreateTailer(root, state);
 
         await service.StartAsync(CancellationToken.None);
@@ -237,7 +237,7 @@ public class HearthLogTailServiceTests
         var ticketPath = Path.Combine(root, "admin-tickets.tsv");
         await File.WriteAllTextAsync(logPath, "");
 
-        var state = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var state = new ServerState(NullLogger<ServerState>.Instance);
         var options = Options.Create(new HearthServerOptions
         {
             GameUserDir = root,
@@ -298,7 +298,7 @@ public class HearthLogTailServiceTests
 
     private static HearthLogTailService CreateTailer(
         string root,
-        PipeServerState state,
+        ServerState state,
         string? identityPath = null)
     {
         var options = Options.Create(new HearthServerOptions

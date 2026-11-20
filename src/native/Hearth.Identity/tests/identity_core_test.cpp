@@ -55,6 +55,9 @@ int main()
     Check(!IsComputerId("steam_76561199000000201") && !IsComputerId("x-1234"), "other names fail the shape check");
     Check(IsSteamId("76561199000000201") && !IsSteamId("7656119904823420") && !IsSteamId("1234567890123456a"),
         "Steam ID shape");
+    Check(IsSteamId("76561197960265729") && IsSteamId("76561198000000001") && IsSteamId("76561200000000001")
+            && IsSteamId("76561202255233023"),
+        "Steam IDs from the first account to account 2^32-1 pass, the newer 7656120 ones included");
 
     // token
     const std::string key = "0123456789abcdef0123456789abcdef";

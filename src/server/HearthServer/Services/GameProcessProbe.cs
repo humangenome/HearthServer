@@ -6,10 +6,8 @@ namespace HearthServer.Services;
 
 /// <summary>
 /// Reports whether the Bellwright game process named in <c>GamePidFile</c> is alive.
-/// Used as an OR condition alongside the plugin heartbeat so a server that is genuinely
-/// up — e.g. parked in its always-on lobby, where the in-game plugin may not be pinging
-/// the pipe — still reports "online" to A2S and <c>/api/v1/health</c> instead of looking
-/// dead in the launcher. Validates the process NAME (not just the PID) to defend against
+/// This alone decides "online" for A2S, RCON status and <c>/api/v1/health</c>.
+/// Validates the process NAME (not just the PID) to defend against
 /// PID reuse: a recycled PID belonging to some unrelated process must not read as online.
 /// </summary>
 public static class GameProcessProbe

@@ -29,6 +29,10 @@ public sealed class HearthRestartCoordinator
     private readonly ILogger<HearthRestartCoordinator> _log;
     private readonly HearthServerOptions _opts;
     private readonly SemaphoreSlim _restoreGate = new(1, 1);
+    private int _killRequests;
+
+    /// <summary>How many times <see cref="KillGame"/> was called (tests: it does nothing off Windows).</summary>
+    internal int KillRequests => Volatile.Read(ref _killRequests);
 
     public HearthRestartCoordinator(ILogger<HearthRestartCoordinator> log, IOptions<HearthServerOptions> opts)
     {
@@ -57,6 +61,7 @@ public sealed class HearthRestartCoordinator
     /// </summary>
     public void KillGame(TimeSpan waitForExit)
     {
+        Interlocked.Increment(ref _killRequests);
         if (!OperatingSystem.IsWindows()) return;
 
         var installRoot = NormalizeForCompare(_opts.GameInstallRoot);

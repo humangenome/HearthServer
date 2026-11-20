@@ -36,12 +36,12 @@ Gameplay settings (raids, spoilage, damage, village needs and the rest of the ga
 | Offset | Default | Purpose | Proto |
 |--------|---------|---------|-------|
 | +0 | 7777 | Gameplay (the join port) | UDP |
-| +1 | 7778 | Control / IPC identifier (local only) | none |
+| +1 | 7778 | Reserved, unused | none |
 | +2 | 7779 | Server query (A2S) | UDP |
 | +3 | 7780 | RCON | TCP |
 | +4 | 7781 | Admin HTTP API | TCP |
 
-Open and forward the gameplay and query ports (+0, +2). Open the RCON and HTTP ports (+3, +4) only for the people who should reach them. The control port (+1) is a local name and needs no firewall rule. The gameplay UDP port needs a Windows Defender inbound allow rule, or players cannot reach the server; the launch script adds the rules when it runs elevated.
+Open and forward the gameplay and query ports (+0, +2). Open the RCON and HTTP ports (+3, +4) only for the people who should reach them. The reserved port (+1) is not listened on and needs no firewall rule. The gameplay UDP port needs a Windows Defender inbound allow rule, or players cannot reach the server; the launch script adds the rules when it runs elevated.
 
 ## RCON commands
 
@@ -51,8 +51,7 @@ HearthServer exposes Source RCON on the RCON port:
 - `status`: server status
 - `players`: connected players
 - `ping`: liveness
-- `say <text>` and `announce <text>`: send a message to the server's chat channel
-- `motd <text>`: set the message of the day
+- `save game`: ask the game to write its save now
 - `save snapshot`: take a world snapshot
 - `save list`: list saved snapshots
 - `save restore <id>`: roll the world back to a snapshot

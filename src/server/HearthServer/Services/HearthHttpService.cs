@@ -5,7 +5,6 @@ using System.Text;
 using System.Text.Json;
 using Hearth.Rcon;
 using HearthServer.Configuration;
-using HearthServer.Static;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -16,13 +15,12 @@ namespace HearthServer.Services;
 /// <summary>
 /// Authenticated HTTP API for launcher-side snapshot management. Listens on
 /// <see cref="HearthServerOptions.HttpPort"/>, validates an HMAC-SHA256
-/// signature against the per-instance HMAC key, then dispatches to the save
+/// signature under SHA256(RconPassword), then dispatches to the save
 /// orchestrator.
 ///
 /// Routes (all under <c>/api/v1</c>):
 ///   GET  /health, /players, /manifest  — public, no auth
 ///   GET  /info                         — instance + version
-///   GET  /chat/recent, /chat/motd      — admin broadcast history (auth)
 ///   GET  /snapshots                    — list snapshots (auth)
 ///   GET  /snapshots/{id}/download      — stream zip (auth)
 ///   POST /snapshots                    — upload zip body, store as snapshot (auth)
@@ -64,9 +62,8 @@ public sealed class HearthHttpService : BackgroundService
     private readonly HearthServerOptions _opts;
     private readonly IConfiguration _config;
     private readonly SaveOrchestratorService _saves;
-    private readonly PipeServerState _pipeState;
+    private readonly ServerState _serverState;
     private readonly InstanceIdentityProvider _identity;
-    private readonly ChatService _chat;
     private readonly AdminJoinTicketService _adminJoinTickets;
     private readonly IdentityTokenService? _identityTokens;
     private readonly ISteamTicketVerifier? _steamTickets;
@@ -96,9 +93,8 @@ public sealed class HearthHttpService : BackgroundService
         IOptions<HearthServerOptions> opts,
         IConfiguration config,
         SaveOrchestratorService saves,
-        PipeServerState pipeState,
+        ServerState serverState,
         InstanceIdentityProvider identity,
-        ChatService chat,
         AdminJoinTicketService adminJoinTickets,
         IdentityTokenService? identityTokens = null,
         ISteamTicketVerifier? steamTickets = null)
@@ -107,9 +103,8 @@ public sealed class HearthHttpService : BackgroundService
         _opts = opts.Value;
         _config = config;
         _saves = saves;
-        _pipeState = pipeState;
+        _serverState = serverState;
         _identity = identity;
-        _chat = chat;
         _adminJoinTickets = adminJoinTickets;
         _identityTokens = identityTokens;
         _steamTickets = steamTickets;
@@ -138,7 +133,6 @@ public sealed class HearthHttpService : BackgroundService
 
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://+:{_opts.HttpPort}/api/v1/");
-        _listener.Prefixes.Add($"http://+:{_opts.HttpPort}/map/");
 
         try
         {
@@ -162,7 +156,6 @@ public sealed class HearthHttpService : BackgroundService
             {
                 _listener = new HttpListener();
                 _listener.Prefixes.Add($"http://+:{_opts.HttpPort}/api/v1/");
-                _listener.Prefixes.Add($"http://+:{_opts.HttpPort}/map/");
                 _listener.Start();
                 _log.LogInformation("HTTP API bound to all interfaces on port {Port} after urlacl fix", _opts.HttpPort);
             }
@@ -177,8 +170,6 @@ public sealed class HearthHttpService : BackgroundService
                 _listener = new HttpListener();
                 _listener.Prefixes.Add($"http://localhost:{_opts.HttpPort}/api/v1/");
                 _listener.Prefixes.Add($"http://127.0.0.1:{_opts.HttpPort}/api/v1/");
-                _listener.Prefixes.Add($"http://localhost:{_opts.HttpPort}/map/");
-                _listener.Prefixes.Add($"http://127.0.0.1:{_opts.HttpPort}/map/");
                 try { _listener.Start(); }
                 catch (Exception innerEx)
                 {
@@ -221,8 +212,7 @@ public sealed class HearthHttpService : BackgroundService
                     // their own pool so signed traffic cannot crowd them out.
                     var limiter = IsPublicRequest(
                         ctx.Request.HttpMethod.ToUpperInvariant(),
-                        ctx.Request.Url?.AbsolutePath ?? "",
-                        _opts.Map)
+                        ctx.Request.Url?.AbsolutePath ?? "")
                         ? _publicLimiter
                         : _signedLimiter;
                     if (!await limiter.WaitAsync(0).ConfigureAwait(false))
@@ -287,19 +277,9 @@ public sealed class HearthHttpService : BackgroundService
             // Public endpoints
             if (method == "GET" && path == "/api/v1/health")
             {
-                var heartbeatTimeout = TimeSpan.FromSeconds(Math.Max(1, _opts.PluginHeartbeatTimeoutSeconds));
-                var pluginOnline = _pipeState.HasFreshHeartbeat(heartbeatTimeout);
-                // Server is "online" if the plugin is pinging OR the Bellwright process is
-                // alive (lobby-parked servers are joinable even before the plugin pings).
-                var gameProcessAlive = GameProcessProbe.IsAlive(_opts.GamePidFile);
-                var online = pluginOnline || gameProcessAlive;
-                int? heartbeatAgeSeconds = null;
-                if (_pipeState.LastHeartbeatAt is DateTimeOffset lastHeartbeat)
-                    heartbeatAgeSeconds = Math.Max(0, (int)(DateTimeOffset.UtcNow - lastHeartbeat).TotalSeconds);
-
-                _log.LogDebug(
-                    "/health decision: online={Online} (pluginOnline={Plugin}, gameProcessAlive={Process}, heartbeatAge={Age}s)",
-                    online, pluginOnline, gameProcessAlive, heartbeatAgeSeconds);
+                // Online = the Bellwright process named in the pid file is alive.
+                var online = GameProcessProbe.IsAlive(_opts.GamePidFile);
+                _log.LogDebug("/health decision: online={Online} (game process probe)", online);
 
                 await WriteJsonAsync(res, online ? 200 : 503, new
                 {
@@ -311,9 +291,7 @@ public sealed class HearthHttpService : BackgroundService
                     gameplay_port = _opts.GameplayPort,
                     query_port = _opts.QueryPort,
                     max_players = _opts.MaxPlayers,
-                    player_count = _pipeState.EffectivePlayerCount,
-                    plugin_connected = _pipeState.Connection is not null,
-                    last_heartbeat_age_seconds = heartbeatAgeSeconds,
+                    player_count = _serverState.EffectivePlayerCount,
                 });
                 return;
             }
@@ -324,7 +302,7 @@ public sealed class HearthHttpService : BackgroundService
                 // the launcher hero panel doesn't have to parse A2S to
                 // show 'who is online'. No auth required.
                 var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                var snap = _pipeState.Players;
+                var snap = _serverState.Players;
                 await WriteJsonAsync(res, 200, new
                 {
                     instance = _identity.InstanceId,
@@ -369,49 +347,6 @@ public sealed class HearthHttpService : BackgroundService
                 return;
             }
 
-            // ----- Live web map (protocol/map-v1.md) -----
-            //
-            // HearthRoster Lua mod writes roster.json (player list +
-            // positions) every 5s and on K2_PostLogin/Logout.
-            // /api/v1/map/state projects that into the SPA's expected
-            // shape. Public when MapOptions.Public=true (community
-            // dashboards) or HMAC-authed (launcher / private use) —
-            // fall-through to the authed handler at the bottom of this
-            // method covers the private path. The /map/ SPA HTML is
-            // always public; if the state endpoint refuses the SPA's
-            // poll the page renders "map is private" rather than failing
-            // silently.
-
-            if (method == "GET" && (path == "/map/" || path == "/map" || path == "/map/index.html"))
-            {
-                if (!_opts.Map.Enabled)
-                {
-                    await WriteJsonAsync(res, 404, new { error = "map disabled" });
-                    return;
-                }
-                var html = MapSpa.Render();
-                var bytes = Encoding.UTF8.GetBytes(html);
-                res.StatusCode = 200;
-                res.ContentType = "text/html; charset=utf-8";
-                res.Headers["Cache-Control"] = "no-store";
-                res.ContentLength64 = bytes.Length;
-                await res.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
-                res.OutputStream.Close();
-                return;
-            }
-
-            if (method == "GET" && path == "/api/v1/map/state" && _opts.Map.Enabled && _opts.Map.Public)
-            {
-                await ServeMapStateAsync(res, ct).ConfigureAwait(false);
-                return;
-            }
-
-            if (method == "GET" && path == "/api/v1/map/state" && !_opts.Map.Enabled)
-            {
-                await WriteJsonAsync(res, 404, new { error = "map disabled" });
-                return;
-            }
-
             if (method == "POST" && path == "/api/v1/identity/token")
             {
                 // Public: a player has no RCON password. Steam's own ticket check is the proof (the ticket only
@@ -440,36 +375,6 @@ public sealed class HearthHttpService : BackgroundService
             }
             var body = auth.Body;
 
-            // ----- Chat plane reads (protocol/chat-v1.md) -----
-            // Admin broadcast history and the MOTD. Signed like every other
-            // admin read; nothing in the game or the app reads them unsigned.
-            if (method == "GET" && path == "/api/v1/chat/recent")
-            {
-                body.Dispose();
-                var sinceMs = ParseLongQuery(req.Url, "since", 0);
-                var limit = (int)ParseLongQuery(req.Url, "limit", 100);
-                var msgs = _chat.GetRecent(sinceMs, limit);
-                await WriteJsonAsync(res, 200, new
-                {
-                    version = 1,
-                    instance = _identity.InstanceId,
-                    now_ms = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    messages = msgs,
-                });
-                return;
-            }
-
-            if (method == "GET" && path == "/api/v1/chat/motd")
-            {
-                body.Dispose();
-                await WriteJsonAsync(res, 200, new
-                {
-                    instance = _identity.InstanceId,
-                    msg = _chat.GetMotd(),
-                });
-                return;
-            }
-
             if (method == "GET" && path == "/api/v1/info")
             {
                 body.Dispose();
@@ -490,7 +395,7 @@ public sealed class HearthHttpService : BackgroundService
                 var ticketRequest = await ParseJsonBodyAsync<AdminJoinTicketRequest>(body, ct).ConfigureAwait(false);
                 body.Dispose();
                 if (ticketRequest is null
-                    || !AdminJoinTicketService.IsValidSteam64(ticketRequest.SteamId))
+                    || !SteamId64.IsValid(ticketRequest.SteamId))
                 {
                     await WriteJsonAsync(res, 400, new { error = "valid steam_id required" });
                     return;
@@ -510,21 +415,6 @@ public sealed class HearthHttpService : BackgroundService
                     token = ticket.Token,
                     expires_unix = ticket.ExpiresUnix,
                 });
-                return;
-            }
-
-            // Authed entry for /api/v1/map/state. If MapOptions.Public is
-            // set the public block above returned early; this branch handles
-            // launcher + dashboard clients that authenticate via HMAC.
-            if (method == "GET" && path == "/api/v1/map/state")
-            {
-                body.Dispose();
-                if (!_opts.Map.Enabled)
-                {
-                    await WriteJsonAsync(res, 404, new { error = "map disabled" });
-                    return;
-                }
-                await ServeMapStateAsync(res, ct).ConfigureAwait(false);
                 return;
             }
 
@@ -595,6 +485,9 @@ public sealed class HearthHttpService : BackgroundService
                 _saves.Database.RecordSnapshot(record);
                 _saves.Database.Audit("http-api", "snapshot.upload", snapshotId,
                     $"{{\"bytes\":{record.SizeBytes}}}", record.TakenUnix);
+                // Uploads count toward the snapshot room too (MaxSnapshotsKept / MaxSnapshotBytes); this one is
+                // the newest, so it stays.
+                _saves.RotateOldSnapshots();
 
                 await WriteJsonAsync(res, 200, new
                 {
@@ -633,36 +526,6 @@ public sealed class HearthHttpService : BackgroundService
                 return;
             }
 
-            // ----- Chat plane writes (protocol/chat-v1.md) -----
-            if (method == "POST" && path == "/api/v1/chat/say")
-            {
-                var sayReq = await ParseJsonBodyAsync<ChatSayRequest>(body, ct).ConfigureAwait(false);
-                body.Dispose();
-                if (sayReq is null || string.IsNullOrWhiteSpace(sayReq.Msg))
-                {
-                    await WriteJsonAsync(res, 400, new { error = "msg required" });
-                    return;
-                }
-                var entry = _chat.BroadcastFromServer(
-                    sayReq.Msg, sayReq.Channel, sayReq.Color, sayReq.Sender);
-                await WriteJsonAsync(res, 200, new { ok = true, ts = entry.Ts });
-                return;
-            }
-
-            if (method == "POST" && path == "/api/v1/chat/motd")
-            {
-                var motdReq = await ParseJsonBodyAsync<MotdRequest>(body, ct).ConfigureAwait(false);
-                body.Dispose();
-                if (motdReq is null)
-                {
-                    await WriteJsonAsync(res, 400, new { error = "json body required" });
-                    return;
-                }
-                var ok = _chat.SetMotd(motdReq.Msg ?? "");
-                await WriteJsonAsync(res, ok ? 200 : 500, new { ok });
-                return;
-            }
-
             body.Dispose();
             await WriteJsonAsync(res, 404, new { error = "not found", method, path });
         }
@@ -685,16 +548,12 @@ public sealed class HearthHttpService : BackgroundService
 
     /// <summary>
     /// Which accept-loop pool a request belongs to. Public = the reads that
-    /// answer without a signature (and the map routes, which only ever answer
-    /// "disabled" or public data). Everything else is signed.
+    /// answer without a signature. Everything else is signed.
     /// </summary>
-    internal static bool IsPublicRequest(string method, string path, MapOptions map)
+    internal static bool IsPublicRequest(string method, string path)
     {
         if (method != "GET") return false;
-        if (path is "/api/v1/health" or "/api/v1/players" or "/api/v1/manifest") return true;
-        if (path is "/map" or "/map/" or "/map/index.html") return true;
-        if (path == "/api/v1/map/state") return !map.Enabled || map.Public;
-        return false;
+        return path is "/api/v1/health" or "/api/v1/players" or "/api/v1/manifest";
     }
 
     internal readonly record struct AuthOutcome(BufferedBody? Body, int Status, string Error)
@@ -1055,98 +914,6 @@ public sealed class HearthHttpService : BackgroundService
         await res.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Reads roster.json (written by the HearthRoster Lua mod every 5s,
-    /// plus on K2_PostLogin/Logout) and projects it into the /api/v1/map/state
-    /// response shape. Position fields (X/Y/Z, world.name) are populated by
-    /// the same rescan that writes the player list, so map data is exactly
-    /// as fresh as the roster snapshot.
-    ///
-    /// Why not a separate map-state.json: UE5 dedicated Bellwright with zero
-    /// connected players ticks at near-zero rate, so a 1Hz Lua LoopAsync
-    /// fires every 10+ min in idle state. Roster's 5s tick is the only
-    /// scheduler in the mod chain that catches both join (via K2_PostLogin
-    /// fast path) and movement (via active-engine tick when a player is
-    /// in-world), so we co-locate position publishing with it.
-    /// </summary>
-    private async Task ServeMapStateAsync(HttpListenerResponse res, CancellationToken ct)
-    {
-        var rosterPath = Path.Combine(AppContext.BaseDirectory, "roster.json");
-        long unixMs = 0;
-        var stale = true;
-        string worldName = "";
-        var players = System.Array.Empty<object>();
-
-        if (File.Exists(rosterPath))
-        {
-            try
-            {
-                var body = await File.ReadAllTextAsync(rosterPath, ct).ConfigureAwait(false);
-                using var doc = JsonDocument.Parse(body);
-                var root = doc.RootElement;
-                if (root.TryGetProperty("unix_ms", out var ums) && ums.TryGetInt64(out var ms))
-                    unixMs = ms;
-                if (root.TryGetProperty("world", out var w) && w.ValueKind == JsonValueKind.Object
-                    && w.TryGetProperty("name", out var wn))
-                    worldName = wn.GetString() ?? "";
-                if (root.TryGetProperty("players", out var pa) && pa.ValueKind == JsonValueKind.Array)
-                {
-                    var list = new List<object>(pa.GetArrayLength());
-                    foreach (var p in pa.EnumerateArray())
-                    {
-                        list.Add(new
-                        {
-                            id    = p.TryGetProperty("HearthUserId", out var idEl) ? idEl.GetString() ?? "" : "",
-                            name  = p.TryGetProperty("DisplayName",  out var nmEl) ? nmEl.GetString() ?? "" : "",
-                            x     = p.TryGetProperty("X", out var xEl) && xEl.ValueKind == JsonValueKind.Number ? xEl.GetDouble() : 0,
-                            y     = p.TryGetProperty("Y", out var yEl) && yEl.ValueKind == JsonValueKind.Number ? yEl.GetDouble() : 0,
-                            z     = p.TryGetProperty("Z", out var zEl) && zEl.ValueKind == JsonValueKind.Number ? zEl.GetDouble() : 0,
-                            biome = "",
-                        });
-                    }
-                    players = list.ToArray();
-                }
-                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                stale = (nowMs - unixMs) > _opts.Map.StaleAfterMs;
-            }
-            catch (Exception ex) when (ex is IOException or JsonException)
-            {
-                _log.LogDebug(ex, "roster.json read/parse failed for map state");
-            }
-        }
-
-        await WriteJsonAsync(res, 200, new
-        {
-            instance = _identity.InstanceId,
-            hearth_version = HearthVersionInfo.HearthVersion,
-            server_name = string.IsNullOrWhiteSpace(_opts.ServerName)
-                ? $"Hearth - {_identity.InstanceId}"
-                : _opts.ServerName.Trim(),
-            unix_ms = unixMs,
-            stale,
-            world = new { name = worldName },
-            players,
-        });
-    }
-
-    private static long ParseLongQuery(Uri? url, string key, long defaultValue)
-    {
-        if (url is null) return defaultValue;
-        var q = url.Query;
-        if (string.IsNullOrEmpty(q)) return defaultValue;
-        if (q[0] == '?') q = q[1..];
-        foreach (var pair in q.Split('&', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var eq = pair.IndexOf('=');
-            if (eq <= 0) continue;
-            if (!pair.AsSpan(0, eq).SequenceEqual(key.AsSpan())) continue;
-            var raw = Uri.UnescapeDataString(pair[(eq + 1)..]);
-            if (long.TryParse(raw, out var v)) return v;
-            return defaultValue;
-        }
-        return defaultValue;
-    }
-
     private static async Task<T?> ParseJsonBodyAsync<T>(BufferedBody body, CancellationToken ct) where T : class
     {
         try
@@ -1162,19 +929,6 @@ public sealed class HearthHttpService : BackgroundService
         {
             return null;
         }
-    }
-
-    private sealed class ChatSayRequest
-    {
-        public string Msg { get; set; } = "";
-        public string? Channel { get; set; }
-        public string? Color { get; set; }
-        public string? Sender { get; set; }
-    }
-
-    private sealed class MotdRequest
-    {
-        public string? Msg { get; set; }
     }
 
     private sealed class AdminJoinTicketRequest
@@ -1240,7 +994,7 @@ public sealed class HearthHttpService : BackgroundService
         {
             try { ticket = Convert.FromHexString(body.Ticket); } catch (FormatException) { ticket = null; }
         }
-        if (body is null || !IdentityTokenService.IsValidSteam64(body.SteamId) || ticket is null)
+        if (body is null || !SteamId64.IsValid(body.SteamId) || ticket is null)
         {
             await WriteJsonAsync(res, 400, new { error = "valid steam_id and hex ticket required" });
             return;

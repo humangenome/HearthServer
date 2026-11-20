@@ -34,7 +34,7 @@ static std::string UrlEncode(const std::string& s)
 
 static std::string Join(const std::string& key)
 {
-    std::string o = "?Name=steam_76561190000000101?PlayerId=76561190000000101?PlatformProvider=STEAM?HearthDisplayName=Tester";
+    std::string o = "?Name=steam_76561198000000101?PlayerId=76561198000000101?PlatformProvider=STEAM?HearthDisplayName=Tester";
     if (!key.empty()) o += "?HearthKey=" + UrlEncode(key);
     return o;
 }

@@ -24,7 +24,6 @@ public sealed class HearthProcessSupervisorService : BackgroundService
 {
     private readonly ILogger<HearthProcessSupervisorService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly HmacKeyService _hmac;
     private readonly HearthRestartCoordinator _coordinator;
 
     private const int MinHealthyUptimeSeconds = 60;
@@ -46,12 +45,10 @@ public sealed class HearthProcessSupervisorService : BackgroundService
     public HearthProcessSupervisorService(
         ILogger<HearthProcessSupervisorService> log,
         IOptions<HearthServerOptions> opts,
-        HmacKeyService hmac,
         HearthRestartCoordinator coordinator)
     {
         _log = log;
         _opts = opts.Value;
-        _hmac = hmac;
         _coordinator = coordinator;
     }
 
@@ -76,7 +73,6 @@ public sealed class HearthProcessSupervisorService : BackgroundService
                 await _coordinator.WaitForNoRestoreAsync(stoppingToken).ConfigureAwait(false);
 
                 ApplyEngineIniPatch();
-                EmitPluginConfig();
                 var start = DateTime.UtcNow;
 
                 using var proc = LaunchGame();
@@ -222,36 +218,6 @@ public sealed class HearthProcessSupervisorService : BackgroundService
         """;
         File.WriteAllText(enginePath, content);
         _log.LogInformation("Patched Engine.ini at {Path}", enginePath);
-    }
-
-    private void EmitPluginConfig()
-    {
-        var exe = ResolveG2ExecutablePath(_opts);
-        var pluginDir = Path.Combine(Path.GetDirectoryName(exe)!,
-            "Mods", "Hearth");
-        Directory.CreateDirectory(pluginDir);
-        var configPath = Path.Combine(pluginDir, "hearth.config.json");
-
-        // ServerPassword is INTENTIONALLY emitted empty.
-        // The native Hearth.dll ApproveLogin hook would otherwise try to
-        // enforce, but the game's stock GameMode races with it and fatal-
-        // crashes the dedicated process on host spawn (the ?Password=
-        // option in the launch URL is dropped by the game's internal map
-        // travel from the menu -> the play level, leaving the host's URL
-        // with no password while the native check still expects one).
-        // The join password (_opts.JoinPassword) is enforced by the bw_ident
-        // host mod inside the game's own login check (JoinGateFileService
-        // writes its file), never through this native path. Plugin sees no
-        // ServerPassword -> no native enforcement -> no crash loop.
-        var payload = new
-        {
-            InstanceId = _opts.InstanceId,
-            PipePath = $@"\\.\pipe\{_opts.PipeName}",
-            HmacKeyHex = Convert.ToHexString(_hmac.Key),
-            ServerPassword = "",
-        };
-        File.WriteAllText(configPath, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
-        _log.LogInformation("Emitted plugin config at {Path}", configPath);
     }
 
     private static string EscapeArg(string s) => s.Contains(' ') ? $"\"{s}\"" : s;

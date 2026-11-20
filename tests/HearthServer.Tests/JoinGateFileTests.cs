@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Text;
 using FluentAssertions;
 using HearthServer.Configuration;
@@ -56,8 +55,6 @@ public sealed class JoinGateFileTests : IDisposable
         JoinGateFileService.EffectivePassword(new HearthServerOptions { JoinPassword = "new", HearthAuthPassword = "old" })
             .Should().Be("new");
         JoinGateFileService.EffectivePassword(new HearthServerOptions { HearthAuthPassword = " old " }).Should().Be("old");
-        JoinGateFileService.EffectivePassword(new HearthServerOptions { ServerPassword = "native" })
-            .Should().BeEmpty("the legacy native ServerPassword is never the join password");
     }
 
     [Fact]
@@ -77,12 +74,11 @@ public sealed class JoinGateFileTests : IDisposable
     }
 
     [Fact]
-    public void The_watchdog_no_longer_stops_the_game_over_a_password()
+    public void Nothing_in_the_server_manager_stops_the_game_over_a_password()
     {
-        const BindingFlags any = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
-        typeof(HeartbeatWatchdogService).GetMethod("CheckHearthAuthLuaReady", any).Should().BeNull(
-            "it stopped the game about 3 minutes after every start whenever a password was set");
-        typeof(HeartbeatWatchdogService).GetMethod("ReadLuaStatus", any).Should().BeNull();
+        // The heartbeat watchdog stopped the game about 3 minutes after every start whenever a password was set;
+        // it went with the named-pipe plane it watched (v0.1.100).
+        typeof(HearthServerOptions).Assembly.GetType("HearthServer.Services.HeartbeatWatchdogService").Should().BeNull();
     }
 }
 

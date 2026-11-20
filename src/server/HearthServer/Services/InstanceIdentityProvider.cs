@@ -14,8 +14,6 @@ public sealed class InstanceIdentityProvider
 
     public string InstanceId => _options.InstanceId;
 
-    public string PipeName => _options.PipeName;
-
     public int GameplayPort => _options.GameplayPort;
     public int ControlPort => _options.ControlPort;
     public int QueryPort => _options.QueryPort;

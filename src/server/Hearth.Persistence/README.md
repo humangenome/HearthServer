@@ -1,4 +1,4 @@
 # Hearth.Persistence
 
-SQLite-backed persistence (HearthDb): bans, scheduler, audit, character store,
-save-snapshot bookkeeping.
+SQLite-backed bookkeeping for HearthServer (HearthDb): the list of world snapshots taken and an audit
+log of snapshot and restore actions.

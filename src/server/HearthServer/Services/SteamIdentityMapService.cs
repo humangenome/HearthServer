@@ -55,7 +55,7 @@ public sealed class SteamIdentityMapService
                 var line = raw.TrimEnd('\r');
                 if (line.Length == 0 || line[0] == '#') continue;
                 var cols = line.Split('\t');
-                if (cols.Length < 2 || !IdentityTokenService.IsValidSteam64(cols[0]) || !IdentityTokenService.IsComputerId(cols[1])) continue;
+                if (cols.Length < 2 || !SteamId64.IsValid(cols[0]) || !IdentityTokenService.IsComputerId(cols[1])) continue;
                 _map.TryAdd(cols[0], cols[1]);
             }
         }
@@ -64,7 +64,7 @@ public sealed class SteamIdentityMapService
     /// <summary>Records the first computer for a Steam ID; false when it already had one (never replaced).</summary>
     public bool RecordFirst(string steam64, string computerId, long? nowUnix = null)
     {
-        if (!IdentityTokenService.IsValidSteam64(steam64) || !IdentityTokenService.IsComputerId(computerId)) return false;
+        if (!SteamId64.IsValid(steam64) || !IdentityTokenService.IsComputerId(computerId)) return false;
         lock (_gate)
         {
             if (_map.ContainsKey(steam64)) return false;
@@ -108,7 +108,7 @@ public sealed class SteamIdentityMapService
                     var opts = m.Groups["opts"].Value;
                     var steam = OptionValue(opts, "PlayerId");
                     var id = OptionValue(opts, "Name");
-                    if (!IdentityTokenService.IsValidSteam64(steam) || !IdentityTokenService.IsComputerId(id) || !hasCharacter(id)) continue;
+                    if (!SteamId64.IsValid(steam) || !IdentityTokenService.IsComputerId(id) || !hasCharacter(id)) continue;
                     var stamp = GameStamp(line) ?? Path.GetFileName(file) + line.Length.ToString("D8");
                     if (!earliest.TryGetValue(steam, out var cur) || string.CompareOrdinal(stamp, cur.Stamp) < 0)
                         earliest[steam] = (stamp, id!);

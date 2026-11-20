@@ -16,23 +16,20 @@ public sealed class RconHostedService : IHostedService
 {
     private readonly ILogger<RconHostedService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly PipeServerState _state;
+    private readonly ServerState _state;
     private readonly SaveOrchestratorService _saves;
-    private readonly ChatService _chat;
     private RconServer? _server;
 
     public RconHostedService(
         ILogger<RconHostedService> log,
         IOptions<HearthServerOptions> opts,
-        PipeServerState state,
-        SaveOrchestratorService saves,
-        ChatService chat)
+        ServerState state,
+        SaveOrchestratorService saves)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
         _saves = saves;
-        _chat = chat;
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -62,40 +59,20 @@ public sealed class RconHostedService : IHostedService
         var head = parts[0].ToLowerInvariant();
         var rest = parts.Length > 1 ? parts[1] : "";
         // Log the verb + arg length only — never the raw arg, which may carry
-        // chat text or operator-entered content.
+        // operator-entered content.
         _log.LogDebug("RCON dispatch: cmd={Cmd} argLen={ArgLen}", head, rest.Length);
         return head switch
         {
-            "help"     => "commands: status, players, ping, save game, save snapshot, save list, save restore <id>, say <msg>, announce <msg>, motd [msg]",
+            // say, announce and motd were removed in v0.1.100: Bellwright shows no server message to
+            // players, so they answered "chat ok" and nobody in the game saw anything.
+            "help"     => "commands: status, players, ping, save game, save snapshot, save list, save restore <id>",
             "status"   => BuildStatus(),
             "players"  => BuildPlayers(),
             "ping"     => "pong",
             "save"     => await HandleSaveAsync(rest).ConfigureAwait(false),
             "snapshot" => await HandleSaveAsync("snapshot").ConfigureAwait(false),
-            "say"      => HandleChat(rest, "system"),
-            "announce" => HandleChat(rest, "admin"),
-            "motd"     => HandleMotd(rest),
             _          => $"unknown rcon command: {head} (try: help)",
         };
-    }
-
-    private string HandleChat(string msg, string channel)
-    {
-        var clean = (msg ?? "").Trim();
-        if (string.IsNullOrEmpty(clean)) return $"usage: {(channel == "admin" ? "announce" : "say")} <message>";
-        var entry = _chat.BroadcastFromServer(clean, channel: channel, sender: "Server");
-        return $"chat ok ({channel}): {entry.Msg}";
-    }
-
-    private string HandleMotd(string sub)
-    {
-        var trimmed = (sub ?? "").Trim();
-        if (string.IsNullOrEmpty(trimmed))
-        {
-            var cur = _chat.GetMotd();
-            return string.IsNullOrEmpty(cur) ? "motd is empty" : $"motd: {cur}";
-        }
-        return _chat.SetMotd(trimmed) ? "motd updated" : "motd update failed (check log)";
     }
 
     private async Task<string> HandleSaveAsync(string sub)
@@ -106,9 +83,8 @@ public sealed class RconHostedService : IHostedService
         if (string.IsNullOrEmpty(arg) || arg.Equals("snapshot", StringComparison.OrdinalIgnoreCase))
         {
             // The game host auto-saves to <userdir>/Saved/SaveGames every ~60s.
-            // We snapshot the on-disk save file directly; the plugin SaveQuiesce
-            // ack is not required because the game's own save writer is atomic
-            // (writes to temp then renames). The FileSystemWatcher in
+            // We snapshot the on-disk save file directly: the game's own save
+            // writer is atomic (writes to temp then renames). The FileSystemWatcher in
             // SaveOrchestratorService handles auto-snapshots; this RCON path is
             // for admin-triggered.
             var rec = await _saves.SnapshotAsync("rcon").ConfigureAwait(false);
@@ -180,10 +156,8 @@ public sealed class RconHostedService : IHostedService
 
     private string BuildStatus()
     {
-        // Same "online" rule as /api/v1/health: the plugin is pinging or the game process is up.
-        // The old "plugin=disconnected" line told an admin nothing about the world.
-        var heartbeatTimeout = TimeSpan.FromSeconds(Math.Max(1, _opts.PluginHeartbeatTimeoutSeconds));
-        var running = _state.HasFreshHeartbeat(heartbeatTimeout) || GameProcessProbe.IsAlive(_opts.GamePidFile);
+        // Same "online" rule as /api/v1/health: the game process named in the pid file is up.
+        var running = GameProcessProbe.IsAlive(_opts.GamePidFile);
         var name = string.IsNullOrWhiteSpace(_opts.ServerName) ? $"Hearth - {_opts.InstanceId}" : _opts.ServerName.Trim();
         return FormatStatus(name, running, _state.EffectivePlayerCount, _opts.MaxPlayers, HearthVersionInfo.HearthVersion);
     }

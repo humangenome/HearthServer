@@ -8,7 +8,7 @@ namespace HearthServer.Services;
 
 /// <summary>
 /// Polls <c>roster.json</c> next to HearthServer.exe and pushes the
-/// snapshot into <see cref="PipeServerState"/> so the A2S info response
+/// snapshot into <see cref="ServerState"/> so the A2S info response
 /// (<see cref="SourceQueryHostedService"/>) and the HTTP players endpoint
 /// (<see cref="HearthHttpService"/>) reflect live player counts and names.
 ///
@@ -26,12 +26,12 @@ namespace HearthServer.Services;
 public sealed class RosterFileWatcherService : BackgroundService
 {
     private readonly ILogger<RosterFileWatcherService> _log;
-    private readonly PipeServerState _state;
+    private readonly ServerState _state;
     private readonly string _rosterPath;
     private DateTimeOffset _lastReadAt = DateTimeOffset.MinValue;
     private long _lastFileSize = -1;
 
-    public RosterFileWatcherService(ILogger<RosterFileWatcherService> log, PipeServerState state)
+    public RosterFileWatcherService(ILogger<RosterFileWatcherService> log, ServerState state)
     {
         _log = log;
         _state = state;
@@ -97,7 +97,6 @@ public sealed class RosterFileWatcherService : BackgroundService
                 PingMs: p.PingMs));
         }
         _state.SetPlayers(snapshots);
-        _state.LastReportedPlayerCount = snapshots.Count;
     }
 
     private static readonly JsonSerializerOptions JsonOpts = new()

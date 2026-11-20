@@ -10,17 +10,16 @@ using Microsoft.Extensions.Options;
 namespace HearthServer.Services;
 
 /// <summary>
-/// Save snapshot orchestrator. On a triggered snapshot, sends
-/// <see cref="FrameType.SaveQuiesce"/> to the plugin, waits for the
-/// game-side quiesce to complete, copies save files to the snapshot
-/// directory under an atomic-rename pattern, hashes them, records a
+/// Save snapshot orchestrator. On a triggered snapshot, runs save protection
+/// on the files the game last wrote (its writer is atomic), copies them to the
+/// snapshot directory under an atomic-rename pattern, hashes them, records a
 /// row in the database, and rotates old snapshots past retention.
 /// </summary>
 public sealed class SaveOrchestratorService : IHostedService, IDisposable
 {
     private readonly ILogger<SaveOrchestratorService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly PipeServerState _state;
+    private readonly ServerState _state;
     private readonly HearthRestartCoordinator _coordinator;
     private readonly SaveProtectionService _saveProtection;
     private readonly HearthDb _db;
@@ -38,7 +37,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     public SaveOrchestratorService(
         ILogger<SaveOrchestratorService> log,
         IOptions<HearthServerOptions> opts,
-        PipeServerState state,
+        ServerState state,
         HearthRestartCoordinator coordinator,
         SaveProtectionService saveProtection)
     {
@@ -52,6 +51,36 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     }
 
     public HearthDb Database => _db;
+
+    /// <summary>Free bytes on the disk under a path (tests replace it).</summary>
+    internal Func<string, long?> FreeSpaceProbe { get; set; } = RestoreZipLimits.FreeBytesOf;
+
+    /// <summary>
+    /// Tests only: runs right before each folder a restore makes, renames or deletes, with the step's name, so a
+    /// test can put a link in place at exactly that moment. Null otherwise.
+    /// </summary>
+    internal Action<string>? TestBeforeMove { get; set; }
+
+    /// <summary>
+    /// The one link a save folder may sit under (<see cref="SecondDriveRule"/>), for a user folder. Tests give it
+    /// stand-in drives; on a machine it is the server's own folder kept on a second drive.
+    /// </summary>
+    internal Func<string?, SecondDriveRule> FolderRule { get; set; } = SecondDriveRule.ForUserFolder;
+
+    // The zip a restore is reading right now: snapshot rotation never removes it.
+    private readonly object _restoreSourceGate = new();
+    private string? _restoreSource;
+
+    private string SavedDir => Path.Combine(_opts.GameUserDir, "Saved");
+
+    private RestoreZipLimits.Caps RestoreCaps => new(
+        _opts.MaxRestoreUnpackedBytes, _opts.MaxRestoreEntries, _opts.MaxRestoreEntryBytes, _opts.RestoreFreeSpaceFloorBytes);
+
+    private long? RestoreFreeBytes()
+    {
+        if (_opts.RestoreFreeSpaceFloorBytes <= 0) return null;
+        return FreeSpaceProbe(SavedDir);
+    }
 
     public async Task StartAsync(CancellationToken ct)
     {
@@ -292,22 +321,9 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
         try
         {
-            // If plugin is connected, request a SaveQuiesce so the game flushes
-            // in-flight state. If not connected, fall through — Bellwright writes its
-            // own save files atomically (temp + rename), so a snapshot taken
-            // without quiesce is still self-consistent. This unblocks the
-            // FileSystemWatcher auto-snapshot path which fires when Bellwright has just
-            // finished writing the file.
-            var conn = _state.Connection;
-            if (conn is not null)
-            {
-                await conn.SendAsync(FrameType.SaveQuiesce,
-                    new SaveQuiesceMessage(snapshotId, TimeoutSeconds: 30),
-                    ct).ConfigureAwait(false);
-                await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
-            }
-
-            // Protect the final, quiesced bytes immediately before archiving them.
+            // Bellwright writes its own save files atomically (temp + rename), so a
+            // snapshot of the files on disk is self-consistent. Protect those bytes
+            // immediately before archiving them.
             if (!await _saveProtection.ProtectCanonicalAsync(false, ct).ConfigureAwait(false))
             {
                 _log.LogError("Snapshot {Id} refused because save protection failed", snapshotId);
@@ -324,7 +340,7 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
             var snapshotPath = Path.Combine(_opts.SaveDir, $"{snapshotId}.zip");
             var tmpPath = snapshotPath + ".tmp";
-            var linksLeftOut = CreateSaveGamesZip(sourceDir, tmpPath, SecondDriveRule.ForUserFolder(_opts.GameUserDir));
+            var linksLeftOut = CreateSaveGamesZip(sourceDir, tmpPath, FolderRule(_opts.GameUserDir));
             if (linksLeftOut.Count > 0)
                 _log.LogWarning("Snapshot {Id}: {Count} link(s) in the save folder were left out, not followed: {Links}",
                     snapshotId, linksLeftOut.Count, string.Join(", ", linksLeftOut.Take(10)));
@@ -355,26 +371,58 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
         }
     }
 
-    private void RotateOldSnapshots()
+    /// <summary>
+    /// Remove the snapshots past the room they may take, oldest first (<see cref="SnapshotBudget"/>: the newest
+    /// <c>MaxSnapshotsKept</c> within <c>MaxSnapshotBytes</c>, and 30 days). Runs after every snapshot, the
+    /// pre-restore copy included, and after every upload. The newest snapshot and one a restore is reading stay.
+    /// A zip is removed only when it sits directly in <c>SaveDir</c>, and its row goes with it.
+    /// </summary>
+    internal void RotateOldSnapshots()
     {
         try
         {
-            var snapshots = _db.ListSnapshots(int.MaxValue);
-            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            foreach (var s in snapshots)
+            string? reading;
+            lock (_restoreSourceGate) reading = _restoreSource;
+            var items = _db.ListSnapshots(int.MaxValue)
+                .Select(s => new SnapshotBudget.Item(s.SnapshotId, s.TakenUnix, s.SizeBytes, s.RetentionDays, s.FilePath));
+            var keep = reading is null ? Array.Empty<string>() : new[] { reading };
+            foreach (var s in SnapshotBudget.ToRemove(items, DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                         _opts.MaxSnapshotsKept, _opts.MaxSnapshotBytes, keep))
             {
-                var ageSeconds = nowUnix - s.TakenUnix;
-                var maxSeconds = s.RetentionDays * 86_400;
-                if (ageSeconds <= maxSeconds) continue;
-                if (File.Exists(s.FilePath))
-                {
-                    try { File.Delete(s.FilePath); } catch { }
-                }
+                // The row stays while its zip does; the next pass tries again.
+                if (!TryRemoveSnapshotFile(s.FilePath)) continue;
+                _db.DeleteSnapshot(s.Id);
+                _log.LogInformation("Snapshot {Id} removed by rotation ({Bytes} bytes, taken {Taken:u})",
+                    s.Id, s.SizeBytes, DateTimeOffset.FromUnixTimeSeconds(s.TakenUnix));
             }
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Snapshot rotation pass failed");
+        }
+    }
+
+    // A snapshot zip is removed only when it sits directly in SaveDir, so a row can never send the removal anywhere
+    // else. File.Delete removes a link itself, never what it points to. A zip that is already gone counts as removed.
+    private bool TryRemoveSnapshotFile(string path)
+    {
+        try
+        {
+            var full = Path.GetFullPath(path);
+            var dir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_opts.SaveDir));
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            if (!string.Equals(Path.GetDirectoryName(full), dir, comparison) || Directory.Exists(full))
+            {
+                _log.LogWarning("Snapshot rotation left {Path} alone: it is not a file in the snapshot folder {Dir}", full, dir);
+                return false;
+            }
+            File.Delete(full);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Snapshot rotation could not remove {Path}", path);
+            return false;
         }
     }
 
@@ -452,8 +500,8 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
     /// save or a cross-server transfer payload). The zip must contain the
     /// contents of a SaveGames directory at its root (TEMP_auto.sav or a
     /// legacy savegame_N.sav).
-    /// Takes a pre-restore snapshot, kills the game, swaps in the new files, then
-    /// releases the supervisor gate.
+    /// Checks the zip and the save folders, then stops the game, takes a pre-restore snapshot, swaps in the new
+    /// files, and releases the supervisor gate.
     /// </summary>
     public async Task<bool> RestoreFromZipPathAsync(
         string zipPath, string requestedBy, string auditAction, CancellationToken ct = default)
@@ -466,6 +514,63 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
 
         using var _ = await _coordinator.BeginRestoreAsync(ct).ConfigureAwait(false);
 
+        // 0. Check the zip and the folders BEFORE stopping anything. A zip with no supported Bellwright save at the
+        // root (almost certainly the wrong folder zipped), one that unpacks to more than the caps allow, one with an
+        // entry whose path leaves the folder or whose name Windows would not store as a plain file, one whose data
+        // is not the size it states, and a save folder that sits under a link are all refused with the game still
+        // running and the world untouched. Until 2026-11-18 the zip was checked only after the stop and the
+        // pre-restore copy, it unpacked with no limit, and nothing checked the folders for links.
+        try
+        {
+            using var probe = ZipFile.OpenRead(zipPath);
+            if (!probe.Entries.Any(e => e.Length > 0 && IsRootSaveSlotPath(e.FullName)))
+            {
+                _log.LogWarning("Restore refused before stopping the game: zip {Path} contains no supported Bellwright save at the root", zipPath);
+                return false;
+            }
+            // The directory first (cheap), then one read of the data, writing nothing; the read is bounded by the
+            // caps the first check just held the stated sizes to.
+            var why = RestoreZipLimits.CheckBeforeUnpack(probe, RestoreCaps, RestoreFreeBytes())
+                ?? RestoreZipLimits.CheckStatedSizesHold(probe);
+            if (why is not null)
+            {
+                _log.LogWarning("Restore refused before stopping the game: zip {Path} {Why}", zipPath, why);
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Restore refused before stopping the game: zip {Path} could not be opened or read", zipPath);
+            return false;
+        }
+
+        var rule = FolderRule(_opts.GameUserDir);
+        var folderWhy = RestoreFolders.Problem(SavedDir, rule, out var realSaved);
+        var saveGamesDir = folderWhy is null ? Path.Combine(realSaved, "SaveGames") : "";
+        folderWhy ??= RestoreFolders.EntryProblem(saveGamesDir);
+        if (folderWhy is not null)
+        {
+            _log.LogWarning("Restore refused before stopping the game: {Why}; a restore never writes through a link", folderWhy);
+            return false;
+        }
+
+        lock (_restoreSourceGate) _restoreSource = Path.GetFullPath(zipPath);
+        try
+        {
+            return await StopAndSwapAsync(zipPath, requestedBy, auditAction, rule, realSaved, saveGamesDir, ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_restoreSourceGate) _restoreSource = null;
+        }
+        // gate released by `using` — supervisor will relaunch Bellwright on its
+        // next loop iteration.
+    }
+
+    private async Task<bool> StopAndSwapAsync(string zipPath, string requestedBy, string auditAction,
+        SecondDriveRule rule, string realSaved, string saveGamesDir, CancellationToken ct)
+    {
         // 1. Stop Bellwright first. Taking a snapshot BEFORE the kill would
         // capture whatever state Bellwright was mid-writing. Kill, wait for
         // exit, then snap.
@@ -479,55 +584,43 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             return false;
         }
 
-        // 3. Atomic SaveGames swap. Extract the incoming zip into a temp
-        // directory first; on success, rename the old SaveGames out of the
-        // way and rename the temp dir into place. If anything fails before
-        // the rename, the live SaveGames is untouched and the operation is
-        // a no-op rather than a corruption.
+        // 3. Atomic SaveGames swap, in the real Saved folder checked in step 0. Extract the incoming zip into a
+        // temp directory first; on success, rename the old SaveGames out of the way and rename the temp dir into
+        // place. If anything fails before the rename, the live SaveGames is untouched and the operation is a
+        // no-op rather than a corruption. Right before each folder is made, renamed or deleted, the Saved folder
+        // and the folders involved are checked again: a link that appeared stops the restore there.
         try
         {
-            var saveGamesDir = Path.Combine(_opts.GameUserDir, "Saved", "SaveGames");
-            Directory.CreateDirectory(Path.GetDirectoryName(saveGamesDir)!);
+            var savedDir = SavedDir;
+            void CheckFolders(string step, params string[] folders)
+            {
+                TestBeforeMove?.Invoke(step);
+                RestoreFolders.CheckBeforeMove(savedDir, rule, realSaved, folders);
+            }
 
             var stagingDir = saveGamesDir + ".incoming-" + Guid.NewGuid().ToString("N").Substring(0, 8);
             var prevDir = saveGamesDir + ".old-" + Guid.NewGuid().ToString("N").Substring(0, 8);
-
-            // Validate the zip BEFORE touching live SaveGames. A zip with no
-            // supported Bellwright save at the root is almost certainly a customer
-            // zipping the wrong folder — refuse rather than wipe their world.
-            try
-            {
-                using var probe = System.IO.Compression.ZipFile.OpenRead(zipPath);
-                var hasSave = probe.Entries.Any(e =>
-                    e.Length > 0 &&
-                    IsRootSaveSlotPath(e.FullName));
-                if (!hasSave)
-                {
-                    _log.LogWarning("Restore rejected: zip {Path} contains no supported Bellwright save at the root", zipPath);
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Restore rejected: zip {Path} could not be opened", zipPath);
-                return false;
-            }
 
             bool savesMovedAside = false;
             bool incomingInstalled = false;
             try
             {
+                CheckFolders("make-staging", saveGamesDir, stagingDir, prevDir);
+                Directory.CreateDirectory(realSaved);
                 Directory.CreateDirectory(stagingDir);
-                // .NET 5+ ZipFile.ExtractToDirectory validates entries don't
-                // escape the destination (zip-slip is rejected with an
-                // IOException), so the staging dir is the canonical sandbox.
-                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, stagingDir, overwriteFiles: true);
+                CheckFolders("unpack", stagingDir);
+                // Entries may not escape the staging dir, nothing is written through a link, and the unpack stops
+                // the moment it writes more than the caps allow, whatever sizes the zip states; the staging dir is
+                // the sandbox and is removed on any failure below.
+                RestoreZipLimits.ExtractWithinCaps(zipPath, stagingDir, RestoreCaps, RestoreFreeBytes());
 
                 if (Directory.Exists(saveGamesDir))
                 {
+                    CheckFolders("move-live-aside", saveGamesDir, prevDir);
                     Directory.Move(saveGamesDir, prevDir);
                     savesMovedAside = true;
                 }
+                CheckFolders("move-incoming-in", stagingDir, saveGamesDir);
                 Directory.Move(stagingDir, saveGamesDir);
                 incomingInstalled = true;
                 if (!_saveProtection.ResetForWorldReplacement())
@@ -536,7 +629,15 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 }
                 if (Directory.Exists(prevDir))
                 {
-                    try { Directory.Delete(prevDir, recursive: true); } catch { /* best effort */ }
+                    try
+                    {
+                        CheckFolders("delete-old", prevDir);
+                        RestoreFolders.DeleteTree(prevDir);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "The replaced saves were left at {Prev}", prevDir);
+                    }
                 }
             }
             catch (Exception ex)
@@ -548,9 +649,10 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 {
                     try
                     {
+                        CheckFolders("rollback", saveGamesDir, prevDir);
                         if (Directory.Exists(saveGamesDir))
                         {
-                            Directory.Delete(saveGamesDir, recursive: true);
+                            RestoreFolders.DeleteTree(saveGamesDir);
                         }
                         Directory.Move(prevDir, saveGamesDir);
                     }
@@ -564,7 +666,11 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 }
                 else if (savesMovedAside && Directory.Exists(prevDir) && !Directory.Exists(saveGamesDir))
                 {
-                    try { Directory.Move(prevDir, saveGamesDir); }
+                    try
+                    {
+                        CheckFolders("rollback", saveGamesDir, prevDir);
+                        Directory.Move(prevDir, saveGamesDir);
+                    }
                     catch (Exception rollbackEx)
                     {
                         _log.LogError(rollbackEx,
@@ -575,7 +681,12 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
                 }
                 if (Directory.Exists(stagingDir))
                 {
-                    try { Directory.Delete(stagingDir, recursive: true); } catch { }
+                    try
+                    {
+                        CheckFolders("delete-staging", stagingDir);
+                        RestoreFolders.DeleteTree(stagingDir);
+                    }
+                    catch { }
                 }
                 _log.LogError(ex, "Restore failed; SaveGames rolled back from {Prev}", prevDir);
                 throw;
@@ -602,7 +713,5 @@ public sealed class SaveOrchestratorService : IHostedService, IDisposable
             _log.LogError(ex, "Restore failed while swapping SaveGames");
             return false;
         }
-        // gate released by `using` — supervisor will relaunch Bellwright on its
-        // next loop iteration.
     }
 }

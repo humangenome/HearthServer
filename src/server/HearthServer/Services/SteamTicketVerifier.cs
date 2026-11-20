@@ -33,6 +33,7 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
 {
     private const int CbSteamServersConnected = 101;
     private const int CbSteamServerConnectFailure = 102;
+    private const int CbSteamServersDisconnected = 103;
     private const int CbValidateAuthTicketResponse = 143;
     private static readonly string[] AuthResponses =
     [
@@ -41,6 +42,40 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
         "AuthTicketNetworkIdentityFailure",
     ];
     private static readonly string[] BeginResults = ["OK", "InvalidTicket", "DuplicateRequest", "InvalidVersion", "GameMismatch", "ExpiredTicket"];
+
+    internal enum SteamLogin { NeverConnected, Connected, Lost }
+    internal enum SteamLoginLine { None, FirstOk, OkAgain, Failed, Lost }
+
+    /// <summary>
+    /// Which login line a Steam game-server callback earns, and the login state after it. Steam drops the game-server
+    /// login now and then (seen during its Tuesday maintenance, 2026-11-10) and logs back in by itself; until 0.1.99
+    /// only the first "login OK" and each failure were logged, so nobody could tell when Steam checks worked again.
+    /// Now a drop (callback 103) logs "lost" and the next connect logs "OK again".
+    /// </summary>
+    internal static SteamLoginLine NextLoginLine(int callbackId, ref SteamLogin state)
+    {
+        switch (callbackId)
+        {
+            case CbSteamServersConnected:
+                var before = state;
+                state = SteamLogin.Connected;
+                return before switch
+                {
+                    SteamLogin.NeverConnected => SteamLoginLine.FirstOk,
+                    SteamLogin.Lost => SteamLoginLine.OkAgain,
+                    _ => SteamLoginLine.None,
+                };
+            case CbSteamServerConnectFailure:
+                if (state == SteamLogin.Connected) state = SteamLogin.Lost;
+                return SteamLoginLine.Failed;
+            case CbSteamServersDisconnected:
+                if (state != SteamLogin.Connected) return SteamLoginLine.None; // never had it, or already logged as lost
+                state = SteamLogin.Lost;
+                return SteamLoginLine.Lost;
+            default:
+                return SteamLoginLine.None;
+        }
+    }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void VoidFn();
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int GsInitFn(uint ip, ushort gamePort, ushort queryPort, int mode, [MarshalAs(UnmanagedType.LPStr)] string version, byte[] interfaces, byte[] err);
@@ -58,6 +93,7 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
 
     private readonly ILogger<SteamGameServerTicketVerifier> _log;
     private readonly IdentityOptions _opts;
+    private readonly SteamLibraryGuard _guard;
     private readonly BlockingCollection<Work> _queue = new();
     private readonly Thread _thread;
     private string? _unavailable;
@@ -65,9 +101,13 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
     private sealed record Work(ulong SteamId, byte[] Ticket, TaskCompletionSource<SteamTicketResult> Done, DateTime Deadline);
 
     public SteamGameServerTicketVerifier(IOptions<HearthServerOptions> options, ILogger<SteamGameServerTicketVerifier> log)
+        : this(options, log, new SteamLibraryGuard()) { }
+
+    internal SteamGameServerTicketVerifier(IOptions<HearthServerOptions> options, ILogger<SteamGameServerTicketVerifier> log, SteamLibraryGuard guard)
     {
         _log = log;
         _opts = options.Value.Identity;
+        _guard = guard;
         _thread = new Thread(Run) { IsBackground = true, Name = "steam-ticket-check" };
         _thread.Start();
     }
@@ -108,12 +148,29 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
             // The old value goes back right after init so nothing HearthServer starts later inherits it.
             var oldAppId = Environment.GetEnvironmentVariable("SteamAppId");
             Environment.SetEnvironmentVariable("SteamAppId", _opts.SteamAppId.ToString());
-            // A Steam game server needs steamclient64.dll. the Steam API library looks for it by name, so loading it first by
-            // full path (its folder supplies tier0_s64 / vstdlib_s64) makes a box without a Steam client work too.
-            var client = FindSteamClient(_opts.SteamClientPath);
-            if (client is not null) { NativeLibrary.Load(client); _log.LogInformation("Identity: Steam client library {Path}", client); }
-            else _log.LogInformation("Identity: no steamclient64.dll found; relying on the Steam API library's own search");
-            lib = NativeLibrary.Load(path);
+            // A Steam game server needs steamclient64.dll. The Steam API library looks for it by name, so loading it first by
+            // full path (with tier0_s64 / vstdlib_s64 from the same folder) makes a box without a Steam client work too.
+            // Only Valve-signed files, held open from the check to the load, from a folder no other account can change when
+            // this process runs elevated (SteamLibraryGuard); anything else and Steam checks stay off, with no fallback to a
+            // search by name.
+            var client = _guard.LoadClient(_opts.SteamClientPath);
+            if (!client.Ok)
+            {
+                Environment.SetEnvironmentVariable("SteamAppId", oldAppId);
+                Fail("Steam client library refused: " + client.Detail + (_guard.IsElevated
+                    ? " (HearthServer runs with administrator rights, so the folder Identity:SteamClientPath names must be one only administrators can change)"
+                    : ""));
+                return;
+            }
+            _log.LogInformation("Identity: Steam client library from {Path} (signed by Valve, checked before loading)", client.Detail);
+            var api = _guard.LoadApi(path, client.Detail);
+            if (!api.Ok)
+            {
+                Environment.SetEnvironmentVariable("SteamAppId", oldAppId);
+                Fail("Steam API library refused: " + api.Detail);
+                return;
+            }
+            lib = api.Handle;
             T F<T>(string name) where T : Delegate => Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(lib, name));
 
             var dispatchInit = F<VoidFn>("SteamAPI_ManualDispatch_Init");
@@ -149,7 +206,7 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
 
             var pending = new Dictionary<ulong, Work>();
             var msg = Marshal.AllocHGlobal(32);
-            var connectedLogged = false;
+            var login = SteamLogin.NeverConnected;
             try
             {
                 while (true)
@@ -160,8 +217,16 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
                     {
                         var id = Marshal.ReadInt32(msg, 4);
                         var param = Marshal.ReadIntPtr(msg, 8);
-                        if (id == CbSteamServersConnected && !connectedLogged) { connectedLogged = true; _log.LogInformation("Identity: Steam game-server login OK"); }
-                        else if (id == CbSteamServerConnectFailure) _log.LogWarning("Identity: Steam game-server login failed (EResult {R})", Marshal.ReadInt32(param, 0));
+                        if (id is CbSteamServersConnected or CbSteamServerConnectFailure or CbSteamServersDisconnected)
+                        {
+                            switch (NextLoginLine(id, ref login))
+                            {
+                                case SteamLoginLine.FirstOk: _log.LogInformation("Identity: Steam game-server login OK"); break;
+                                case SteamLoginLine.OkAgain: _log.LogInformation("Identity: Steam game-server login OK again; Steam checks work again"); break;
+                                case SteamLoginLine.Failed: _log.LogWarning("Identity: Steam game-server login failed (EResult {R})", Marshal.ReadInt32(param, 0)); break;
+                                case SteamLoginLine.Lost: _log.LogWarning("Identity: Steam game-server login lost (EResult {R}); Steam checks wait until it is back", Marshal.ReadInt32(param, 0)); break;
+                            }
+                        }
                         else if (id == CbValidateAuthTicketResponse)
                         {
                             var who = (ulong)Marshal.ReadInt64(param, 0);
@@ -213,26 +278,12 @@ public sealed class SteamGameServerTicketVerifier : ISteamTicketVerifier, IDispo
         }
     }
 
+    // Where the client files would come from (the guard's folder choice): the configured file or folder only. null when
+    // none is configured or it is not there (no other folder is searched).
     internal static string? FindSteamClient(string configured)
     {
-        var candidates = new List<string>();
-        // Identity:SteamClientPath may name the file or the folder that holds it (the self-host notes say "set their folder").
-        if (!string.IsNullOrWhiteSpace(configured))
-            candidates.Add(Directory.Exists(configured) ? Path.Combine(configured, "steamclient64.dll") : configured);
-        candidates.Add(Path.Combine(AppContext.BaseDirectory, "steamclient64.dll"));
-        if (OperatingSystem.IsWindows())
-        {
-            foreach (var key in new[] { @"SOFTWARE\WOW6432Node\Valve\Steam", @"SOFTWARE\Valve\Steam" })
-            {
-                try
-                {
-                    using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(key);
-                    if (k?.GetValue("InstallPath") is string dir) candidates.Add(Path.Combine(dir, "steamclient64.dll"));
-                }
-                catch (Exception) { }
-            }
-        }
-        return candidates.FirstOrDefault(File.Exists);
+        var folder = new SteamLibraryGuard().ClientFolder(configured);
+        return folder is null ? null : Path.Combine(folder, "steamclient64.dll");
     }
 
     private void Fail(string why)

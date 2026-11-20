@@ -1,336 +1,17 @@
--- bw_host v0.18.64: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
---   v0.18.64: the r19 release: v0.18.63 plus the Travel Sign pass that walks each class once instead of looking
---              every object up by path (a join froze the world up to 6.2 s, three times; 2026-10-30 full pass).
---   v0.18.63: a Stop's save request goes to a controller with a player state, and one line says
---              which was picked (2026-10-30, identity lab: "NOT confirmed within 20 s" with nothing logged).
---   v0.18.62: game-thread time is measured and one search cost is cut (2026-10-25).
---              Boot (2026-10-26): the save request is served from the game-thread pump
---              every 2 s from the first frame (a Stop in the first two minutes after a
---              start used to kill unsaved), and the travel-sign provider check runs 40
---              per background pass (sign providers first), so the background loop is no
---              longer blocked 70-130 s after "listen server UP".
---              Joined walls (2026-10-26): the wall the game joins into another and destroys
---              is logged ("wall joined into ...") and dropped from the rebuild, scans and
---              rechecks; only the wall that grew is rebuilt (it read "0 -> 0" and "1 without").
---              The pump times every queued callback by label and counts the object
---              lookups made inside them (by path: StaticFindObject; walks: FindAllOf),
---              and logs one "gt 60s:" line a minute when any ran. The 10/24 fog lab
---              read 50-70 ms for one lookup by path of a joiner's object on the game
---              thread (inference from bw_fog's timing). The travel-sign repair looked
---              up every remote pawn once per sign, three passes after every join; it
---              now looks each pawn (and the blueprint library) up once per batch.
---   v0.18.61: game-thread work runs from one game-thread pump; the background
---              service loop no longer calls UE4SS's ExecuteInGameThread, any
---              hook registration or any game function (2026-10-18). In UE4SS b50986bd ExecuteInGameThread writes to the Lua
---              stack the game thread is running on, with nothing locking the
---              two. Now and then that left UE4SS's game-thread queue dead for the
---              rest of the session ("Ref was not function": 11 of 54 sessions
---              10/16-10/18, most with nobody on; roster, settings, joins help and
---              the save before a Stop all stopped), or crashed the game inside a
---              running callback (26 of 39 crashes in 10 days). The service loop
---              now appends to a plain Lua queue that the pump drains every frame;
---              the host start (OpenLevel, net driver swap), net tuning writes and
---              the quarantine's identity-string writes run on the game thread;
---              the join service reads Player/Pawn/PlayerNamePrivate instead of
---              calling IsLocalPlayerController/K2_GetPawn/GetPlayerName.
---              NotifyOnNewObject is registered from the pump's first run. A pump
---              that stops for 60 s is logged and the heartbeat ends ",stalled",
---              which the panel's Stop reads to wait for the game's own autosave.
---              The startup fast pin (12 s of GameMode/GameEngine travel settings
---              after host-up) is the one background write left, on purpose.
---              tests/host-thread-safety.test.lua keeps it that way.
---   v0.18.60: palisade walls placed by players become build sites (four customer
---              reports since 2026-09-05: invisible, never built, still block other
---              buildings, can be demolished). The game makes each wall piece's
---              construction site with the first player controller's character as
---              builder; on this host that controller is the hidden host, which has
---              no character, so every piece waited forever. After an accepted wall
---              edit the server re-runs the wall's own update with the placing
---              player's character in that slot for the one call, then empties it
---              again. Walls saved in the stuck state are healed once a player is on,
---              after a copy of the save (<save>.wallheal.bak). The spline census
---              lists every spline actor and each wall's build-site count. Off
---              switches: HEARTH_WALL_BUILDER=0, or a file Logs\bw_wallfix.off.
---   v0.18.59: (1) a game-thread callback that never runs no longer stops a
---              service for good (see GAME_THREAD_WATCH below; one server lost
---              its roster, settings, saves and join help for 58 h on 10/12).
---              (2) two full object searches left the game thread (2026-10-14). The
---              roster write searched every IpNetDriver on the game thread every
---              service pass with a player on (every 9 s idle), and the viewport
---              re-assert searched every GameViewportClient on the game thread
---              every 15 s. Each search walks the whole object list and froze the
---              server for 65-110 ms; on the fixed 30 fps step that is lost world
---              time. The roster now reads the listen world's own net driver
---              (kept by the service loop) and the viewport comes from the
---              engine's GameViewport; each falls back to the old search only
---              when that object is not known. Roster contents are unchanged.
---   v0.18.58: the false "Server full" after a fast reconnect (2026-09-16,
---              seen again 2026-10-09 at PCs=4 against a cap of 5). The engine
---              refuses a login with "Server full." when GameMode NumPlayers +
---              NumTravellingPlayers reaches GameSession MaxPlayers, and on these
---              hosts that sum can stay above the number of live controllers
---              after a player reconnects before their old connection is reaped,
---              until a restart. The heartbeat now logs the engine's count next
---              to the live controllers (seats=) and, when the count stays above
---              the live non-spectator controllers for two heartbeats in a row
---              with no join or leave in between and nobody travelling, sets it
---              back on the game thread. Log line: 'seat count corrected'.
---              Kill switch: environment HEARTH_SEAT_HEAL=0. Also folds in the
---              unreleased v0.18.56 dropped-controller change below (with its
---              objectAddress use-before-definition fixed: it stopped the join
---              service on every pass in the lab), and removes a MapFog sweep
---              loop that had never run (same use-before-definition shape).
---   v0.18.57: a late joiner is no longer frozen. HearthServer drops a
---              login-identities row 45 min after login. The conn of a player
---              who stayed longer then failed its sticky lookup and recency-
---              claimed the next fresh row, which was the newcomer's; the
---              newcomer got no identity and was quarantined (no-login-
---              identity) ~7 min later, and the old player took over the
---              newcomer's roster id (and admin ticket, if any). Seen
---              2026-10-10 on two servers. A conn that holds a claim now only
---              re-claims a row with its own seed; a captured identity holds
---              for the life of the controller (only weak -> Steam-backed may
---              replace it); claims and identities keyed by object address
---              are dropped when the address now holds a differently named
---              conn or controller.
---   v0.18.56: (first shipped in v0.18.58) leave a real player's dropped
---              controller to the game. A remote
---              player whose connection dropped on the Halmare map had their
---              orphaned controller frozen by the pre-login quarantine 9 s later
---              (SetReplicates false, tick off, hidden) while the game kept it
---              alive for 2.5 min; the rejoin 35 s after the drop came back with
---              an empty character (2026-09-15). The quarantine now skips any
---              controller that was serviced with a live connection, nothing is
---              quarantined or start-driven on the TransitionMap, and the host's
---              own controller is recognised by object address across a travel
---              (its full name changes per map; it was quarantined on the return
---              trip). Log line: 'remote player connection dropped, controller
---              left to the game'.
---   v0.18.55: Renown readout and a staff repair lever. A remote player's
---              Renown went to -14,560 after a time skip on the islands. In
---              this build the HUD number is TotalRenown minus the Renown
---              "used" by recruited villagers and structures (UMistHiring-
---              ValueComponent::UpdateUsedRenown, recomputed on data rebind and
---              snapshotted per map on a voyage); daily militia/mercenary
---              upkeep is paid in coins, never Renown. The mod now logs the
---              hiring component's readable properties at install, after each
---              world change and around every Renown movement it can hook
---              (PayRenownCost, MulticastRenownGained, ServerGiveRenown), and
---              honours an operator marker Logs\bw_renown.marker holding one
---              integer: GiveRenown(n) through the game's own cheat component,
---              logged before/after, marker removed. Nothing runs without it.
---   v0.18.54: (1) a seamless travel passes through /Game/Mist/Maps/Dev/
---              TransitionMap for ~25 s; v0.18.50 took THAT as the world change
---              and its 60 s throttle swallowed the real destination, so the
---              Travel Sign sweep re-ran against the transition map. In-transit
---              worlds are ignored now; the destination is the change.
---              (2) Log-only diagnostics for the two open reports on a remote
---              player's map after a voyage and their palisade after Place:
---              the seamless-travel handshake (ServerFinishSeamlessTravelSetup,
---              ClientPostSeamlessTravelSetup, the ClientSendIcon* stream and
---              ServerKeyValuesAck per player), the four Client spline replies,
---              a property dump of the wall actor after every accepted edit and
---              the construction-site count before/after. Nothing else changes.
---   v0.18.53: flush spline dormancy BEFORE the game edits replicated points.
---              Waking afterward can initialize the replication comparison from
---              the already-modified state and lose the update. Request the net
---              update after the edit; combining splines handles both actors.
---   v0.18.52: wake the wall/road actor after every server-side spline edit.
---              v0.18.51's log proved the mechanism: the server accepts each
---              segment (points 1->2->3, versions match) but the spline actor
---              is DORM_DormantAll and AddPoints never flushes dormancy, so the
---              new points never reach a remote player. Their game, still
---              holding a one-point copy, cancels the placement and asks the
---              server to remove "the lone post" (rejected: stale version), and
---              the wall they placed is invisible until they rejoin. A listen
---              host never sees this (it reads server state directly). Now the
---              post-hook of every spline edit RPC calls FlushNetDormancy +
---              ForceNetUpdate on the actor, the engine's own idiom for a
---              dormant actor that just changed.
---   v0.18.51: Splineworks (palisade wall / road) server-side diagnostics. A
---              remote player's wall preview vanishes on confirm and the game
---              logs nothing. The server's ServerExtendSpline rejects an edit
---              when the version the client sends differs from the actor's
---              replicated EditVersion, or when the segment cannot be crafted
---              (walls cost nothing, so only the version gate applies). Every
---              spline RPC is now logged with both versions and the actor's
---              replication settings. Log-only, pcall-wrapped, no handles kept.
---   v0.18.50: stop holding UObject handles across ticks. Three host crashes
---              (one server: 2026-08-29, 2026-09-05, 2026-09-06) symbolized against
---              the pinned UE4SS b50986bd PDB: two access violations inside the
---              UE4SS call thunk / object wrapper while a queued game-thread
---              callback called a UFunction with a component, provider, icon class
---              or pawn handle the Travel Sign code had kept from an earlier tick,
---              and one process abort from a Lua error escaping a LoopAsync body.
---              Travel Sign memory now stores object PATHS and resolves each one
---              through StaticFindObject on the game thread at the moment of use,
---              remote pawns are resolved the same way, every LoopAsync body runs
---              under pcall, and a live-world change (the Halmare voyage and the
---              trip back are ServerTravel) clears the Travel Sign memory and
---              re-runs the startup sweep so the map is not empty until a restart.
---   v0.18.49: apply host-managed gameplay settings through a build-locked
---              native server path. Bellwright's own SaveChanges deliberately
---              skips persistence on NM_Client, so a remote player's host flag
---              can never save these values. The native helper runs only on the
---              game thread, verifies the exact retail executable, invokes the
---              authoritative UMistGameSettingsData setters, mirrors the game's
---              persistence-dirty calls, and writes exact readback status. Keep
---              polling the immutable config revision so Apply works live and
---              startup readiness can fail closed on missing/mismatched settings.
---   v0.18.48: bound the late-spawn Travel Sign sweep to startup instead of
---              walking every map-icon provider for the lifetime of the host.
---              Remember non-travel providers after their owner resolves, rely
---              on the existing object hooks for later arrivals, and protect
---              every queued game-thread callback with a Lua-level pcall so an
---              ordinary callback error cannot enter UE4SS's unsafe traceback
---              path and terminate the host process.
---   v0.18.47: permit only the MapFog actor tick after all four build-locked
---              null-RHI patches verify. Keep every component tick disabled. The
---              missing fourth patch skips the exact UMapRevealerComponent virtual
---              call whose null Canvas caused both v0.1.77 crashes at 62 seconds.
---   v0.18.46: keep looking for Travel Signs instead of trusting one boot-time
---              sweep. On a loaded save the Fast Travel components can spawn after
---              that sweep, which returned components=0 providers=820 on a live
---              server; the scan was one-shot, so nothing ever looked again and
---              only a sign that happened to arrive through the runtime hook was
---              ever repaired. Rescan on an interval, clear give-up markers so a
---              component that failed only because its owner was not ready yet is
---              retried, and always sweep the world on a player sync pass instead
---              of only when nothing has been remembered — that guard meant one
---              known sign permanently disabled the search for the rest.
---   v0.18.45: deliver the granted admin flag to a client whose pawn went dormant,
---              and stop trusting a silent write. ForceNetUpdate only flushes net
---              dormancy when it can resolve a NetDriver for the actor, so a
---              DORM_Initial pawn keeps its opening bunch and never sends the
---              property again. Call FlushNetDormancy explicitly, republish the
---              write across the first few service ticks, and log the read-back
---              value plus the dormancy state so a locked client can be told apart
---              from a failed write. No change to who may be granted authority.
---   v0.18.44: replay completed Travel Signs through Bellwright's reflected
---              ServerRepairTravelComponent RPC for each ready remote player.
---              Keep the existing bounded road/icon refresh and MapFog guard;
---              this remains scoped to completed FastTravelSign_C actors.
---   v0.18.43: publish the authenticated bIsHostPlayer write to the owning client.
---              bIsHostPlayer is a replicated native property and this build links
---              Unreal's push-model replication, so the direct write never left server
---              memory and the gameplay-settings UI stayed locked. Mark the property
---              dirty through the reflected UNetPushModelHelpers and force a net update
---              on the owner, and disable push model pre-host when an admin is
---              configured so the listen server's rep layouts never skip the compare.
---              No change to who may be granted authority.
---   v0.18.42: consume the authenticated admin ticket from HearthServer's
---              validated login cache when UE4SS cannot reflect RequestURL.
---   v0.18.41: grant Bellwright's replicated bIsHostPlayer authority only after
---              a one-use HearthServer ticket proves the RCON/admin password and
---              binds the configured Steam64 identity to the connection source.
---   v0.18.40: promote a newly completed Travel Sign to the bounded player-sync
---              path when remote players are already connected. This refreshes
---              that sign's road graph and false/true discovery state without
---              enabling MapFog or replaying unrelated map icons.
---   v0.18.39: replay completed Travel Sign discovery after a remote player's
---              map-icon manager and possessed pawn are ready. Bellwright ignores
---              a repeated true-only discovery request once the provider is
---              already marked, so use its built-in false/true transition in
---              three bounded post-join passes and refresh the sign road graph.
---   v0.18.38: pair Travel Sign and map-icon-provider subobjects through their
---              shared actor owner. Provider construction can lag the fast-travel
---              component by more than the bounded retry window; the provider
---              object hook now re-arms that exact sign when it becomes ready.
---   v0.18.37: keep MapFog fully disabled under null-RHI and repair only completed
---              Travel Sign discovery through Bellwright's built-in
---              SetMapIconDiscovered path. Full MapFog ticking still crashes after
---              the known render paths are patched.
---   v0.18.35: invoke the already-validated operator save component directly
---              after the game-thread handoff. Revalidating the reflected object
---              inside the callback can stall the Unreal game thread.
---   v0.18.34: make operator save-component resolution fail-safe. Validate
---   reflected objects inside protected calls, fall back to a bounded class
---   scan, and surface service-loop errors instead of silently swallowing the
---   request while its port-scoped marker remains pending.
---   v0.18.33: resolve the native cheating component from the established
---   service loop before queueing the game-thread save call. A fresh full-object
---   lookup inside the callback can abort the callback before it logs or clears
---   the marker; the queued callback now only validates and invokes the cached
---   component, with every callback error logged and retried safely.
---   v0.18.32: place operator force-save markers beside the host log, where
---   the live UE4SS process already has proven read/write access. Keep the
---   Windows Temp marker as a compatibility fallback and remove every scoped
---   copy after one successful native save request.
---   v0.18.31: support a port-scoped operator force-save marker. Resolve
---   Bellwright's reflected cheating component and invoke its native Auto-slot
---   save on the game thread, so recovery can be verified without a test player.
---   v0.18.30: continue the existing TEMP auto-save through Bellwright's native
---   travel options instead of opening Karvenia as a new game. Preserve the
---   listen port and paid player capacity on the same travel URL.
---   v0.18.29: require the safe UE4SS field sentinel and check IsValidField
---   before optional reflected property reads/writes. A missing field can appear
---   during UObject teardown/GC; never dereference that invalid-field sentinel.
---   v0.18.28: remove direct runtime mutation of live NPC Mutable components;
---   Bellwright can be inside an asynchronous skeletal-mesh update when those
---   UE4SS native calls fire, causing an uncatchable game-thread access violation.
---   Keep the safe cvar/render suppression only. Give native persistence a full
---   grace window before retrying HandleStartingNewPlayer so an existing player
---   record can resolve before the host drives the start handler again.
---   v0.18.27: preserve Bellwright's native persistent-player lifecycle. The
---   login URL's stable Name is consumed by InitNewPlayer before PostLogin; do
---   not overwrite PlayerState/controller/connection identity afterward. Retry
---   HandleStartingNewPlayer on the game thread while persistence finishes
---   loading instead of forcing RestartPlayer, which creates an unbound default
---   pawn with no AMistPlayer state. Leave streaming, movement, customization,
---   and cinematic readiness to Bellwright's normal player-start flow.
---   v0.18.26: strip the UTF-8 BOM from the first login-identity timestamp so
---   the first player after restart is immediately claimable. Keep the identity
---   grace beyond the 150s cache window and never re-service a quarantined PC.
---   v0.18.25: keep join/identity servicing alive when UE4SS transiently exposes
---   ClientConnections with a nil array count. Treat that tick as empty instead
---   of throwing out of serviceJoiners; later ticks resume the live connections.
---   v0.18.24: apply the paid player capacity to Bellwright's native GameSession.
---   Bellwright's hidden listen host consumes one native seat, so a 4-player
---   dedicated host needs MaxPlayers=5 to admit four real remote players. The
---   supervisor/A2S count remains 4 because the hidden host is never customer-visible.
---   v0.18.23: recency-claim fallback for the login identity cache. On some
---   endpoints UE4SS exposes BOTH UNetConnection.RequestURL and the remote
---   address as unreadable object proxies, so the v0.18.21 byAddress/byLogin
---   lookups can never match and the REAL joiner got quarantined after the 30s
---   grace (interactions dead and the pawn hidden server-side). Now an
---   unmatched live remote conn claims the oldest UNCLAIMED fresh (<150s) row
---   from login-identities.tsv — Bellwright's LogNet login and the controller
---   creation are seconds apart, so time-proximity is authoritative when direct
---   matching is blind. Each row is handed out once (claim registry), claims are
---   sticky per connection, and the pre-login grace is raised 30s -> 75s for
---   slow-loading clients. Genuinely identity-less controllers still quarantine.
---   v0.18.22: clear a stale roster at idle. writeRoster was only called when a
---   remote joiner was live, so after the last player left (or a restart) the last
---   non-empty roster.json persisted forever -> the launcher showed a phantom
---   "1 player, no name, always there" (often a pre-guard UScriptStruct identity).
---   Now the idle service loop refreshes the roster every ~9s so it self-clears to
---   players:[]; safe because the IpNetDriver scan is cheap under -nullrhi.
---   v0.18.21: use HearthServer's Bellwright LogNet login identity cache when
---   UE4SS exposes UNetConnection.RequestURL as a transient UObject proxy.
---   v0.18.20: guard diagnostic World.TimeSeconds math when UE4SS returns an
---   Unreal property proxy instead of a Lua number, so join servicing cannot throw.
---   v0.18.19: add a low-risk post-host liveness heartbeat and retire the
---   high-frequency travel-pin loop shortly after listen startup so repeated
---   UObject travel probes cannot wedge the Lua VM while the game keeps ticking.
---   v0.18.18: keep the post-travel host loop alive even when GameInstance lookup
---   disappears after OpenLevel, so idle heartbeat/join servicing continues.
---   v0.18.17: prefer the launcher's Steam-backed PlayerId / PlatformUserId over
---   generated ?Name values for reconnect/save identity.
---   v0.18.16: keep once-identified local host phantom controllers out of the
---   remote joiner path even if Bellwright later reports them as non-local.
---   v0.18.15: only spawn/possess controllers after a live NetConnection has a
---   stable Hearth login identity, and isolate stale pre-login controllers so
---   failed handshakes cannot become sleeping/interacting ghost players.
---   v0.18.14: reject transient UE object strings (UScriptStruct/UObject/etc.)
---   as player identities; clear them before spawn instead of saving them as
---   reconnect keys.
---   v0.18.13: reconnect/save identity fix — seed the joiner's PlayerState/PC string fields
---   from the direct-IP login URL before forced RestartPlayer, and stop roster ids from
---   falling back to transient UObject addresses.
---   v0.18.12: TICK-RATE fix — cache hot FindFirstOf lookups + kill the per-pass full-object bench scan; the continuous GUObjectArray walks (UObjectArrayCache off) held the UE4SS Lua lock ~100% and serialized every engine frame to ~1.5s (0.65fps, joiners frozen).
---   v0.18.11: roster/player-count fix — count every live ClientConnection, no longer
---   drop connections whose OSS=Null PlayerState name looks generated (the "0 of 4
---   forever" A2S count bug; name stays cosmetic, count is ground-truth connections).
+-- bw_host v0.18.71: Bellwright (UE5.7.4 "Mist") headless host mod for Hearth.
+--   Version history: docs/HOST-MOD-HISTORY.md (moved out of this file in v0.1.102).
+--
+-- Design notes the code depends on:
+--   - Game-thread work runs from one game-thread pump (v0.18.61). The background service loop
+--     never calls ExecuteInGameThread, a hook registration or a game function: in UE4SS b50986bd
+--     ExecuteInGameThread writes to the Lua stack the game thread is running on, with nothing
+--     locking the two, which killed the game-thread queue for the rest of a session or crashed the
+--     game inside a running callback. The loop appends to a plain Lua queue that the pump drains
+--     every frame. A pump stopped for 60 s is logged and the heartbeat ends ",stalled", which the
+--     panel's Stop reads to wait for the game's own autosave.
+--   - The startup fast pin (12 s of GameMode/GameEngine travel settings after host-up) is the one
+--     background write left, on purpose. tests/host-thread-safety.test.lua keeps it that way.
+--
 -- Proven recipe (spike 2026-06-13 + on-box validation 2026-06-14):
 --   1. Wait for a SETTLED main menu (the menu world name unchanged for >=6s, and >=18s elapsed).
 --   2. swap NetDriverDefinitions[GameNetDriver] SteamSocketsNetDriver -> stock IpNetDriver
@@ -388,8 +69,17 @@ local ADMIN_AUTH = {
     consumedTickets = {},
     republishByPc = {},
 }
+-- A personal Steam account's SteamID64: exactly 17 ASCII digits, account 1 to 2^32-1
+-- (76561197960265729 to 76561202255233023). Accounts so far start 7656119, newer ones
+-- will start 7656120, so no prefix test. Compared as Lua integers, never as floats.
+-- On ADMIN_AUTH, not a new local: the main chunk is at Lua's 200-local limit.
+function ADMIN_AUTH.isSteamId64(s)
+    if type(s) ~= "string" or #s ~= 17 or not s:match("^%d+$") then return false end
+    local n = tonumber(s)
+    return math.type(n) == "integer" and n >= 76561197960265729 and n <= 76561202255233023
+end
 for candidate in tostring(getenv_file("HEARTH_ADMIN_STEAM_IDS", nil, "")):gmatch("[^,%s]+") do
-    if #candidate == 17 and candidate:match("^7656119%d%d%d%d%d%d%d%d%d%d$") then
+    if ADMIN_AUTH.isSteamId64(candidate) then
         ADMIN_AUTH.configured[candidate] = true
         ADMIN_AUTH.count = ADMIN_AUTH.count + 1
     end
@@ -404,6 +94,42 @@ GAMEPLAY_SETTINGS = {
     lastCheckT = -10,
     lastStatus = nil,
 }
+-- v0.18.65: the background loop's quiet switch and its own timing (see the header). Global
+-- (uppercase): the main chunk is at Lua's 200-active-locals limit. Paths are set at first use.
+BG_LOOP = { enabled = (os.getenv("HEARTH_BG_QUIET") ~= "0"), quiet = false, quietRounds = 0, fullEvery = 10,
+    statusMaxAge = 150, lastPCs = 0, paths = nil }
+-- True only while bw_pause's status file says the world is paused with nobody connected and was
+-- written in the last statusMaxAge seconds. No file, an old or half-written file, a connection,
+-- bw_pause switched off or this switch off: false, and the loop runs in full as before.
+BG_LOOP.pausedNow = function()
+    local B = BG_LOOP
+    if not B.enabled then return false end
+    if not B.paths then
+        local d = type(LOG) == "string" and LOG:match("^(.*)[/\\][^/\\]+$") or nil
+        B.paths = { status = d and (d .. "\\bw_pause.status") or nil, off = d and (d .. "\\bw_bgquiet.off") or nil }
+    end
+    B.offNow = false
+    if not B.paths.status then return false end
+    if B.paths.off then
+        local off = io.open(B.paths.off, "r")
+        if off then off:close(); B.offNow = true; return false end
+    end
+    local f = io.open(B.paths.status, "r")
+    if not f then return false end
+    -- v0.18.69 (Security, 2026-11-15): at most 512 bytes. The server owner can write the Logs folder, and a whole-file
+    -- read every 1.5 s would pull any size into the game's memory on a machine other customers share. bw_pause writes
+    -- about 120 bytes; a longer file is not its status file: not paused, the loop runs in full.
+    local text = f:read(512) or ""
+    local more = f:read(1)
+    f:close()
+    if more ~= nil then return false end
+    local paused = text:match("paused=(%d+)")
+    local conns = tonumber(text:match("connections=(%d+)") or "")
+    local updated = tonumber(text:match("updated=(%d+)") or "")
+    if paused ~= "1" or conns ~= 0 or not updated then return false end
+    local age = os.time() - updated
+    return age >= -5 and age <= B.statusMaxAge
+end
 
 local function log(s)
     local line = "[bw_host] " .. tostring(s)
@@ -610,7 +336,7 @@ local function optionalFieldText(obj, key)
     return tostring(value)
 end
 
-log("mod loaded v0.18.64  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
+log("mod loaded v0.18.71  port=" .. tostring(GAME_PORT) .. " world=" .. tostring(WORLD_NAME)
     .. " customerMaxPlayers=" .. tostring(CUSTOMER_MAX_PLAYERS)
     .. " nativeMaxPlayers=" .. tostring(NATIVE_MAX_PLAYERS)
     .. " configuredAdmins=" .. tostring(ADMIN_AUTH.count)
@@ -836,8 +562,8 @@ end
 -- whatever it finds. Objects are only used inside this callback, never across frames. A batch under walkMin signs keeps
 -- the lookup by path, which is cheaper there. A name the walk does not list falls back to the lookup by path.
 ObjRef.walkMin = 3
-ObjRef.resolveInBatch = function(batch, key, className)
-    if (batch.size or 0) < ObjRef.walkMin then return ObjRef.resolve(key, className) end
+-- every object of one class in this callback, by full name (one walk per class per callback)
+ObjRef.walkByName = function(batch, className)
     batch.walked = batch.walked or {}
     local byName = batch.walked[className]
     if not byName then
@@ -849,9 +575,21 @@ ObjRef.resolveInBatch = function(batch, key, className)
         end
         batch.walked[className] = byName
     end
-    local obj = byName[key]
+    return byName
+end
+ObjRef.resolveInBatch = function(batch, key, className)
+    -- v0.18.66: a walk this callback already made is used whatever the batch size
+    if (batch.size or 0) < ObjRef.walkMin and not (batch.walked and batch.walked[className]) then
+        return ObjRef.resolve(key, className)
+    end
+    local obj = ObjRef.walkByName(batch, className)[key]
     if obj and obj.IsValid and obj:IsValid() then return obj end
-    return ObjRef.resolve(key, className)
+    -- v0.18.67: the walk lists every live object of the class, so a name it does not list is gone (or was
+    -- renamed after the construction hook took it). No lookup by path: 61 of them held the game thread
+    -- 3.6 s in the minute a player joined (lab 2026-11-14).
+    local sg = BG_LOOP.sg
+    if sg then sg.gone = (sg.gone or 0) + 1 end
+    return nil
 end
 
 local travelSignPending = {}
@@ -873,6 +611,22 @@ local travelSignPlayerSyncReason = "none"
 local TRAVEL_SIGN_DISCOVERY_SCAN_PASSES = 8
 local TRAVEL_SIGN_DISCOVERY_SCAN_INTERVAL = 60
 local TRAVEL_SIGN_PROVIDER_BATCH = 40
+-- v0.18.66: bumped by a world reset; a pass queued before the reset does nothing when it runs
+local travelSignGeneration = 0
+-- v0.18.68 (see travelSignPassOnGameThread): recheck delay for "no owner yet", the most a due name waits for company,
+-- the pass budget, the background loop's clock (stamped on new names by the hooks), the scan pass owing its second half
+local TRAVEL_SIGN_WAIT_RECHECK = 30
+local TRAVEL_SIGN_FOLD_WAIT = 15
+local TRAVEL_SIGN_PASS_BUDGET_MS = 40
+local travelSignClock = 0        -- the background loop's clock at its last round (the hooks stamp new names with it)
+local travelSignScanHalf = nil   -- { providers = n, dueT = t } while a startup scan pass still owes its component walk
+-- v0.18.69 (see travelSignProvidersDue), global: the main chunk is at Lua's 200-active-locals limit.
+--   halfGap: loop seconds from a scan pass's provider walk to its component walk (v0.18.68: the next pass, 3 s), so a
+--            pass is two walks a minute apart and the next pass starts TRAVEL_SIGN_DISCOVERY_SCAN_INTERVAL later;
+--   rideScan: while the startup scan runs, waiting and new provider names are checked by the scan's own provider walk
+--            (in hand) instead of walks of their own, and a name that walk does not list is dropped as gone;
+--   walkGap: after the startup scan, at most one provider-check walk per this many loop seconds.
+TRAVEL_SIGN_TUNE = { halfGap = 60, rideScan = true, walkGap = 30, lastProviderWalk = -1e9 }
 
 local function travelSignObjectKey(obj)
     local key = objFullName(obj)
@@ -882,6 +636,8 @@ end
 
 local function queueTravelSignKey(key, retries, playerSync)
     if type(key) ~= "string" or not ObjRef.pathFromFullName(key) then return end
+    -- v0.18.67: a class's own template (Default__...) is never a placed sign and never in a walk
+    if key:find("Default__", 1, true) then return end
     local pending = travelSignPendingByKey[key]
     if pending then
         if playerSync then pending.playerSync = true end
@@ -925,8 +681,18 @@ local function rememberTravelSignComponent(component, owner)
     return ownerKey
 end
 
-local function rememberTravelSignProvider(providerKey)
-    local provider = ObjRef.resolve(providerKey, "MistMapIconProviderComponent")
+-- Game thread (v0.18.66). looked: this callback's walks; inHand: the object, when the caller holds it.
+local function rememberTravelSignProvider(providerKey, looked, inHand)
+    local provider = inHand
+    if not provider then
+        -- v0.18.67: not `looked and resolveInBatch(...) or resolve(...)`: a name the walk does not list comes back nil,
+        -- and that form then looked it up by path anyway
+        if looked then
+            provider = ObjRef.resolveInBatch(looked, providerKey, "MistMapIconProviderComponent")
+        else
+            provider = ObjRef.resolve(providerKey, "MistMapIconProviderComponent")
+        end
+    end
     if not provider then return "invalid" end
     if travelSignProviderSeen[providerKey] then return "remembered" end
 
@@ -954,12 +720,21 @@ local function rememberTravelSignProvider(providerKey)
     return "remembered"
 end
 
+local function queueTravelSignProviderKey(providerKey)
+    if not ObjRef.pathFromFullName(providerKey) then return end
+    -- v0.18.66: a Blueprint's component template (..._GEN_VARIABLE) belongs to the class, not to an actor, so
+    -- its owner never resolves: it answered "wait" on every pass for the life of the server. The object walk
+    -- never lists templates; only the construction hook saw them.
+    if providerKey:find("_GEN_VARIABLE", 1, true) then return end
+    -- v0.18.67: the same for a class's own template objects (Default__...)
+    if providerKey:find("Default__", 1, true) then return end
+    if travelSignProviderSeen[providerKey] or travelSignProviderPending[providerKey] then return end
+    -- v0.18.68: the value is when the name is next due (loop clock); a new name is due now
+    travelSignProviderPending[providerKey] = travelSignClock
+end
 local function queueTravelSignProvider(provider)
     if not (provider and provider.IsValid and provider:IsValid()) then return end
-    local providerKey = travelSignObjectKey(provider)
-    if not ObjRef.pathFromFullName(providerKey) then return end
-    if travelSignProviderSeen[providerKey] or travelSignProviderPending[providerKey] then return end
-    travelSignProviderPending[providerKey] = true
+    queueTravelSignProviderKey(travelSignObjectKey(provider))
 end
 
 local function classDerivesFromNamed(cls, baseName)
@@ -1131,7 +906,8 @@ local function requestTravelSignPlayerSyncImpl(reason)
         .. " passes=" .. tostring(TRAVEL_SIGN_PLAYER_SYNC_PASSES))
 end
 
-local function queueTravelSignPlayerSyncPass(passNumber)
+-- Game thread (v0.18.66: was the background loop). looked: this callback's walks.
+local function queueTravelSignPlayerSyncPass(passNumber, looked)
     local queued = 0
     for _, components in pairs(travelSignComponentsByOwner) do
         for _, componentKey in ipairs(components) do
@@ -1145,7 +921,7 @@ local function queueTravelSignPlayerSyncPass(passNumber)
     -- this stopped looking, so a server that found one sign at boot stayed on
     -- that one sign for its whole life while the rest stayed invisible.
     local swept = 0
-    for _, component in ipairs(safeFindAll("MistFastTravelComponent")) do
+    for _, component in pairs(ObjRef.walkByName(looked, "MistFastTravelComponent")) do
         queueTravelSignComponent(component, 0, true)
         swept = swept + 1
     end
@@ -1155,85 +931,208 @@ local function queueTravelSignPlayerSyncPass(passNumber)
         .. " swept=" .. tostring(swept))
 end
 
-local function serviceTravelSignDiscoveryImpl(now)
-    if travelSignDiscoveryQueued or now < travelSignDiscoveryNextT then return end
-    travelSignDiscoveryNextT = now + 3
+-- v0.18.66: the Travel Sign service runs on the game thread (until v0.18.65 the background loop looked providers up by
+-- path, called GetOwner and walked the objects itself, against the v0.18.61 rule; tests/host-thread-safety.test.lua
+-- now reaches this service and fails if it slips back).
+-- v0.18.68: one pass does one piece of work at a time. The 2026-11-14 re-lab of v0.18.67 measured 1.5-1.6 s a minute of
+-- game-thread time in the first minutes after a start (a walk of every map-icon provider every 3 s, to recheck the
+-- 36-43 that had no owner yet) and a 257 ms pass in the minute a player joined (two walks plus lookups by path in one
+-- callback). Now:
+--   * a provider with no owner yet is checked again 30 s (loop clock) later, not on every pass;
+--   * one or two due names wait up to 15 s for more and are then checked with one walk, never one lookup by path each;
+--   * the pieces of a pass (repairs, a player-sync sweep, each half of a startup scan, the provider checks) each take
+--     about one walk; after the first piece, a pass starts no other piece once it has used 40 ms, and what it did not
+--     start runs on the next pass, 3 s later. The startup scan's two walks are two pieces.
+-- Same work and the same order of results as before; only the timing within a few seconds changes.
 
-    -- v0.18.62: at most TRAVEL_SIGN_PROVIDER_BATCH other providers per pass, sign providers always.
-    -- The first scan queues 800-2,700 map-icon providers and one lookup by path each kept this
-    -- background loop busy for 70-130 s after the host came up (no joins served, no save read).
-    for providerKey in pairs(travelSignProviderPending) do
-        if providerKey:find("FastTravelSign", 1, true) then
-            local result = rememberTravelSignProvider(providerKey)
-            if result ~= "wait" then travelSignProviderPending[providerKey] = nil end
+-- Provider checks (game thread): every due sign provider, then up to TRAVEL_SIGN_PROVIDER_BATCH other due ones,
+-- through one walk of the class. Returns the number checked.
+local function checkTravelSignProviders(now, looked, sg)
+    local signKeys, otherKeys = {}, {}
+    for providerKey, at in pairs(travelSignProviderPending) do
+        if at <= now then
+            if providerKey:find("FastTravelSign", 1, true) then signKeys[#signKeys + 1] = providerKey
+            elseif #otherKeys < TRAVEL_SIGN_PROVIDER_BATCH then otherKeys[#otherKeys + 1] = providerKey end
         end
     end
-    local batch = 0
-    for providerKey in pairs(travelSignProviderPending) do
-        if batch >= TRAVEL_SIGN_PROVIDER_BATCH then break end
-        batch = batch + 1
-        local result = rememberTravelSignProvider(providerKey)
-        if result ~= "wait" then travelSignProviderPending[providerKey] = nil end
+    looked.size = math.max(ObjRef.walkMin, #signKeys + #otherKeys)   -- one walk, never a lookup by path each
+    TRAVEL_SIGN_TUNE.lastProviderWalk = now
+    local checked = 0
+    for _, list in ipairs({ signKeys, otherKeys }) do
+        for _, providerKey in ipairs(list) do
+            local result = rememberTravelSignProvider(providerKey, looked)
+            checked = checked + 1
+            sg.checked = sg.checked + 1
+            if result == "wait" then
+                sg.wait = sg.wait + 1
+                travelSignProviderPending[providerKey] = now + TRAVEL_SIGN_WAIT_RECHECK
+            else
+                travelSignProviderPending[providerKey] = nil
+            end
+        end
     end
+    return checked
+end
 
-    if travelSignScanState.count < TRAVEL_SIGN_DISCOVERY_SCAN_PASSES
-        and now >= travelSignScanState.nextT then
-        travelSignScanState.nextT = now + TRAVEL_SIGN_DISCOVERY_SCAN_INTERVAL
-        travelSignScanState.count = travelSignScanState.count + 1
-        -- A single early pass missed late-spawned components on loaded saves.
-        -- Keep a bounded startup window, then rely on the object hooks above.
-        -- A lifetime sweep walks roughly 2,500 unrelated providers every minute
-        -- and needlessly exercises the UE4SS Lua/UObject boundary. Clear the
-        -- give-up markers during this startup window: "failed" here usually
-        -- means the owning actor was not ready yet, not a permanent failure.
-        -- On a loaded save the Fast Travel
-        -- components can spawn after that first sweep, and a live server logged
-        -- components=0 providers=820 for its only scan, so the signs that arrived
-        -- a moment later were never looked at again.
-        for key, state in pairs(travelSignSeen) do
-            if state == "failed" then travelSignSeen[key] = nil end
-        end
-        local providers = safeFindAll("MistMapIconProviderComponent")
-        for _, provider in ipairs(providers) do queueTravelSignProvider(provider) end
-        local components = safeFindAll("MistFastTravelComponent")
-        for _, component in ipairs(components) do queueTravelSignComponent(component, 0) end
-        log("travel sign discovery scan pass=" .. tostring(travelSignScanState.count)
-            .. " components=" .. tostring(#components)
-            .. " providers=" .. tostring(#providers))
-        if travelSignScanState.count >= TRAVEL_SIGN_DISCOVERY_SCAN_PASSES then
-            log("travel sign discovery startup scan complete passes="
-                .. tostring(TRAVEL_SIGN_DISCOVERY_SCAN_PASSES)
-                .. " (runtime object hooks remain active)")
+-- Startup scan, first half (game thread): walk the map-icon providers and check each new one in hand.
+local function scanTravelSignProvidersHalf(now, looked, sg)
+    for key, state in pairs(travelSignSeen) do
+        if state == "failed" then travelSignSeen[key] = nil end
+    end
+    local nProviders = 0
+    local listed = ObjRef.walkByName(looked, "MistMapIconProviderComponent")
+    for providerKey, provider in pairs(listed) do
+        nProviders = nProviders + 1
+        if not travelSignProviderSeen[providerKey] and not providerKey:find("_GEN_VARIABLE", 1, true)
+            and not providerKey:find("Default__", 1, true) and ObjRef.pathFromFullName(providerKey) then
+            local result = rememberTravelSignProvider(providerKey, looked, provider)
+            sg.checked = sg.checked + 1
+            if result == "wait" then
+                sg.wait = sg.wait + 1
+                travelSignProviderPending[providerKey] = now + TRAVEL_SIGN_WAIT_RECHECK
+            else
+                travelSignProviderPending[providerKey] = nil
+            end
         end
     end
-    if travelSignPlayerSyncPasses > 0 and now >= travelSignPlayerSyncNextT then
+    -- v0.18.69: this walk lists every live provider, so a waiting or new name it does not list is gone (it was
+    -- renamed after the construction hook took it, or it left the world): drop it, no walk of its own later
+    if TRAVEL_SIGN_TUNE.rideScan then
+        for providerKey in pairs(travelSignProviderPending) do
+            if not listed[providerKey] then
+                travelSignProviderPending[providerKey] = nil
+                sg.gone = (sg.gone or 0) + 1
+            end
+        end
+    end
+    travelSignScanHalf = { providers = nProviders, dueT = now + TRAVEL_SIGN_TUNE.halfGap }
+end
+
+-- Startup scan, second half (game thread): walk the Fast Travel components and queue them; the pass is then counted.
+local function scanTravelSignComponentsHalf(now, looked)
+    local nComponents = 0
+    for _, component in pairs(ObjRef.walkByName(looked, "MistFastTravelComponent")) do
+        nComponents = nComponents + 1
+        queueTravelSignComponent(component, 0)
+    end
+    travelSignScanState.count = travelSignScanState.count + 1
+    travelSignScanState.nextT = now + TRAVEL_SIGN_DISCOVERY_SCAN_INTERVAL
+    log("travel sign discovery scan pass=" .. tostring(travelSignScanState.count)
+        .. " components=" .. tostring(nComponents)
+        .. " providers=" .. tostring(travelSignScanHalf and travelSignScanHalf.providers or 0))
+    travelSignScanHalf = nil
+    if travelSignScanState.count >= TRAVEL_SIGN_DISCOVERY_SCAN_PASSES then
+        log("travel sign discovery startup scan complete passes="
+            .. tostring(TRAVEL_SIGN_DISCOVERY_SCAN_PASSES)
+            .. " (runtime object hooks remain active)")
+    end
+end
+
+-- Repairs (game thread, one batch in one callback, as before: v0.18.62's pawn and library lookups once per batch).
+local function repairTravelSignBatch(looked)
+    local items = travelSignPending
+    travelSignPending = {}
+    looked.size = math.max(ObjRef.walkMin, #items)   -- v0.18.68: one walk per class, never a lookup by path each
+    for _, item in ipairs(items) do
+        travelSignPendingByKey[item.key] = nil
+        local ok, itemErr = pcall(function() repairTravelSignComponent(item, looked) end)
+        if not ok then retryTravelSignComponent(item, itemErr) end
+    end
+end
+
+-- How much provider work is due (plain Lua: read by the background loop and by the pass).
+local function travelSignProvidersDue(now)
+    local due, oldest = 0, nil
+    for _, at in pairs(travelSignProviderPending) do
+        if at <= now then
+            due = due + 1
+            if not oldest or at < oldest then oldest = at end
+        end
+    end
+    -- v0.18.69: while the startup scan runs, its next provider walk checks these names in hand (2026-11-15 re-lab of
+    -- v0.18.68: the separate rechecks and new-name checks were 5-7 of the 7-9 walks a minute in the first minutes)
+    local T = TRAVEL_SIGN_TUNE
+    if T.rideScan and travelSignScanState.count < TRAVEL_SIGN_DISCOVERY_SCAN_PASSES then return due, false end
+    -- after it, at most one provider-check walk per walkGap seconds; everything due then goes in that one walk
+    if now - T.lastProviderWalk < T.walkGap then return due, false end
+    local ready = due >= ObjRef.walkMin or (due > 0 and (now - oldest) >= TRAVEL_SIGN_FOLD_WAIT)
+    return due, ready
+end
+
+local function travelSignSyncDue(now)
+    return travelSignPlayerSyncPasses > 0 and now >= travelSignPlayerSyncNextT
+end
+
+local function travelSignScanDue(now)
+    -- v0.18.69: a pass's component walk comes halfGap seconds after its provider walk, not on the next pass
+    if travelSignScanHalf then return now >= (travelSignScanHalf.dueT or 0) end
+    return travelSignScanState.count < TRAVEL_SIGN_DISCOVERY_SCAN_PASSES and now >= travelSignScanState.nextT
+end
+
+-- One Travel Sign pass on the game thread. now = the background loop's clock when the pass was queued.
+local function travelSignPassOnGameThread(now)
+    local started = os.clock()
+    local looked = { size = 0 }
+    local sg = BG_LOOP.sg or { passes = 0, pending = 0, checked = 0, wait = 0, gone = 0 }
+    local pieces = 0
+    local function mayStart()
+        if pieces > 0 and (os.clock() - started) * 1000 >= TRAVEL_SIGN_PASS_BUDGET_MS then
+            sg.deferred = (sg.deferred or 0) + 1
+            return false
+        end
+        pieces = pieces + 1
+        return true
+    end
+    -- 1. repairs waiting from an earlier piece (a scan, a sweep or the hooks)
+    if #travelSignPending > 0 and mayStart() then repairTravelSignBatch(looked) end
+    -- 2. a player-sync sweep after a join
+    if travelSignSyncDue(now) and mayStart() then
         local passNumber = TRAVEL_SIGN_PLAYER_SYNC_PASSES - travelSignPlayerSyncPasses + 1
-        queueTravelSignPlayerSyncPass(passNumber)
         travelSignPlayerSyncPasses = travelSignPlayerSyncPasses - 1
         travelSignPlayerSyncNextT = now + TRAVEL_SIGN_PLAYER_SYNC_INTERVAL
+        queueTravelSignPlayerSyncPass(passNumber, looked)
+        -- the sweep's own component walk serves its repairs when the budget still allows
+        if #travelSignPending > 0 and mayStart() then repairTravelSignBatch(looked) end
     end
-    if #travelSignPending == 0 then return end
+    -- 3. the startup scan, one half per piece
+    if travelSignScanDue(now) and mayStart() then
+        if travelSignScanHalf then scanTravelSignComponentsHalf(now, looked)
+        else scanTravelSignProvidersHalf(now, looked, sg) end
+    end
+    -- 4. provider checks, when enough are due
+    local _, ready = travelSignProvidersDue(now)
+    if ready and mayStart() then checkTravelSignProviders(now, looked, sg) end
+end
 
-    local batch = travelSignPending
-    travelSignPending = {}
+-- Background loop, every 3 s of its clock: plain Lua bookkeeping only (no game object, no lookup, no walk). It
+-- hands one pass to the game-thread pump when any piece of work is due.
+local function serviceTravelSignDiscoveryImpl(now)
+    travelSignClock = now
+    if travelSignDiscoveryQueued or now < travelSignDiscoveryNextT then return end
+    travelSignDiscoveryNextT = now + 3
+    -- v0.18.65: counted for the "bg" timing line (pending/due at the start of a pass; checks and waits on the game thread)
+    local sg = BG_LOOP.sg
+    if not sg then sg = { passes = 0, pending = 0, checked = 0, wait = 0, gone = 0 }; BG_LOOP.sg = sg end
+    sg.passes = sg.passes + 1
+    sg.pending = 0
+    for _ in pairs(travelSignProviderPending) do sg.pending = sg.pending + 1 end
+    local due, providersReady = travelSignProvidersDue(now)
+    sg.due = due
+    if #travelSignPending == 0 and not travelSignSyncDue(now) and not travelSignScanDue(now) and not providersReady then
+        return
+    end
+    local generation = travelSignGeneration
     travelSignDiscoveryQueued = true
     local queued, err = executeInGameThreadSafe("travel-sign-discovery", function()
-        local looked = { size = #batch }
-        for _, item in ipairs(batch) do
-            travelSignPendingByKey[item.key] = nil
-            local ok, itemErr = pcall(function() repairTravelSignComponent(item, looked) end)
-            if not ok then retryTravelSignComponent(item, itemErr) end
-        end
+        if generation ~= travelSignGeneration then return end
+        travelSignPassOnGameThread(now)
         travelSignDiscoveryQueued = false
-    end, function(callbackErr)
-        travelSignDiscoveryQueued = false
-        for _, item in ipairs(batch) do
-            travelSignPendingByKey[item.key] = nil
-            retryTravelSignComponent(item, callbackErr)
-        end
+    end, function()
+        if generation == travelSignGeneration then travelSignDiscoveryQueued = false end
     end)
     if not queued then
-        log("travel sign discovery batch was not queued err=" .. tostring(err))
+        travelSignDiscoveryQueued = false
+        log("travel sign discovery pass was not queued err=" .. tostring(err))
     end
 end
 
@@ -1285,6 +1184,9 @@ local function resetTravelSignDiscoveryImpl(reason)
     travelSignDiscoveryQueued = false
     travelSignDiscoveryNextT = 0
     travelSignScanState = { nextT = 0, count = 0 }
+    travelSignScanHalf = nil
+    TRAVEL_SIGN_TUNE.lastProviderWalk = -1e9
+    travelSignGeneration = travelSignGeneration + 1
     log("travel sign discovery reset reason=" .. tostring(reason) .. " (startup sweep re-armed)")
     requestTravelSignPlayerSyncImpl(tostring(reason))
 end
@@ -2157,7 +2059,17 @@ end
 local function connForPc(pc)
     local pcAddr = objectAddress(pc)
     if pcAddr == 0 then return nil end
-    for _, nd in ipairs(FindAllOf("IpNetDriver") or {}) do
+    -- v0.18.69: the listen world's own net driver, as the roster has used since v0.18.59. The walk of every object for
+    -- the net drivers ran twice per player per 1.5 s round of the background loop (2026-11-15 re-lab: the loop took
+    -- 6.2-6.4 s a minute with one player on, 2.5 s with nobody). Walk only while that world is not known.
+    local drivers = nil
+    pcall(function()
+        if netWorld and netWorld:IsValid() then
+            local d = readOptionalField(netWorld, "NetDriver")
+            if d and d.IsValid and d:IsValid() then drivers = { d } end
+        end
+    end)
+    for _, nd in ipairs(drivers or FindAllOf("IpNetDriver") or {}) do
         local arr = readOptionalField(nd, "ClientConnections")
         if arr then
             local n = safeArrayNum(arr)
@@ -2586,7 +2498,7 @@ end
 function ADMIN_AUTH.steam64FromIdentity(value)
     value = trimString(tostring(value or "")) or ""
     local candidate = value:match("^steam_(%d+)$") or value:match("^(%d+)$")
-    if candidate and #candidate == 17 and candidate:match("^7656119%d%d%d%d%d%d%d%d%d%d$") then
+    if ADMIN_AUTH.isSteamId64(candidate) then
         return candidate
     end
     return nil
@@ -3721,8 +3633,40 @@ function ADMIN_AUTH.seatCheck(pcs)
     return info .. " (over, correcting)"
 end
 
-local function serviceJoiners(t)
-    local pcs = FindAllOf("PlayerController") or {}
+-- v0.18.69: true when the listen world's net driver has no client connection and no controller is being followed
+-- (one seen without a connection waits in pendingRemoteByPc until it is quarantined). Unknown: false. Off with
+-- HEARTH_BG_QUIET=0 or Logs\bw_bgquiet.off (read each round by BG_LOOP.pausedNow), like the quiet switch.
+BG_LOOP.joinersIdle = function()
+    if not BG_LOOP.enabled or BG_LOOP.offNow or next(pendingRemoteByPc) ~= nil then return false end
+    local n = nil
+    pcall(function()
+        if netWorld and netWorld:IsValid() then
+            local nd = readOptionalField(netWorld, "NetDriver")
+            if nd and nd.IsValid and nd:IsValid() then
+                local arr = readOptionalField(nd, "ClientConnections")
+                if arr then n = safeArrayNum(arr) end
+            end
+        end
+    end)
+    return n == 0
+end
+
+local function serviceJoiners(t, quiet)
+    -- v0.18.65: quiet = the world is paused with nobody connected (bw_pause status): no walk of
+    -- every object this round. The heartbeat and the idle roster write keep their cadence.
+    -- v0.18.69: with nobody connected (BG_LOOP.joinersIdle) the controllers are walked on heartbeat rounds only (every
+    -- 6th, 9 s), where the seat check needs them; a joiner's connection shows on the net driver before his controller
+    -- exists, so the next round walks again. The 2026-11-15 re-lab measured this walk at about 2.5 s a minute.
+    -- Not while the loop is quiet: there the safety-net round (every 10th) walks as in v0.18.65. Applied there too, a
+    -- walk needed a round that was both, and with the two counts out of step none came (re-lab 13:37-13:44: walks=0).
+    local walk = not quiet
+    if walk and not BG_LOOP.quiet and ((diagT + 1) % 6) ~= 0 and BG_LOOP.joinersIdle() then walk = false end
+    BG_LOOP.walkedJoiners = walk
+    local pcs = {}
+    if walk then
+        pcs = FindAllOf("PlayerController") or {}
+        BG_LOOP.lastPCs = #pcs
+    end
     diagT = diagT + 1
     local nRemote = 0
     travelSignRemotePlayerCount = 0
@@ -3802,8 +3746,14 @@ local function serviceJoiners(t)
             lastWorldTimeWall = os.time()
         end
         local seatInfo = ""
-        pcall(function() seatInfo = ADMIN_AUTH.seatCheck(pcs) end)
-        log("hb t=" .. t .. " PCs=" .. #pcs .. " remote=" .. nRemote .. seatInfo .. tickInfo .. GAME_THREAD_WATCH.info())
+        if not walk then
+            -- the seat check needs this round's controllers and one more walk; start its two-heartbeat count again
+            ADMIN_AUTH.seat.pending = nil
+            seatInfo = " quiet"
+        else
+            pcall(function() seatInfo = ADMIN_AUTH.seatCheck(pcs) end)
+        end
+        log("hb t=" .. t .. " PCs=" .. (walk and #pcs or BG_LOOP.lastPCs) .. " remote=" .. nRemote .. seatInfo .. tickInfo .. GAME_THREAD_WATCH.info())
     end
 end
 
@@ -4122,21 +4072,43 @@ loop50.mainLoopBody = function()
         -- HandleStartingNewPlayer attempts.
         if up then
             pcall(GAME_THREAD_WATCH.check)
-            local discoveryOk, discoveryErr = pcall(function() serviceTravelSignDiscovery(t) end)
-            if not discoveryOk then
-                log("travel sign discovery service ERROR: " .. tostring(discoveryErr))
+            -- v0.18.65: quiet while bw_pause has the world paused with nobody connected. Nothing
+            -- spawns or joins in a paused world: the Travel Sign service waits, and the joiner check
+            -- walks the objects every 10th round as a safety net instead of every round.
+            local quietNow = false
+            pcall(function() quietNow = BG_LOOP.pausedNow() and true or false end)
+            if quietNow ~= BG_LOOP.quiet then
+                BG_LOOP.quiet = quietNow
+                BG_LOOP.quietRounds = 0
+                log(quietNow and "background loop quiet: world paused with nobody connected (bw_pause); Travel Signs wait, joiner check every 10th round"
+                    or "background loop in full: world running or pause status unreadable")
             end
-            local ok, err = pcall(function() serviceJoiners(t) end)
+            local fullJoiners = true
+            if quietNow then
+                BG_LOOP.quietRounds = BG_LOOP.quietRounds + 1
+                fullJoiners = (BG_LOOP.quietRounds % BG_LOOP.fullEvery) == 0
+            end
+            local c0 = os.clock()
+            if not quietNow then
+                local discoveryOk, discoveryErr = pcall(function() serviceTravelSignDiscovery(t) end)
+                if not discoveryOk then
+                    log("travel sign discovery service ERROR: " .. tostring(discoveryErr))
+                end
+            end
+            local c1 = os.clock()
+            local ok, err = pcall(function() serviceJoiners(t, not fullJoiners) end)
             if not ok and not serviceJoinersErrorLogged then
                 serviceJoinersErrorLogged = true
                 log("serviceJoiners ERROR (continuing loop): " .. tostring(err))
             end
+            local c2 = os.clock()
             -- v0.18.62: the force-save marker is served by the game-thread pump (serviceForcedSave)
             local settingsOk, settingsErr = pcall(GAMEPLAY_SETTINGS.service)
             if not settingsOk then
                 log("gameplay settings service ERROR: " .. tostring(settingsErr))
             end
             pcall(function() if type(RENOWN_DIAG_SERVICE) == "function" then RENOWN_DIAG_SERVICE() end end)
+            loop50.part = { signs = c1 - c0, joiners = c2 - c1, settings = os.clock() - c2, quiet = quietNow, walk = BG_LOOP.walkedJoiners }
         end
         -- re-assert the 600s server-side timeouts periodically: config gets wiped and
         -- the GameNetDriver can be (re)constructed after our initial stamp. Cheap, and
@@ -4162,8 +4134,44 @@ end
 -- v0.18.50: a Lua error escaping a LoopAsync body is raised inside UE4SS's
 -- async update with no handler and aborts the whole host process (seen
 -- 2026-09-05 11:05, luaD_throw -> abort). Nothing may escape.
+-- v0.18.65: the loop's own time ("bg" line), by part, once a minute for the first 20 minutes after
+-- host-up and every 10 minutes after. os.clock is wall time under the C runtime UE4SS uses.
+loop50.account = function(seconds)
+    local m = loop50.tm
+    if not m then
+        m = { since = os.time(), rounds = 0, quiet = 0, walks = 0, busy = 0, signs = 0, joiners = 0, settings = 0, worst = 0 }
+        loop50.tm = m
+    end
+    local part = loop50.part
+    loop50.part = nil
+    m.rounds = m.rounds + 1
+    m.busy = m.busy + seconds
+    if seconds > m.worst then m.worst = seconds end
+    if part then
+        m.signs = m.signs + part.signs
+        m.joiners = m.joiners + part.joiners
+        m.settings = m.settings + part.settings
+        if part.quiet then m.quiet = m.quiet + 1 end
+        if part.walk then m.walks = m.walks + 1 end
+    end
+    local now = os.time()
+    local every = (upT and (t - upT) < 1200) and 60 or 600
+    if now - m.since < every or not up then return end
+    local sg = BG_LOOP.sg or { passes = 0, pending = 0, checked = 0, wait = 0, gone = 0 }
+    log(string.format("bg %ds: rounds=%d quiet=%d busy_ms=%.0f worst_ms=%.0f | signs_ms=%.0f joiners_ms=%.0f (walks=%d) settings_ms=%.0f other_ms=%.0f | providers pending=%d due=%d checked=%d wait=%d gone=%d deferred=%d",
+        now - m.since, m.rounds, m.quiet, m.busy * 1000, m.worst * 1000, m.signs * 1000, m.joiners * 1000, m.walks,
+        m.settings * 1000, (m.busy - m.signs - m.joiners - m.settings) * 1000, sg.pending, sg.due or 0, sg.checked, sg.wait,
+        sg.gone or 0, sg.deferred or 0))
+    sg.checked = 0
+    sg.wait = 0
+    sg.gone = 0
+    sg.deferred = 0
+    loop50.tm = nil
+end
 LoopAsync(1500, function()
+    local roundStart = os.clock()
     local ok, result = pcall(loop50.mainLoopBody)
+    pcall(loop50.account, os.clock() - roundStart)
     if not ok then
         loop50.mainLoopErrors = loop50.mainLoopErrors + 1
         if loop50.mainLoopErrors <= 20 then
@@ -4193,7 +4201,7 @@ LoopAsync(250, function()
     return retire and true or false
 end)
 
--- v0.18.55: Renown readout + operator repair marker. See the header note.
+-- v0.18.55: Renown readout + operator repair marker. See docs/HOST-MOD-HISTORY.md (v0.18.55).
 -- One table in a do-block (200-active-locals limit). Installed from the
 -- Splineworks block; serviced from the main loop beside the force-save marker.
 do

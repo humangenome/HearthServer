@@ -12,7 +12,7 @@
 -- False edges can hide real ones in review noise; both are fixed and pinned here.
 -- GATE=<path> runs these against another copy of the gate: the old one fails checks 1, 2 and 5 (it rejects
 -- safe mods) and passes 3 and 4 (it still catches real background calls; 4 accepts either name the old and new gate
--- give the function).
+-- give the function). The old gate also passes 6 and 7b (2026-11-13: it never followed the Travel Sign service).
 local gate = os.getenv("GATE") or "tests/host-thread-safety.test.lua"
 local failures, checks = 0, 0
 local function check(cond, what)
@@ -101,6 +101,65 @@ lines[#lines + 1] = "end)"
 code, out = runGate("watchctor", table.concat(lines, "\n") .. "\n")
 check(code == 0, "a bigger constructor of constants after many local functions binds none of its fields to a function")
 if code ~= 0 then io.write(out) end
+
+-- 6. (2026-11-13) a function handed back by an immediately called function and called from background code is
+-- followed: bw_host's whole Travel Sign service was built this way and the gate never looked inside it
+code, out = runGate("iife", [[
+local serviceA, serviceB = (function()
+    local function helper() return 1 end
+    local function serviceImplA()
+        local o = FindFirstOf("Actor")
+        o:GetOwner()
+    end
+    local function serviceImplB() return helper() end
+    return serviceImplA, serviceImplB
+end)()
+LoopAsync(1000, function()
+    pcall(function() serviceB() end)
+    pcall(function() serviceA() end)
+    return false
+end)
+]] .. PUMP)
+check(code ~= 0 and out:find(":GetOwner%(%)") ~= nil, "a function returned by an immediately called function and called from LoopAsync is followed")
+if code == 0 then io.write(out) end
+
+-- 7. the Travel Sign service's background half touches no game object, not even a lookup or IsValid; handing
+-- the object work to the game-thread queue is fine
+local QUEUE = "local queueItems = {}\nlocal function executeInGameThreadSafe(label, cb) queueItems[#queueItems + 1] = cb; return true end\n"
+code, out = runGate("tsgood", QUEUE .. [[
+local serviceTravelSignDiscovery = (function()
+    local pending = {}
+    local function serviceTravelSignDiscoveryImpl(now)
+        if next(pending) == nil then return end
+        executeInGameThreadSafe("travel-sign-discovery", function()
+            for _, o in ipairs(FindAllOf("MistMapIconProviderComponent") or {}) do o:GetOwner() end
+        end)
+    end
+    return serviceTravelSignDiscoveryImpl
+end)()
+LoopAsync(1000, function()
+    pcall(function() serviceTravelSignDiscovery(1) end)
+    return false
+end)
+]] .. "\nLoopInGameThreadAfterFrames(1, function() for _, cb in ipairs(queueItems) do pcall(cb) end end)\n")
+check(code == 0, "a Travel Sign background half that only queues game-thread work passes")
+if code ~= 0 then io.write(out) end
+code, out = runGate("tsbad", QUEUE .. [[
+local serviceTravelSignDiscovery = (function()
+    local function serviceTravelSignDiscoveryImpl(now)
+        local all = FindAllOf("MistMapIconProviderComponent") or {}
+        for _, o in ipairs(all) do local ok = o:IsValid() end
+    end
+    return serviceTravelSignDiscoveryImpl
+end)()
+LoopAsync(1000, function()
+    pcall(function() serviceTravelSignDiscovery(1) end)
+    return false
+end)
+]] .. "\nLoopInGameThreadAfterFrames(1, function() for _, cb in ipairs(queueItems) do pcall(cb) end end)\n")
+check(code ~= 0 and out:find("must not touch a game object") ~= nil and out:find("FindAllOf") ~= nil and out:find(":IsValid%(%)") ~= nil,
+    "a Travel Sign background half that walks or calls IsValid is reported")
+if code == 0 then io.write(out) end
 
 print(string.format("%d of %d gate checks passed", checks - failures, checks))
 os.exit(failures == 0 and 0 or 1)

@@ -8,26 +8,24 @@ namespace HearthServer.Services;
 
 /// <summary>
 /// Runs the Source A2S query responder. Pulls live snapshot data from the plugin
-/// (via <see cref="PipeServerState"/>) on every query, so external tools like
+/// (via <see cref="ServerState"/>) on every query, so external tools like
 /// GameTracker and ServerMonkey see real player counts.
 /// </summary>
 public sealed class SourceQueryHostedService : IHostedService, IAsyncDisposable
 {
     private readonly ILogger<SourceQueryHostedService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly PipeServerState _state;
-    private readonly TimeSpan _heartbeatTimeout;
+    private readonly ServerState _state;
     private SourceQueryServer? _server;
 
     public SourceQueryHostedService(
         ILogger<SourceQueryHostedService> log,
         IOptions<HearthServerOptions> opts,
-        PipeServerState state)
+        ServerState state)
     {
         _log = log;
         _opts = opts.Value;
         _state = state;
-        _heartbeatTimeout = TimeSpan.FromSeconds(Math.Max(1, _opts.PluginHeartbeatTimeoutSeconds));
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -53,7 +51,7 @@ public sealed class SourceQueryHostedService : IHostedService, IAsyncDisposable
         if (_server is not null) await _server.StopAsync().ConfigureAwait(false);
     }
 
-    private ServerInfoSnapshot BuildInfo() => new(
+    internal ServerInfoSnapshot BuildInfo() => new(
         Name: string.IsNullOrWhiteSpace(_opts.ServerName) ? $"Hearth — {_opts.InstanceId}" : _opts.ServerName.Trim(),
         Map: "Karvenia_08",
         Folder: "bellwright",
@@ -103,21 +101,11 @@ public sealed class SourceQueryHostedService : IHostedService, IAsyncDisposable
         new KeyValuePair<string, string>("hearth_build", HearthVersionInfo.HearthBuild),
     };
 
-    // Online when the in-game plugin is pinging OR the Bellwright process is alive.
-    // The lobby-parked case (no fresh plugin heartbeat, but the game IS running and
-    // joinable) must still answer A2S so the launcher shows the server online.
+    // Online when the Bellwright process named in the pid file is alive.
     private bool IsGameOnline()
     {
-        var freshHeartbeat = _state.HasFreshHeartbeat(_heartbeatTimeout);
-        // Only probe the pidfile if the heartbeat path didn't already say online,
-        // matching the original short-circuit (no behavior change).
-        var processAlive = !freshHeartbeat && GameProcessProbe.IsAlive(_opts.GamePidFile);
-        var online = freshHeartbeat || processAlive;
-        _log.LogDebug(
-            "A2S IsGameOnline={Online} (source={Source}, freshHeartbeat={Heartbeat}, gameProcessAlive={Process})",
-            online,
-            online ? (freshHeartbeat ? "fresh-heartbeat" : "game-process-probe") : "none",
-            freshHeartbeat, processAlive);
+        var online = GameProcessProbe.IsAlive(_opts.GamePidFile);
+        _log.LogDebug("A2S IsGameOnline={Online} (game process probe)", online);
         return online;
     }
 }

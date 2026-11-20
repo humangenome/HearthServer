@@ -26,7 +26,7 @@ public static class Program
 
         // Verbose toggle: Hearth:Verbose (config / appsettings.json) OR the
         // HEARTH_VERBOSE env var. When on, the minimum log level drops to Debug
-        // so the RCON / A2S / HTTP / heartbeat instrumentation is emitted. Off by
+        // so the RCON / A2S / HTTP instrumentation is emitted. Off by
         // default keeps the steady-state log to Information.
         var verbose = ResolveVerbose(args);
         var minLevel = verbose
@@ -57,8 +57,7 @@ public static class Program
             builder.Services.Configure<HearthServerOptions>(builder.Configuration.GetSection("Hearth"));
 
             builder.Services.AddSingleton<InstanceIdentityProvider>();
-            builder.Services.AddSingleton<HmacKeyService>();
-            builder.Services.AddSingleton<PipeServerState>();
+            builder.Services.AddSingleton<ServerState>();
             builder.Services.AddSingleton<HearthRestartCoordinator>();
             builder.Services.AddSingleton<SaveProtectionService>();
             builder.Services.AddSingleton<AdminJoinTicketService>();
@@ -73,11 +72,7 @@ public static class Program
             }
 
             builder.Services.AddSingleton<SaveOrchestratorService>();
-            builder.Services.AddSingleton<ChatService>();
             builder.Services.AddHostedService(sp => sp.GetRequiredService<SaveOrchestratorService>());
-            builder.Services.AddHostedService(sp => sp.GetRequiredService<ChatService>());
-            builder.Services.AddHostedService<NamedPipeServerService>();
-            builder.Services.AddHostedService<HeartbeatWatchdogService>();
             // Join password file for the bw_ident host mod; written before the query starts advertising the flag.
             builder.Services.AddHostedService<JoinGateFileService>();
             builder.Services.AddHostedService<SourceQueryHostedService>();
@@ -91,10 +86,16 @@ public static class Program
 
             // Emit the per-instance identity line now that DI has bound options.
             var opts = host.Services.GetRequiredService<IOptions<HearthServerOptions>>().Value;
-            Log.Information("Instance {Instance} | gameplay:{GP} query:{QP} rcon:{RP} pipe:{Pipe}",
-                opts.InstanceId, opts.GameplayPort, opts.QueryPort, opts.RconPort, opts.PipeName);
+            Log.Information("Instance {Instance} | gameplay:{GP} query:{QP} rcon:{RP}",
+                opts.InstanceId, opts.GameplayPort, opts.QueryPort, opts.RconPort);
             Log.Information("Save dir: {Dir}", opts.SaveDir);
             Log.Information("Bellwright user dir: {Dir}", opts.GameUserDir);
+
+            // Key files the removed plugin pipe left (data/hmac.key, Mods/Hearth/hearth.config.json): exact names,
+            // plain files only, one log line (v0.1.100).
+            LegacyKeyFiles.Remove(opts,
+                host.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>().CreateLogger("HearthServer.LegacyKeyFiles"),
+                LegacyKeyFiles.DefaultInstallRoot);
 
             host.Run();
             return 0;

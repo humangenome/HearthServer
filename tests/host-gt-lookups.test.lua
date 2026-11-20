@@ -273,25 +273,33 @@ check("a batch of signs walks each class once and looks no sign up by path", fun
     assert(gameThreadWalks["MistMapIconProviderComponent"] == 1, "provider walks: " .. tostring(gameThreadWalks["MistMapIconProviderComponent"]))
 end)
 
-check("a sign the walk does not list falls back to the lookup by path and is still repaired", function()
+-- v0.18.67: a name the pass's own walk does not list is gone (or renamed since the hook took it): no lookup by path.
+-- Until v0.18.66 it fell back to one; 61 of those held the game thread 3.6 s in a join minute (lab 2026-11-14).
+check("a sign the walk does not list is treated as gone (no lookup by path); the next pass that lists it repairs it", function()
     gtPathLookups, gameThreadWalks = {}, {}
     repairs = 0
     local hidden = table.remove(components)
     mod.requestTravelSignPlayerSync("walk-miss")
     mod.serviceTravelSignDiscovery(t); runPump(); t = t + 3
-    components[#components + 1] = hidden
     local bySign = 0
     for p, v in pairs(gtPathLookups) do
         if p:find("FastTravelSign_C_", 1, true) then bySign = bySign + v end
     end
-    assert(bySign == 1, "lookups by path for signs: " .. bySign)
-    assert(repairs == SIGNS * 2, "player repairs " .. repairs .. ", want " .. SIGNS * 2)
+    assert(bySign == 0, "lookups by path for signs: " .. bySign)
+    assert(repairs == (SIGNS - 1) * 2, "player repairs " .. repairs .. ", want " .. (SIGNS - 1) * 2)
+    components[#components + 1] = hidden
+    repairs = 0
+    mod.requestTravelSignPlayerSync("walk-back")
+    mod.serviceTravelSignDiscovery(t); runPump(); t = t + 3
+    assert(repairs == SIGNS * 2, "after the sign is listed again: player repairs " .. repairs .. ", want " .. SIGNS * 2)
 end)
 
 check("a batch under walkMin signs keeps the lookup by path", function()
     -- ObjRef sits inside a do-block, so this one reads the source: the two-sign path has no mocked way in
-    assert(source:find("if (batch.size or 0) < ObjRef.walkMin then return ObjRef.resolve(key, className) end", 1, true), "small-batch path is gone")
-    assert(source:find("local looked = { size = #batch }", 1, true), "the batch no longer carries its size")
+    -- v0.18.66: unchanged rule, new text: a walk this callback already made is used whatever the size
+    assert(source:find("if (batch.size or 0) < ObjRef.walkMin and not (batch.walked and batch.walked[className]) then\n        return ObjRef.resolve(key, className)", 1, true), "small-batch path is gone")
+    -- v0.18.68: a repair batch walks each class it needs, even under walkMin (never one lookup by path per sign)
+    assert(source:find("looked.size = math.max(ObjRef.walkMin, #items)", 1, true), "the repair batch no longer walks")
 end)
 
 print(passed .. " checks passed, " .. failed .. " failed")

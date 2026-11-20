@@ -4,7 +4,7 @@ public sealed class HearthServerOptions
 {
     /// <summary>
     /// When true, the process logs at Debug level (per-request HTTP, A2S query
-    /// decisions, RCON auth/dispatch, heartbeat transitions, pidfile probes).
+    /// decisions, RCON auth/dispatch, pidfile probes).
     /// Default false = Information. Can also be enabled via the HEARTH_VERBOSE
     /// env var. Read at startup in Program.ResolveVerbose to set Serilog's
     /// minimum level; this field documents/binds the appsettings.json key.
@@ -13,9 +13,12 @@ public sealed class HearthServerOptions
 
     public string InstanceId { get; set; } = "default";
 
-    public string PipeName { get; set; } = @"Hearth\default";
-
-    /// <summary>Path to a 64-hex-character HMAC key file, generated per instance.</summary>
+    /// <summary>
+    /// Old name kept on purpose: hearth.db (the snapshot list and audit log) lives in this file's
+    /// folder ("data" by default). The key file itself belonged to the unused plugin pipe removed in
+    /// v0.1.100; the start removes a leftover hmac.key here (LegacyKeyFiles). Renaming the setting
+    /// would move every server's snapshot list.
+    /// </summary>
     public string HmacKeyPath { get; set; } = "data/hmac.key";
 
     public int GameplayPort { get; set; } = 27015;
@@ -28,8 +31,8 @@ public sealed class HearthServerOptions
 
     /// <summary>
     /// HTTP API port. Used by the launcher to list/upload/download/restore
-    /// snapshots and to fetch instance metadata. Auth is per-instance HMAC,
-    /// same key as the named-pipe IPC.
+    /// snapshots and to fetch instance metadata. Requests are signed with
+    /// HMAC-SHA256 under a key derived from <see cref="RconPassword"/>.
     /// </summary>
     public int HttpPort { get; set; } = 27019;
 
@@ -40,20 +43,37 @@ public sealed class HearthServerOptions
     /// </summary>
     public long MaxUploadBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 
-    public string RconPassword { get; set; } = "";
+    /// <summary>
+    /// What a world zip (restore, import, migrate) may unpack to, checked before the game is stopped and before
+    /// anything is written: all entries together, the number of entries, any one entry, and the free space the
+    /// unpack must leave on the disk. A small zip can unpack to far more than its upload size. A real Bellwright
+    /// save folder is far below these (the largest seen in November 2026 was under 100 MB zipped, a few dozen
+    /// files); 4 GB is twice <see cref="MaxUploadBytes"/>.
+    /// </summary>
+    public long MaxRestoreUnpackedBytes { get; set; } = 4L * 1024 * 1024 * 1024;
+
+    /// <summary>See <see cref="MaxRestoreUnpackedBytes"/>.</summary>
+    public int MaxRestoreEntries { get; set; } = 10_000;
+
+    /// <summary>See <see cref="MaxRestoreUnpackedBytes"/>.</summary>
+    public long MaxRestoreEntryBytes { get; set; } = 2L * 1024 * 1024 * 1024;
+
+    /// <summary>See <see cref="MaxRestoreUnpackedBytes"/>. 0 turns the free-space check off.</summary>
+    public long RestoreFreeSpaceFloorBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 
     /// <summary>
-    /// LEGACY field — IGNORED. Was the password handed to the game's native
-    /// handshake + the native Hearth.dll ApproveLogin hook. The game's stock
-    /// GameMode fatal-crashes the dedicated process when a password is set on
-    /// the native path (the ?Password= option in the launch URL is dropped by
-    /// the game's internal map travel, the native check sees a mismatch, and
-    /// the process self-terminates with "appError: Couldn't spawn player").
-    /// The join password is <see cref="JoinPassword"/>; A2S and the host mods
-    /// ignore this field. Kept for appsettings.json compatibility only; do NOT
-    /// set it.
+    /// Room for stored world backups in <see cref="SaveDir"/> (backups taken here, the copy each restore takes
+    /// first, and uploads): the newest <see cref="MaxSnapshotsKept"/> are kept while they fit in
+    /// <see cref="MaxSnapshotBytes"/> together, counted from the newest, and older ones are removed. 30 days
+    /// still removes any. The newest one, and one a restore is reading, are always kept. 0 turns that limit
+    /// off. Applied after every backup, upload and restore.
     /// </summary>
-    public string ServerPassword { get; set; } = "";
+    public int MaxSnapshotsKept { get; set; } = 20;
+
+    /// <summary>See <see cref="MaxSnapshotsKept"/>.</summary>
+    public long MaxSnapshotBytes { get; set; } = 4L * 1024 * 1024 * 1024;
+
+    public string RconPassword { get; set; } = "";
 
     /// <summary>
     /// The join password (2026-11-02). Empty = open server. When set, a player gets in only if their Hearth app sends
@@ -103,9 +123,6 @@ public sealed class HearthServerOptions
     /// </summary>
     public string GamePidFile { get; set; } = "";
 
-    /// <summary>Heartbeat window — if plugin doesn't ping in this many seconds, assume crashed.</summary>
-    public int PluginHeartbeatTimeoutSeconds { get; set; } = 30;
-
     /// <summary>
     /// Slot count reported via A2S. The session UI labels lobbies as 1/4, so
     /// 4 is the natural default — anything higher and the in-game host UI
@@ -137,18 +154,12 @@ public sealed class HearthServerOptions
     /// </summary>
     public bool SnapshotsEnabled { get; set; } = true;
 
-    /// <summary>Chat plane configuration. See protocol/chat-v1.md.</summary>
-    public ChatOptions Chat { get; set; } = new();
-
     /// <summary>
     /// Mod manifest published at GET /api/v1/manifest. Hosters list the mods
     /// they require, recommend, or forbid; the launcher reads this on join
     /// and installs/offers/warns accordingly. Spec: protocol/manifest-v1.md.
     /// </summary>
     public ModsOptions Mods { get; set; } = new();
-
-    /// <summary>Live web map. See protocol/map-v1.md.</summary>
-    public MapOptions Map { get; set; } = new();
 
     /// <summary>
     /// A returning player's character follows their Steam account (HearthIdentity host mod). The app asks
@@ -176,8 +187,11 @@ public sealed class IdentityOptions
     /// <summary>
     /// steamclient64.dll for the game-server login (a Steam game server needs it; Valve's Steamworks redistributable,
     /// app 1007, anonymous SteamCMD, has it with tier0_s64 and vstdlib_s64 beside it). The file or the folder holding it; a
-    /// host that keeps one shared copy sets this. Empty = one beside HearthServer, or the installed Steam client's. None
-    /// found = Steam checks stay off and players keep the character of the computer they join from.
+    /// host sets this. Empty, or no file there = Steam checks stay off and players keep the character of the computer they
+    /// join from; no other folder is searched (not HearthServer's own, not an installed Steam client's).
+    /// All three files must be signed by Valve and are loaded only by full path (SteamLibraryGuard). When HearthServer
+    /// runs with administrator rights, the folder and the files must also be ones only administrators can change, or
+    /// Steam checks stay off.
     /// </summary>
     public string SteamClientPath { get; set; } = "";
 
@@ -192,12 +206,6 @@ public sealed class IdentityOptions
 
     /// <summary>How long to wait for Steam's answer on one ticket.</summary>
     public int SteamCheckTimeoutSeconds { get; set; } = 15;
-}
-
-public sealed class ChatOptions
-{
-    /// <summary>In-memory ring buffer cap for /api/v1/chat/recent. Min 20, default 200.</summary>
-    public int RingBufferSize { get; set; } = 200;
 }
 
 public sealed class ModsOptions
@@ -225,22 +233,3 @@ public sealed class BlockedModEntry
     public string Reason { get; set; } = "";
 }
 
-public sealed class MapOptions
-{
-    /// <summary>Master toggle. When false, /api/v1/map/state returns 404.</summary>
-    public bool Enabled { get; set; } = true;
-
-    /// <summary>
-    /// When true, /api/v1/map/state and the /map/ SPA are reachable without
-    /// HMAC auth. Use for community-facing servers that want to publish a
-    /// live map dashboard. Default false — server admin/launcher only.
-    /// </summary>
-    public bool Public { get; set; } = false;
-
-    /// <summary>
-    /// Cap on cached state age (ms). If roster.json is older than this,
-    /// /api/v1/map/state still serves it but flags stale=true so the SPA
-    /// can dim or warn. Default 10000 (10s).
-    /// </summary>
-    public int StaleAfterMs { get; set; } = 10000;
-}

@@ -81,7 +81,7 @@ public sealed class HearthLogTailService : BackgroundService
 
     private readonly ILogger<HearthLogTailService> _log;
     private readonly HearthServerOptions _opts;
-    private readonly PipeServerState _state;
+    private readonly ServerState _state;
     private readonly AdminJoinTicketService _adminJoinTickets;
     // Address candidates from "accepted from" LogNet lines, stamped so stale
     // entries (e.g. a NAT-flapping zombie connection's old ports) can never be
@@ -107,7 +107,7 @@ public sealed class HearthLogTailService : BackgroundService
     public HearthLogTailService(
         ILogger<HearthLogTailService> log,
         IOptions<HearthServerOptions> opts,
-        PipeServerState state,
+        ServerState state,
         AdminJoinTicketService adminJoinTickets,
         IdentityTokenService? identityTokens = null,
         SteamIdentityMapService? identityMap = null)
@@ -314,14 +314,36 @@ public sealed class HearthLogTailService : BackgroundService
             return;
         }
 
-        // Default: pass through with [Bellwright] prefix and category as info.
+        // Default: pass through with [Bellwright] prefix, at the level PassThroughLevel picks.
         var safeLine = RedactCredentialQueryValues(line);
-        if (safeLine.Contains("Error", StringComparison.OrdinalIgnoreCase))
-            _log.LogError("[Bellwright] {Line}", safeLine);
-        else if (safeLine.Contains("Warning", StringComparison.OrdinalIgnoreCase))
-            _log.LogWarning("[Bellwright] {Line}", safeLine);
-        else
-            _log.LogInformation("[Bellwright] {Line}", safeLine);
+        switch (PassThroughLevel(safeLine))
+        {
+            case LogLevel.Error: _log.LogError("[Bellwright] {Line}", safeLine); break;
+            case LogLevel.Warning: _log.LogWarning("[Bellwright] {Line}", safeLine); break;
+            default: _log.LogInformation("[Bellwright] {Line}", safeLine); break;
+        }
+    }
+
+    // A player leaving makes the game write its close reason as "Result=ControlChannelClose, ErrorContext=..." (a clean
+    // leave) or "Result=ConnectionTimeout, ErrorContext=..." (their connection dropped). "Error" there is the field's
+    // name, not a fault. On hosted servers these were the only Error lines in HearthServer's log (3-7 a server a day,
+    // read 2026-11-11), so they hid real errors; they now pass at the game's own level (none = Information).
+    private static readonly Regex NormalCloseRegex = new(
+        @"\bResult=(?:ControlChannelClose|ConnectionTimeout), ErrorContext=", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex VerbosityRegex = new(
+        @"(?:^|\])Log\w+: (?<v>Fatal|Error|Warning):", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    internal static LogLevel PassThroughLevel(string line)
+    {
+        if (NormalCloseRegex.IsMatch(line))
+        {
+            var v = VerbosityRegex.Match(line);
+            if (!v.Success) return LogLevel.Information;
+            return v.Groups["v"].Value == "Warning" ? LogLevel.Warning : LogLevel.Error;
+        }
+        if (line.Contains("Error", StringComparison.OrdinalIgnoreCase)) return LogLevel.Error;
+        if (line.Contains("Warning", StringComparison.OrdinalIgnoreCase)) return LogLevel.Warning;
+        return LogLevel.Information;
     }
 
     private void TrackAcceptedAddress(string address)
@@ -545,7 +567,8 @@ public sealed class HearthLogTailService : BackgroundService
         if (id.StartsWith("bw:", StringComparison.OrdinalIgnoreCase)) id = id[3..];
         if (id.Length == 0 || id.Contains("...", StringComparison.Ordinal) || IsUnrealObjectIdentity(id))
             id = loginName;
-        if (id.All(char.IsDigit) && id.Length is >= 15 and <= 20)
+        // ASCII digits only: char.IsDigit also takes other scripts' digits, which no Steam ID has.
+        if (id.All(char.IsAsciiDigit) && id.Length is >= 15 and <= 20)
             return "steam_" + id;
         return Regex.Replace(id.Trim(), @"[^\w\-]", "_");
     }

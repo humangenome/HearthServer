@@ -41,7 +41,7 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
             GamePidFile = "",
         };
         var o = Options.Create(opts);
-        var pipe = new PipeServerState(NullLogger<PipeServerState>.Instance);
+        var pipe = new ServerState(NullLogger<ServerState>.Instance);
         var saves = new SaveOrchestratorService(
             NullLogger<SaveOrchestratorService>.Instance, o, pipe,
             new HearthRestartCoordinator(NullLogger<HearthRestartCoordinator>.Instance, o),
@@ -50,7 +50,6 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
             NullLogger<HearthHttpService>.Instance, o,
             new ConfigurationBuilder().Build(),
             saves, pipe, new InstanceIdentityProvider(o),
-            new ChatService(NullLogger<ChatService>.Instance, new StaticMonitor(opts)),
             new AdminJoinTicketService(o, NullLogger<AdminJoinTicketService>.Instance));
         _cts = new CancellationTokenSource();
         await _service.StartAsync(_cts.Token);
@@ -170,11 +169,13 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
     [Fact]
     public async Task SmallSignedCallWithoutDeclaredHashStillWorks()
     {
-        // What an app from before the declared-hash header sends.
-        var body = Encoding.UTF8.GetBytes("{\"msg\":\"server restarts in 10 minutes\"}");
-        using var resp = await _http.SendAsync(Signed(HttpMethod.Post, "/api/v1/chat/say", body, declareHash: false));
+        // What an app from before the declared-hash header sends: a small signed body, read and
+        // parsed (the reply says the Steam id is not an admin here, so the body got through).
+        var body = Encoding.UTF8.GetBytes("{\"steam_id\":\"76561197960265729\"}");
+        using var resp = await _http.SendAsync(Signed(HttpMethod.Post, "/api/v1/admin/join-ticket", body, declareHash: false));
 
-        resp.StatusCode.Should().Be(HttpStatusCode.OK);
+        resp.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        (await resp.Content.ReadAsStringAsync()).Should().Contain("not a configured admin");
     }
 
     [Fact]
@@ -192,16 +193,21 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ChatHistoryAndMotdNeedASignature()
+    public async Task ChatRoutesAreGone()
     {
+        // say, announce and motd reached no player (removed in v0.1.100); their HTTP routes went too.
+        var body = Encoding.UTF8.GetBytes("{\"msg\":\"hi\"}");
         using var unsignedRecent = await _http.GetAsync(Url("/api/v1/chat/recent"));
-        using var unsignedMotd = await _http.GetAsync(Url("/api/v1/chat/motd"));
         using var signedRecent = await _http.SendAsync(Signed(HttpMethod.Get, "/api/v1/chat/recent", Array.Empty<byte>(), false));
+        using var signedMotd = await _http.SendAsync(Signed(HttpMethod.Get, "/api/v1/chat/motd", Array.Empty<byte>(), false));
+        using var signedSay = await _http.SendAsync(Signed(HttpMethod.Post, "/api/v1/chat/say", body, false));
+        using var signedSetMotd = await _http.SendAsync(Signed(HttpMethod.Post, "/api/v1/chat/motd", body, false));
 
         unsignedRecent.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
-        unsignedMotd.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
-        signedRecent.StatusCode.Should().Be(HttpStatusCode.OK);
-        (await signedRecent.Content.ReadAsStringAsync()).Should().Contain("\"messages\"");
+        signedRecent.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        signedMotd.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        signedSay.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        signedSetMotd.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
     [Fact]
@@ -216,13 +222,61 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task PrivateMapStateNeedsASignature()
+    public async Task HealthComesFromTheGameProcessOnly()
     {
-        using var unsigned = await _http.GetAsync(Url("/api/v1/map/state"));
-        using var signed = await _http.SendAsync(Signed(HttpMethod.Get, "/api/v1/map/state", Array.Empty<byte>(), false));
+        // No pid file here, so no game process: 503 and ok=false. The plugin pipe fields are gone
+        // (nothing ever connected to the pipe; removed in v0.1.100).
+        using var resp = await _http.GetAsync(Url("/api/v1/health"));
+        var body = await resp.Content.ReadAsStringAsync();
 
-        unsigned.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
-        signed.StatusCode.Should().Be(HttpStatusCode.OK);
+        resp.StatusCode.Should().Be(HttpStatusCode.ServiceUnavailable);
+        body.Should().Contain("\"ok\":false");
+        body.Should().NotContain("plugin_connected");
+        body.Should().NotContain("last_heartbeat_age_seconds");
+    }
+
+    [Fact]
+    public void ServerQueryClaimsAPasswordOnlyForTheJoinPassword()
+    {
+        // The pipe plane's keys (ServerPassword, PipeName, PluginHeartbeatTimeoutSeconds) are gone; an old
+        // appsettings.json that still carries them binds to nothing and never sets "password required".
+        // Only the join password (or its legacy name HearthAuthPassword) does.
+        HearthServerOptions Bind(Dictionary<string, string?> values)
+        {
+            var bound = new HearthServerOptions();
+            new ConfigurationBuilder().AddInMemoryCollection(values).Build().GetSection("Hearth").Bind(bound);
+            return bound;
+        }
+        SourceQueryHostedService Query(HearthServerOptions o) => new(
+            NullLogger<SourceQueryHostedService>.Instance, Options.Create(o),
+            new ServerState(NullLogger<ServerState>.Instance));
+
+        var old = Query(Bind(new()
+        {
+            ["Hearth:ServerPassword"] = "native",
+            ["Hearth:PipeName"] = "hearth-old",
+            ["Hearth:PluginHeartbeatTimeoutSeconds"] = "60",
+            ["Hearth:ServerName"] = "Lab",
+        }));
+        old.BuildInfo().PasswordRequired.Should().BeFalse();
+        old.BuildInfo().Name.Should().Be("Lab");
+
+        Query(Bind(new() { ["Hearth:JoinPassword"] = "x" })).BuildInfo().PasswordRequired.Should().BeTrue();
+        Query(Bind(new() { ["Hearth:HearthAuthPassword"] = "x" })).BuildInfo().PasswordRequired.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task MapRoutesAreGone()
+    {
+        // The server's own web map had no position source (removed in v0.1.100); the panel's
+        // World Map does not use it. /map/ is no longer listened on at all (not probed here: what
+        // an unregistered prefix answers is the HTTP stack's business, and on Linux the managed
+        // listener's answer to it unsettled the next request on the same connection in CI).
+        using var unsignedState = await _http.GetAsync(Url("/api/v1/map/state"));
+        using var signedState = await _http.SendAsync(Signed(HttpMethod.Get, "/api/v1/map/state", Array.Empty<byte>(), false));
+
+        unsignedState.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        signedState.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
     [Fact]
@@ -237,7 +291,7 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
             {
                 var c = new TcpClient();
                 await c.ConnectAsync(IPAddress.Loopback, _port);
-                var head = $"POST /api/v1/chat/say HTTP/1.1\r\nHost: 127.0.0.1:{_port}\r\nContent-Length: 1000\r\n" +
+                var head = $"POST /api/v1/admin/join-ticket HTTP/1.1\r\nHost: 127.0.0.1:{_port}\r\nContent-Length: 1000\r\n" +
                            $"X-Hearth-Timestamp: {Now()}\r\nX-Hearth-Signature: {new string('c', 64)}\r\n\r\n";
                 await c.GetStream().WriteAsync(Encoding.ASCII.GetBytes(head));
                 held.Add(c);
@@ -254,22 +308,19 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData("GET", "/api/v1/health", true, false, true)]
-    [InlineData("GET", "/api/v1/players", true, false, true)]
-    [InlineData("GET", "/api/v1/manifest", true, false, true)]
-    [InlineData("GET", "/map/", true, false, true)]
-    [InlineData("GET", "/api/v1/map/state", true, false, false)]
-    [InlineData("GET", "/api/v1/map/state", true, true, true)]
-    [InlineData("GET", "/api/v1/map/state", false, false, true)]
-    [InlineData("GET", "/api/v1/chat/recent", true, false, false)]
-    [InlineData("GET", "/api/v1/chat/motd", true, false, false)]
-    [InlineData("POST", "/api/v1/chat/player", true, false, false)]
-    [InlineData("POST", "/api/v1/health", true, false, false)]
-    [InlineData("GET", "/api/v1/snapshots", true, false, false)]
-    public void PublicPoolHoldsOnlyTheUnsignedReads(string method, string path, bool mapEnabled, bool mapPublic, bool expected)
+    [InlineData("GET", "/api/v1/health", true)]
+    [InlineData("GET", "/api/v1/players", true)]
+    [InlineData("GET", "/api/v1/manifest", true)]
+    [InlineData("GET", "/map/", false)]
+    [InlineData("GET", "/api/v1/map/state", false)]
+    [InlineData("GET", "/api/v1/chat/recent", false)]
+    [InlineData("GET", "/api/v1/chat/motd", false)]
+    [InlineData("POST", "/api/v1/chat/player", false)]
+    [InlineData("POST", "/api/v1/health", false)]
+    [InlineData("GET", "/api/v1/snapshots", false)]
+    public void PublicPoolHoldsOnlyTheUnsignedReads(string method, string path, bool expected)
     {
-        HearthHttpService.IsPublicRequest(method, path, new MapOptions { Enabled = mapEnabled, Public = mapPublic })
-            .Should().Be(expected);
+        HearthHttpService.IsPublicRequest(method, path).Should().Be(expected);
     }
 
     // ---- helpers ----
@@ -340,13 +391,5 @@ public sealed class HearthHttpServiceAuthTests : IAsyncLifetime
         var port = ((IPEndPoint)l.LocalEndpoint).Port;
         l.Stop();
         return port;
-    }
-
-    private sealed class StaticMonitor : IOptionsMonitor<HearthServerOptions>
-    {
-        public StaticMonitor(HearthServerOptions value) => CurrentValue = value;
-        public HearthServerOptions CurrentValue { get; }
-        public HearthServerOptions Get(string? name) => CurrentValue;
-        public IDisposable? OnChange(Action<HearthServerOptions, string?> listener) => null;
     }
 }

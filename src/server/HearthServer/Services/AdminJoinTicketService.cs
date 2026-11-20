@@ -18,9 +18,6 @@ public sealed class AdminJoinTicketService
 {
     private const int TicketLifetimeSeconds = 180;
     private const int MaxOutstandingTickets = 64;
-    private static readonly Regex Steam64Regex = new(
-        @"^7656119[0-9]{10}$",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex TicketRegex = new(
         @"^[0-9a-f]{64}$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -38,7 +35,7 @@ public sealed class AdminJoinTicketService
         _log = log;
         var opts = options.Value;
         _allowedSteamIds = (opts.AdminSteamIds ?? [])
-            .Where(IsValidSteam64)
+            .Where(SteamId64.IsValid)
             .ToHashSet(StringComparer.Ordinal);
         _path = ResolvePath(opts.AdminJoinTicketPath);
 
@@ -54,7 +51,7 @@ public sealed class AdminJoinTicketService
     {
         var normalizedSteamId = (steamId ?? "").Trim();
         var normalizedAddress = NormalizeAddress(remoteAddress);
-        if (!IsValidSteam64(normalizedSteamId)
+        if (!SteamId64.IsValid(normalizedSteamId)
             || !_allowedSteamIds.Contains(normalizedSteamId)
             || normalizedAddress is null)
         {
@@ -94,7 +91,7 @@ public sealed class AdminJoinTicketService
         var normalizedSteamId = (steamId ?? "").Trim();
         var normalizedAddress = NormalizePeerAddress(remoteAddress);
         if (!TicketRegex.IsMatch(normalizedToken)
-            || !IsValidSteam64(normalizedSteamId)
+            || !SteamId64.IsValid(normalizedSteamId)
             || normalizedAddress is null)
         {
             return false;
@@ -128,9 +125,6 @@ public sealed class AdminJoinTicketService
             return true;
         }
     }
-
-    public static bool IsValidSteam64(string? value) =>
-        value is not null && Steam64Regex.IsMatch(value);
 
     internal string RegistryPath => _path;
 

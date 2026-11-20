@@ -16,7 +16,6 @@ namespace HearthServer.Services;
 /// </summary>
 public sealed class IdentityTokenService
 {
-    private static readonly Regex Steam64Regex = new(@"^7656119[0-9]{10}$", RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex ComputerIdRegex = new(
         @"^[A-Za-z0-9_.\-]{1,64}-[0-9A-Fa-f]{32}$", RegexOptions.CultureInvariant | RegexOptions.Compiled);
     internal const int MaxLifetimeSeconds = 600;
@@ -57,7 +56,6 @@ public sealed class IdentityTokenService
     /// <summary>The identity folder (token.key, steam-map.tsv), absolute.</summary>
     public string Folder { get; }
 
-    public static bool IsValidSteam64([NotNullWhen(true)] string? s) => s is not null && Steam64Regex.IsMatch(s);
     public static bool IsComputerId([NotNullWhen(true)] string? s) => s is not null && ComputerIdRegex.IsMatch(s);
 
     internal static string ResolveFolder(string configured)
@@ -68,7 +66,7 @@ public sealed class IdentityTokenService
 
     public (string Token, long ExpiresUnix) Issue(string steam64, long? nowUnix = null)
     {
-        if (!IsValidSteam64(steam64)) throw new ArgumentException("not a Steam64 id", nameof(steam64));
+        if (!SteamId64.IsValid(steam64)) throw new ArgumentException("not a Steam64 id", nameof(steam64));
         var now = nowUnix ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var expires = now + _lifetime;
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
@@ -88,7 +86,7 @@ public sealed class IdentityTokenService
     /// </summary>
     public bool Verify(string? token, string? steam64, long? nowUnix = null)
     {
-        if (string.IsNullOrEmpty(token) || token.Length > 512 || !IsValidSteam64(steam64)) return false;
+        if (string.IsNullOrEmpty(token) || token.Length > 512 || !SteamId64.IsValid(steam64)) return false;
         var dot = token.IndexOf('.');
         if (dot <= 0) return false;
         byte[] payload, mac;

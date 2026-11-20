@@ -26,16 +26,48 @@
 -- start-up crash and kept on purpose). The main chunk may register exactly one game-thread loop
 -- (the pump) and it must be its last UE4SS call, so nothing of the mod runs on the game thread while
 -- the start-up thread still touches the Lua registry.
-local files = {}
-for i = 1, #arg do files[#files + 1] = arg[i] end
-if #files == 0 then
+--
+-- 2026-11-13 (bw_host v0.18.66): a local set from an immediately called function's results
+-- (local a, b = (function() ... return f, g end)()) is bound to the functions it returns. Before, the gate
+-- never followed such a name, so the whole Travel Sign service (built that way) was invisible to it: a
+-- banned call planted there passed, and the service's own GetOwner and lookups ran on the background
+-- loop unseen. And the functions in NO_OBJECT_ACCESS, plus everything they reach off the game thread, may
+-- not touch a game object at all: no UE4SS lookup or walk, no object method (only Lua string and file methods).
+--
+-- Known debt (2026-10-25): the player mod HearthConnect (HearthHeadBuild left the pack in v0.1.101) and the hosting panel's
+-- live-map probe (bw_map, kept outside this repository) still use the old pattern. Their problems are
+-- listed in tests/thread-safety-baseline.txt and checked as a ratchet: a problem not in the list fails,
+-- and a listed problem that no longer happens fails too, so the list only ever shrinks (the player
+-- mods move onto one game-thread loop next, then the probe). Problems are compared without line
+-- numbers. The host mods have no baseline: any problem there fails.
+--   lua5.4 tests/host-thread-safety.test.lua                  host mods strict + player mods (ratchet)
+--   lua5.4 tests/host-thread-safety.test.lua f.lua ...        these files strict
+--   lua5.4 tests/host-thread-safety.test.lua --baseline B --as NAME f.lua
+--                                                             f.lua against B's entries for NAME
+-- The player mods, the probe and the baseline list are not in the public HearthServer copy;
+-- missing default player-mod files are skipped there.
+local files, baselinePath, asName = {}, nil, nil
+local defaultRun = true
+do
+    local i = 1
+    while i <= #arg do
+        if arg[i] == "--baseline" then baselinePath = arg[i + 1]; i = i + 2
+        elseif arg[i] == "--as" then asName = arg[i + 1]; i = i + 2
+        else files[#files + 1] = { path = arg[i] }; defaultRun = false; i = i + 1 end
+    end
+end
+if defaultRun then
     files = {
-        "dist/ue4ss-server/Mods/bw_host/Scripts/main.lua",
-        "dist/ue4ss-server/Mods/bw_fog/Scripts/main.lua",
-        "dist/ue4ss-server/Mods/bw_seat4/Scripts/main.lua",
-        "dist/ue4ss-server/Mods/bw_pause/Scripts/main.lua",
-        "dist/ue4ss-server/Mods/bw_ident/Scripts/main.lua",
+        { path = "dist/ue4ss-server/Mods/bw_host/Scripts/main.lua" },
+        { path = "dist/ue4ss-server/Mods/bw_fog/Scripts/main.lua" },
+        { path = "dist/ue4ss-server/Mods/bw_seat4/Scripts/main.lua" },
+        { path = "dist/ue4ss-server/Mods/bw_pause/Scripts/main.lua" },
+        { path = "dist/ue4ss-server/Mods/bw_ident/Scripts/main.lua" },
+        { path = "dist/ue4ss-client/Mods/HearthConnect/Scripts/main.lua", ratchet = true, optional = true },
     }
+    baselinePath = baselinePath or "tests/thread-safety-baseline.txt"
+elseif baselinePath then
+    for _, f in ipairs(files) do f.ratchet = true; f.name = asName end
 end
 
 local BACKGROUND_SCHEDULERS = { LoopAsync = true, ExecuteAsync = true, ExecuteWithDelay = true }
@@ -76,6 +108,12 @@ for name in ([[IsValid IsValidField GetFName GetFullName GetClass GetOuter GetSu
     find match gsub sub lower upper gmatch rep byte format len reverse
     close write read lines seek flush setvbuf]]):gmatch("%S+") do ALLOWED_METHODS[name] = true end
 local WRITE_HELPERS = { writeOptionalField = true, setOptionalField = true, setNetField = true, set_prop = true }
+-- background functions that must not touch a game object at all, nor may anything they reach off the game
+-- thread (2026-11-13: the Travel Sign service's background half only decides when a game-thread pass is due)
+local NO_OBJECT_ACCESS = { serviceTravelSignDiscoveryImpl = true, serviceTravelSignDiscovery = true }
+local LUA_METHODS = {}
+for name in ([[find match gsub sub lower upper gmatch rep byte format len reverse
+    close write read lines seek flush setvbuf]]):gmatch("%S+") do LUA_METHODS[name] = true end
 -- helpers that call a game function through a field lookup (fn(obj, ...)), which the SELF check cannot see
 local CALL_HELPERS = { callMethod = true }
 -- the fast pin (kept on purpose, see header) and nothing else may write from background code
@@ -103,7 +141,8 @@ local function parse(text)
         elseif line:match("^locals %(") then section = "locals"
         elseif line:match("^upvalues %(") then section = "upvals"
         elseif cur and section == "code" then
-            local pc, ln, op, args = line:match("^%s+(%d+)%s+%[(%d+)%]%s+(%u+)%s*(.*)$")
+            -- opcode names can end in a digit (RETURN0, RETURN1): read them whole
+            local pc, ln, op, args = line:match("^%s+(%d+)%s+%[(%d+)%]%s+(%u[%u%d]*)%s*(.*)$")
             if pc then
                 local regs, comment = args:match("^(.-)%s*;%s*(.*)$")
                 if not regs then regs, comment = args, "" end
@@ -183,6 +222,9 @@ local function analyze(path)
     local banned = {}        -- proto -> { {name, line}, ... }
     local methods = {}       -- proto -> { {name, line}, ... }
     local mainApi = {}       -- ordered UE4SS references in the main chunk { name, pc, line }
+    local readsBy = {}       -- proto -> { {name, line}, ... } UE4SS lookups/walks referenced
+    local results = {}       -- locals set from an immediately called function's results { scope, name, closure, pos }
+    local returns = {}       -- proto -> { {pos, name, scope, closure}, ... } what each RETURN hands back
     local function bind(k, child) bindings[k] = bindings[k] or {}; table.insert(bindings[k], child) end
     local function push(t, p, v) t[p] = t[p] or {}; table.insert(t[p], v) end
 
@@ -202,6 +244,7 @@ local function analyze(path)
                 if GAME_SCHEDULERS[field] or BACKGROUND_SCHEDULERS[field] or UE4SS_READS[field] then
                     if p.main then mainApi[#mainApi + 1] = { name = field, pc = pc, line = ins.line } end
                 end
+                if UE4SS_READS[field] and field ~= "print" then push(readsBy, p, { field, ins.line }) end
                 if GAME_SCHEDULERS[field] and field ~= "executeInGameThreadSafe" and field ~= "gtQueue" then
                     push(banned, p, { field, ins.line })
                 end
@@ -278,6 +321,12 @@ local function analyze(path)
                 local nm = p.upvals[B + 1]
                 local src = reg[A] or {}
                 if nm and src.closure then bind(key(scopeOf(p, nm, false), nm), src.closure) end
+            elseif (op == "RETURN" and A and B and B > 1) or (op == "RETURN1" and A) then
+                for i = 1, (op == "RETURN1") and 1 or (B - 1) do
+                    local nm, scope = nameOfReg(A + i - 1, pc)
+                    local v = reg[A + i - 1] or {}
+                    push(returns, p, { pos = i, name = nm, scope = scope or p, closure = v.closure })
+                end
             elseif WRITES_A[op] then
                 -- a value the gate does not follow (a number, a computed value, an array slot): the register
                 -- no longer holds the name or function it held before, so a later store or call through it
@@ -299,6 +348,13 @@ local function analyze(path)
                 local isGame = cname and GAME_SCHEDULERS[cname]
                 local isBg = cname and BACKGROUND_SCHEDULERS[cname]
                 if callee.closure then push(inline, p, callee.closure) end
+                -- local a, b = (function() ... return f, g end)(): remember which locals take which result
+                if callee.closure and C and C > 1 then
+                    for i = 1, C - 1 do
+                        local ln = startsLocal(p, A + i - 1, pc)
+                        if ln then results[#results + 1] = { scope = p, name = ln, closure = callee.closure, pos = i } end
+                    end
+                end
                 if callee.name and not callee.global then push(refs, p, key(callee.scope, callee.name)) end
                 if callee.global then push(refs, p, key("G", callee.global)) end
                 for r = A + 1, A + nargs do
@@ -337,6 +393,17 @@ local function analyze(path)
         end
     end
 
+    -- bind the locals taken from an immediately called function's results to what it returns
+    for _, r in ipairs(results) do
+        for _, ret in ipairs(returns[r.closure] or {}) do
+            if ret.pos == r.pos then
+                if ret.closure then bind(key(r.scope, r.name), ret.closure) end
+                if ret.name then
+                    for _, q in ipairs(bindings[key(ret.scope, ret.name)] or {}) do bind(key(r.scope, r.name), q) end
+                end
+            end
+        end
+    end
     -- resolve keys to protos
     local function protosOf(k)
         if type(k) == "table" then return { k } end
@@ -410,6 +477,38 @@ local function analyze(path)
             end
         end
     end
+    -- NO_OBJECT_ACCESS: these background functions, and all they reach off the game thread, touch no game object
+    -- a function can be bound to several names (serviceTravelSignDiscoveryImpl inside, serviceTravelSignDiscovery
+    -- outside); any one of them on the list counts, whichever name the messages use
+    local strictName = {}
+    for k, list in pairs(bindings) do
+        local last = k:match("|(.*)$"):match("([%w_]+)$")
+        if last and NO_OBJECT_ACCESS[last] then for _, q in ipairs(list) do strictName[q] = last end end
+    end
+    for q in pairs(reach) do
+        local nm = strictName[q]
+        if nm then
+            local seen, todo = { [q] = true }, { q }
+            local j = 1
+            while j <= #todo do
+                local x = todo[j]; j = j + 1
+                for _, rd in ipairs(readsBy[x] or {}) do
+                    problems[#problems + 1] = string.format("line %d: %s must not touch a game object off the game thread, but %s calls %s", rd[2], nm, where(x), rd[1])
+                end
+                for _, m in ipairs(methods[x] or {}) do
+                    if not LUA_METHODS[m[1]] then
+                        problems[#problems + 1] = string.format("line %d: %s must not touch a game object off the game thread, but %s calls :%s()", m[2], nm, where(x), m[1])
+                    end
+                end
+                local nexts = {}
+                for _, c in ipairs(inline[x] or {}) do nexts[#nexts + 1] = c end
+                for _, k in ipairs(refs[x] or {}) do for _, t in ipairs(protosOf(k)) do nexts[#nexts + 1] = t end end
+                for _, c in ipairs(nexts) do
+                    if not seen[c] then seen[c] = true; todo[#todo + 1] = c end
+                end
+            end
+        end
+    end
     -- the main chunk: only background schedulers and exactly one pump, registered last
     local pumps, lastApi, pumpAt = 0, nil, nil
     for _, api in ipairs(mainApi) do
@@ -430,19 +529,87 @@ local function analyze(path)
     return problems, reachCount, #order
 end
 
+-- a problem without its line numbers, so the baseline survives edits elsewhere in the file
+local function normalize(p)
+    return (p:gsub("^line %d+: ", ""):gsub("%(lines %d+%-%d+%)", "(lines)"):gsub("fn@%d+", "fn"))
+end
+
+-- baseline: "<name>\t<count>\t<normalized problem>" per line; # comments
+local baseline = {}
+if baselinePath then
+    local fh = io.open(baselinePath, "r")
+    if fh then
+        for line in fh:lines() do
+            local name, n, prob = line:match("^([^#\t][^\t]*)\t(%d+)\t(.+)$")
+            if name then
+                baseline[name] = baseline[name] or {}
+                baseline[name][prob] = (baseline[name][prob] or 0) + tonumber(n)
+            end
+        end
+        fh:close()
+    end
+end
+
 local failed = 0
-for _, path in ipairs(files) do
-    local problems, reachable, total = analyze(path)
-    local unique, seen = {}, {}
-    for _, p in ipairs(problems) do if not seen[p] then seen[p] = true; unique[#unique + 1] = p end end
-    problems = unique
-    table.sort(problems)
-    if #problems > 0 then
-        failed = failed + 1
-        io.stderr:write(("FAIL %s: %d problem(s)\n"):format(path, #problems))
-        for _, p in ipairs(problems) do io.stderr:write("  " .. p .. "\n") end
+for _, f in ipairs(files) do
+    local path = f.path
+    local exists = io.open(path, "r")
+    if exists then exists:close() end
+    if not exists and f.optional then
+        print(("skip - %s: not in this repository"):format(path))
     else
-        print(("ok - %s: %d of %d functions reachable from background code, no game-thread/hook API, no game function, no property write outside the fast pin; one pump registered last"):format(path, reachable, total))
+        local problems, reachable, total = analyze(path)
+        local unique, seen = {}, {}
+        for _, p in ipairs(problems) do if not seen[p] then seen[p] = true; unique[#unique + 1] = p end end
+        problems = unique
+        table.sort(problems)
+        if f.ratchet then
+            local name = f.name or path
+            local want = baseline[name] or {}
+            local got = {}
+            for _, p in ipairs(problems) do local k = normalize(p); got[k] = (got[k] or 0) + 1 end
+            local new, gone, known = {}, {}, 0
+            for _, p in ipairs(problems) do
+                local k = normalize(p)
+                if (want[k] or 0) < got[k] then new[#new + 1] = p end
+            end
+            for k, n in pairs(want) do
+                if (got[k] or 0) < n then gone[#gone + 1] = k end
+                known = known + math.min(n, got[k] or 0)
+            end
+            table.sort(gone)
+            if #new > 0 or #gone > 0 then
+                failed = failed + 1
+                io.stderr:write(("FAIL %s: %d new problem(s), %d baseline entr(y/ies) no longer seen (%s)\n"):format(path, #new, #gone, baselinePath or "no baseline"))
+                for _, p in ipairs(new) do io.stderr:write("  new: " .. p .. "\n") end
+                for _, k in ipairs(gone) do io.stderr:write("  fixed, remove from the baseline: " .. k .. "\n") end
+            else
+                print(("ok (known debt) - %s: %d known problem(s) from %s, none new; %d of %d functions reachable from background code"):format(path, known, baselinePath, reachable, total))
+            end
+        elseif #problems > 0 then
+            failed = failed + 1
+            io.stderr:write(("FAIL %s: %d problem(s)\n"):format(path, #problems))
+            for _, p in ipairs(problems) do io.stderr:write("  " .. p .. "\n") end
+        else
+            print(("ok - %s: %d of %d functions reachable from background code, no game-thread/hook API, no game function, no property write outside the fast pin; one pump registered last"):format(path, reachable, total))
+        end
+    end
+end
+-- write the current problems of every ratcheted file as baseline lines (to start or refresh a baseline by hand)
+if os.getenv("THREAD_SAFETY_PRINT_BASELINE") == "1" then
+    for _, f in ipairs(files) do
+        if f.ratchet and io.open(f.path, "r") then
+            local problems, dedup, seen = analyze(f.path), {}, {}
+            for _, p in ipairs(problems) do if not seen[p] then seen[p] = true; dedup[#dedup + 1] = p end end
+            local counts, order = {}, {}
+            for _, p in ipairs(dedup) do
+                local k = normalize(p)
+                if not counts[k] then order[#order + 1] = k end
+                counts[k] = (counts[k] or 0) + 1
+            end
+            table.sort(order)
+            for _, k in ipairs(order) do print((f.name or f.path) .. "\t" .. counts[k] .. "\t" .. k) end
+        end
     end
 end
 os.exit(failed == 0 and 0 or 1)
