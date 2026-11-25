@@ -5,8 +5,9 @@ on:
     tags:
       - 'v*.*.*'
 
+# Read-only by default; only the build job, which creates this repo's release, may write contents.
 permissions:
-  contents: write
+  contents: read
 
 env:
   # The host-side UE4SS core is vendored at vendor/ue4ss/server/UE4SS.dll and
@@ -95,6 +96,8 @@ jobs:
   build:
     name: Build HearthServer (windows-latest)
     runs-on: windows-latest
+    permissions:
+      contents: write
     needs: guard
     timeout-minutes: 20
     # As in the first job: the tag reaches the shell only through this variable.
@@ -124,7 +127,9 @@ jobs:
           global-json-file: global.json
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
+        with:
+          toolchain: stable
 
       - name: Restore NuGet
         run: dotnet restore HearthServer.sln
@@ -243,7 +248,7 @@ jobs:
           name: release-body
 
       - name: Create GitHub release (HearthServer)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: HearthServer ${{ github.ref_name }}
           files: |
@@ -252,6 +257,7 @@ jobs:
           body_path: release-body.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          # Author as HumanGenome rather than github-actions[bot] when the PAT
-          # is available; falls back to the default token otherwise.
-          token: ${{ secrets.HUMANGENOME_PAT || secrets.GITHUB_TOKEN }}
+          # The release is created in this repo, so the workflow's own token is enough
+          # (this job has permissions: contents: write). No account token on this step
+          # (Security 2026-11-25), so the release page names github-actions[bot] as author.
+          token: ${{ secrets.GITHUB_TOKEN }}
