@@ -261,3 +261,16 @@ jobs:
           # (this job has permissions: contents: write). No account token on this step
           # (Security 2026-11-25), so the release page names github-actions[bot] as author.
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Last job: scan the release this run just published. It is created with the
+  # workflow's own token, which starts no other workflow, so the release-event
+  # scan would not run for it; the daily scan in artifact-scan.yml stays as well
+  # (Security 2026-11-25). Read-only and given no secrets.
+  scan:
+    name: Scan the published release
+    needs: [build]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/artifact-scan.yml
+    with:
+      tag: ${{ github.ref_name }}
