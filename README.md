@@ -96,7 +96,7 @@ src/server/HearthServer              the supervisor (entry point)
 src/server/Hearth.SourceQuery        A2S responder
 src/server/Hearth.Rcon               Source RCON server
 src/server/Hearth.Persistence        SQLite store (snapshot list, audit log)
-src/shared/Hearth.Protocol           wire types shared with the player app
+src/shared/Hearth.Protocol           the player list and version types the server reports
 src/shared/Hearth.Abstractions       shared interfaces
 src/native/Hearth.GameplaySettings   server-side gameplay settings (C++)
 src/native/Hearth.FogReveal          map exploration on a host with no screen (C++)
