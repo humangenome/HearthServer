@@ -28,7 +28,7 @@ This repo is the whole server side. The player app is closed source.
 - Server console (RCON): status, the player list, a save on request and world backups. Backups download and restore through the admin API
 - Shows up in server lists: monitoring tools and Discord bots see the name, map and player count
 - Keeps a list of world backups and a log of every backup and restore, across restarts
-- Crash restarts: starts Bellwright again if it crashes. `-Stop` and `-Restart` save the world first
+- Crash restarts: starts Bellwright again if it crashes. `-Stop` and `-Restart` ask the game to save first
 
 ## What it does not do
 
@@ -71,7 +71,7 @@ Open the two UDP ports on the host firewall and forward them if the server sits 
    The first boot takes a minute or two. The script logs to `Logs\host.log` and prints `Bellwright host UP` once the gameplay port is bound.
 5. **Give players the address** as `ip:port`. They add it in the Hearth app and press **Connect**.
 
-`.\host-instance.ps1 -Stop` saves the world, then stops everything. `-Restart` does the same for the game alone. Gameplay settings live in `HearthServer\data\gameplay-settings.cfg`: a template is written on the first start, and `managed=1` makes the server use it. To keep the world running with nobody online, set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json`. Console commands, worlds, backups and admin details are in [docs/ADMIN.md](docs/ADMIN.md).
+`.\host-instance.ps1 -Stop` asks the game to save, then stops everything, even if the game doesn't confirm the save. `-Restart` does the same for the game alone. Gameplay settings live in `HearthServer\data\gameplay-settings.cfg`: a template is written on the first start, and `managed=1` makes the server use it. To keep the world running with nobody online, set `"PauseWhenEmpty": false` in `HearthServer\appsettings.json`. Console commands, worlds, backups and admin details are in [docs/ADMIN.md](docs/ADMIN.md).
 
 Several servers on one machine: give each its own package folder and gameplay port (7777, 7877, 7977 and so on) and pass `-CoresPerInstance 2` so each one runs on its own cores.
 
