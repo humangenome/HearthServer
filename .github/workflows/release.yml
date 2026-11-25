@@ -25,12 +25,29 @@ jobs:
     name: Guard release preconditions
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The tag reaches the shell only through this variable, always quoted. Git
+    # allows $, ( ), ;, & and backticks in a tag name, so the tag is never
+    # written into a script line.
+    env:
+      TAG: ${{ github.ref_name }}
     steps:
+      # First step, before anything else runs: refuse any tag that is not a
+      # release version. Every tag this repo has published is v and three numbers.
+      - name: Check tag
+        shell: bash
+        run: |
+          pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ ! "${TAG}" =~ ${pattern} ]]; then
+            echo "::error::refusing this tag: a release tag here is v and three numbers, like v1.2.3"
+            exit 1
+          fi
+          echo "tag ${TAG} is a release version"
+
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Check the tag matches the version stamp
-        run: bash scripts/check-version-stamp.sh "${{ github.ref_name }}"
+        run: bash scripts/check-version-stamp.sh "${TAG}"
 
       - name: Licence-notice check (its own tests)
         run: python3 scripts/test-verify-release-notices.py
@@ -39,7 +56,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
+          tag="${TAG}"
           version="${tag#v}"
           # Fail rather than publish the old "See CHANGELOG.md for details."
           # placeholder. check-version-stamp.sh already requires the section;
@@ -80,8 +97,22 @@ jobs:
     runs-on: windows-latest
     needs: guard
     timeout-minutes: 20
+    # As in the first job: the tag reaches the shell only through this variable.
+    env:
+      TAG: ${{ github.ref_name }}
 
     steps:
+      # First step of this job too, so it never relies on the other job's check.
+      - name: Check tag
+        shell: bash
+        run: |
+          pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [[ ! "${TAG}" =~ ${pattern} ]]; then
+            echo "::error::refusing this tag: a release tag here is v and three numbers, like v1.2.3"
+            exit 1
+          fi
+          echo "tag ${TAG} is a release version"
+
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -117,7 +148,7 @@ jobs:
       - name: Verify the published binary reports the tag version
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = $env:TAG.TrimStart('v')
           $publish = "src/server/HearthServer/bin/Release/net10.0/win-x64/publish"
           $exe = [Diagnostics.FileVersionInfo]::GetVersionInfo("$publish/HearthServer.exe")
           if ($exe.FileVersion -ne "$version.0" -or -not $exe.ProductVersion.StartsWith($version)) {
@@ -133,7 +164,7 @@ jobs:
       - name: Stage release artifact
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:TAG
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           $publish = "src/server/HearthServer/bin/Release/net10.0/win-x64/publish"
           if (-not (Test-Path "$publish/HearthServer.exe")) { throw "server publish missing at $publish" }
