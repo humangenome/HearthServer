@@ -87,7 +87,9 @@ public sealed class RconHostedService : IHostedService
             // writer is atomic (writes to temp then renames). The FileSystemWatcher in
             // SaveOrchestratorService handles auto-snapshots; this RCON path is
             // for admin-triggered.
-            var rec = await _saves.SnapshotAsync("rcon").ConfigureAwait(false);
+            var noRoom = false;
+            var rec = await _saves.SnapshotAsync("rcon", noRoom: () => noRoom = true).ConfigureAwait(false);
+            if (noRoom) return SaveOrchestratorService.BackupNoRoomWords;
             return rec is null
                 ? "snapshot failed (check hearth log; save dir likely missing)"
                 : $"snapshot ok: {rec.SnapshotId} ({rec.SizeBytes} bytes, sha={rec.Sha256Hex[..16]})";
@@ -105,7 +107,9 @@ public sealed class RconHostedService : IHostedService
         {
             var snapshotId = arg["restore ".Length..].Trim();
             if (string.IsNullOrEmpty(snapshotId)) return "usage: save restore <id>";
-            var restored = await _saves.RestoreSnapshotAsync(snapshotId, "rcon").ConfigureAwait(false);
+            var noRoom = false;
+            var restored = await _saves.RestoreSnapshotAsync(snapshotId, "rcon", noRoom: () => noRoom = true).ConfigureAwait(false);
+            if (noRoom) return SaveOrchestratorService.RestoreNoRoomWords;
             return restored
                 ? $"restore ok: {snapshotId}"
                 : $"restore failed: {snapshotId} (not found, missing, or invalid; check hearth log)";

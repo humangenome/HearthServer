@@ -270,6 +270,9 @@ public sealed class HearthHttpService : BackgroundService
 
         _log.LogDebug("HTTP request {Method} {Path} from {Remote}", method, path, remote);
 
+        // A signed route's body on disk. Each route disposes it; the finally below disposes it
+        // again (a no-op then), so a route that throws never leaves the upload in the temp folder.
+        BufferedBody? signedBody = null;
         try
         {
             res.Headers["X-Hearth-Instance"] = _identity.InstanceId;
@@ -360,6 +363,7 @@ public sealed class HearthHttpService : BackgroundService
             // summary); the body, if any, then lands in a temp file and the
             // resulting BufferedBody is passed through to the route handler.
             var auth = await AuthorizeAndReadBodyAsync(ctx, ct).ConfigureAwait(false);
+            signedBody = auth.Body;
             if (auth.Body is null)
             {
                 if (auth.Status == 0) return; // connection already aborted
@@ -470,6 +474,12 @@ public sealed class HearthHttpService : BackgroundService
                 // The body is already on disk as a temp file. Just rename
                 // it into SaveDir under the canonical snapshot name.
                 Directory.CreateDirectory(_opts.SaveDir);
+                if (!_saves.HasRoomForBackup(body.SizeBytes))
+                {
+                    body.Dispose();
+                    await WriteJsonAsync(res, 507, new { error = SaveOrchestratorService.BackupNoRoomWords });
+                    return;
+                }
                 var snapshotId = $"upload-{DateTimeOffset.UtcNow:yyyyMMddTHHmmssZ}-{Guid.NewGuid():N}".Substring(0, 36);
                 var finalPath = Path.Combine(_opts.SaveDir, $"{snapshotId}.zip");
                 File.Move(body.TempPath, finalPath);
@@ -485,8 +495,7 @@ public sealed class HearthHttpService : BackgroundService
                 _saves.Database.RecordSnapshot(record);
                 _saves.Database.Audit("http-api", "snapshot.upload", snapshotId,
                     $"{{\"bytes\":{record.SizeBytes}}}", record.TakenUnix);
-                // Uploads count toward the snapshot room too (MaxSnapshotsKept / MaxSnapshotBytes); this one is
-                // the newest, so it stays.
+                // An upload is the owner's: it is never removed and takes none of the automatic backups' room.
                 _saves.RotateOldSnapshots();
 
                 await WriteJsonAsync(res, 200, new
@@ -506,7 +515,13 @@ public sealed class HearthHttpService : BackgroundService
             {
                 body.Dispose();
                 var id = path["/api/v1/snapshots/".Length..^"/restore".Length];
-                var ok = await _saves.RestoreSnapshotAsync(id, "http-api", ct).ConfigureAwait(false);
+                var noRoom = false;
+                var ok = await _saves.RestoreSnapshotAsync(id, "http-api", ct, () => noRoom = true).ConfigureAwait(false);
+                if (noRoom)
+                {
+                    await WriteJsonAsync(res, 507, new { ok, error = SaveOrchestratorService.RestoreNoRoomWords });
+                    return;
+                }
                 await WriteJsonAsync(res, ok ? 200 : 500, new { ok });
                 return;
             }
@@ -519,9 +534,15 @@ public sealed class HearthHttpService : BackgroundService
                     await WriteJsonAsync(res, 400, new { error = "empty body" });
                     return;
                 }
+                var noRoom = false;
                 var ok = await _saves.RestoreFromZipPathAsync(
-                    body.TempPath, "http-api", "snapshot.import_restore", ct).ConfigureAwait(false);
+                    body.TempPath, "http-api", "snapshot.import_restore", ct, () => noRoom = true).ConfigureAwait(false);
                 body.Dispose();
+                if (noRoom)
+                {
+                    await WriteJsonAsync(res, 507, new { ok, error = SaveOrchestratorService.RestoreNoRoomWords });
+                    return;
+                }
                 await WriteJsonAsync(res, ok ? 200 : 500, new { ok });
                 return;
             }
@@ -534,12 +555,14 @@ public sealed class HearthHttpService : BackgroundService
             _log.LogError(ex, "HTTP {Method} {Path} threw", method, path);
             try
             {
-                await WriteJsonAsync(res, 500, new { error = ex.Message });
+                // Never the exception's text: it can carry a path on this machine.
+                await WriteJsonAsync(res, 500, new { error = "internal error" });
             }
             catch { }
         }
         finally
         {
+            signedBody?.Dispose();
             try { _log.LogDebug("HTTP response {Method} {Path} -> {Status}", method, path, res.StatusCode); }
             catch { }
             try { res.Close(); } catch { }

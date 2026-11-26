@@ -3,6 +3,9 @@
     <RootNamespace>Hearth.SourceQuery</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="HearthServer.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="../../shared/Hearth.Abstractions/Hearth.Abstractions.csproj" />
   </ItemGroup>
 </Project>

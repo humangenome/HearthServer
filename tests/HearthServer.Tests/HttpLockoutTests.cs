@@ -22,7 +22,7 @@ namespace HearthServer.Tests;
 public sealed class HttpLockoutTests : IDisposable
 {
     private const string Password = "lockout-test-secret";
-    private static readonly byte[] Key = SHA256.HashData(Encoding.UTF8.GetBytes(Password));
+    internal static readonly byte[] Key = SHA256.HashData(Encoding.UTF8.GetBytes(Password));
     private static readonly byte[] WrongKey = SHA256.HashData(Encoding.UTF8.GetBytes("not-the-password"));
 
     public HttpLockoutTests() => TestNet.ResetGuard();
@@ -131,7 +131,7 @@ public sealed class HttpLockoutTests : IDisposable
             .Status.Should().Be(200, "four wrong, one right, four wrong is never five in a row");
     }
 
-    private sealed class Harness : IAsyncDisposable
+    internal sealed class Harness : IAsyncDisposable
     {
         private readonly string _root;
         private readonly HearthHttpService _service;
