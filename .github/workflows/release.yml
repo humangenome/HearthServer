@@ -5,7 +5,8 @@ on:
     tags:
       - 'v*.*.*'
 
-# Read-only by default; only the build job, which creates this repo's release, may write contents.
+# Read-only by default; only the build job, which fills this repo's hand-made draft release, may write contents
+# (GitHub shows a draft release only to callers that can write).
 permissions:
   contents: read
 
@@ -45,7 +46,7 @@ jobs:
           echo "tag ${TAG} is a release version"
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Check the tag matches the version stamp
         run: bash scripts/check-version-stamp.sh "${TAG}"
@@ -87,7 +88,7 @@ jobs:
         run: bash scripts/lint-release-notes.sh --profile body release-body.md
 
       - name: Upload the release body
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-body
           path: release-body.md
@@ -117,12 +118,12 @@ jobs:
           echo "tag ${TAG} is a release version"
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup .NET 10
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           global-json-file: global.json
 
@@ -243,34 +244,65 @@ jobs:
           } | Out-File -FilePath artifacts/checksums.txt -Encoding ascii
 
       - name: Download the release body
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-body
 
-      - name: Create GitHub release (HearthServer)
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          name: HearthServer ${{ github.ref_name }}
-          files: |
-            artifacts/*.zip
-            artifacts/checksums.txt
-          body_path: release-body.md
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          # The release is created in this repo, so the workflow's own token is enough
-          # (this job has permissions: contents: write). No account token on this step
-          # (Security 2026-11-25), so the release page names github-actions[bot] as author.
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # The release page is made BY HAND, as a draft, before the tag (Security 2026-11-25), with exactly
+      # the body the guard job builds from CHANGELOG.md. GitHub's look-up of a release by tag answers 404
+      # for a draft, so a release action that looks one up that way makes a second release and publishes
+      # it. gh finds drafts. This step only uploads this run's files into the one draft for the tag: it
+      # never creates, publishes or edits a release and never touches Latest. Read the files back, scan,
+      # then publish by hand.
+      - name: Fill the hand-made draft release (HearthServer)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=()
+          for f in artifacts/*.zip artifacts/checksums.txt; do
+            if [ -f "$f" ]; then files+=("$f"); fi
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::this run built no release files"
+            exit 1
+          fi
+          rels="$(gh api "repos/${REPO}/releases?per_page=100" --paginate \
+            | jq -s --arg t "${TAG}" 'add // [] | map(select(.tag_name == $t))')"
+          n="$(jq 'length' <<<"${rels}")"
+          if [ "${n}" -ne 1 ]; then
+            echo "::error::expected exactly one release for ${TAG} (a draft made by hand first), found ${n}; nothing was uploaded"
+            exit 1
+          fi
+          if [ "$(jq -r '.[0].draft' <<<"${rels}")" != "true" ]; then
+            echo "::error::the release for ${TAG} is already published; this workflow only fills a hand-made draft"
+            exit 1
+          fi
+          jq -r '.[0].body // ""' <<<"${rels}" > draft-body.md
+          same="$(jq -n --rawfile a draft-body.md --rawfile b release-body.md \
+            '($a | ltrimstr("﻿") | gsub("\r"; "") | sub("\\s+$"; "")) == ($b | ltrimstr("﻿") | gsub("\r"; "") | sub("\\s+$"; ""))')"
+          if [ "${same}" != "true" ]; then
+            echo "::error::the draft's text differs from the body built from CHANGELOG.md; fix the draft by hand, nothing was uploaded"
+            exit 1
+          fi
+          names="$(for f in "${files[@]}"; do basename "$f"; done | sort)"
+          others="$(jq -r '.[0].assets[].name' <<<"${rels}" | sort | comm -23 - <(printf '%s\n' "${names}"))"
+          if [ -n "${others}" ]; then
+            echo "::error::the draft already holds files this run does not build: ${others}"
+            exit 1
+          fi
+          id="$(jq -r '.[0].id' <<<"${rels}")"
+          gh release upload "${TAG}" -R "${REPO}" --clobber "${files[@]}"
+          after="$(gh api "repos/${REPO}/releases/${id}")"
+          if [ "$(jq -r '.draft' <<<"${after}")" != "true" ]; then
+            echo "::error::release ${id} is no longer a draft after the upload"
+            exit 1
+          fi
+          jq -r '.assets[] | "\(.name) \(.size)"' <<<"${after}"
+          echo "Draft ${TAG} (release ${id}) holds this run's files."
 
-  # Last job: scan the release this run just published. It is created with the
-  # workflow's own token, which starts no other workflow, so the release-event
-  # scan would not run for it; the daily scan in artifact-scan.yml stays as well
-  # (Security 2026-11-25). Read-only and given no secrets.
-  scan:
-    name: Scan the published release
-    needs: [build]
-    permissions:
-      contents: read
-    uses: ./.github/workflows/artifact-scan.yml
-    with:
-      tag: ${{ github.ref_name }}
+  # No scan job here: this run leaves a draft, which a read-only scan cannot see. The draft is
+  # scanned by hand before it is published; artifact-scan.yml's daily run covers it once published.
