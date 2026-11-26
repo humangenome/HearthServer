@@ -7,6 +7,7 @@ kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 ## [0.1.103] - 2026-11-26
 
 - Server list queries now ask for Valve's standard challenge first, and each address gets a limited number of replies a second.
+- Only automatic backups are removed to make room. They now share up to 512 MB, or less on a nearly full drive, with no limit on how many. Backups you make or upload never count toward it. A new backup is refused if it would leave less than 2 GB free on the drive.
 - World backups you make or upload are no longer deleted after 30 days. Neither are the copies made before a restore, or any backup you already have.
 
 ## [0.1.102] - 2026-11-20
