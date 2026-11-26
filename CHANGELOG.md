@@ -4,6 +4,11 @@ All notable changes to HearthServer are documented here. The version here is
 kept in lockstep with the `HumanGenome/HearthClient` release tag and the
 `Directory.Build.props` `<Version>`.
 
+## [0.1.103] - 2026-11-26
+
+- Server list queries now ask for Valve's standard challenge first, and each address gets a limited number of replies a second.
+- World backups you make or upload are no longer deleted after 30 days. Neither are the copies made before a restore, or any backup you already have.
+
 ## [0.1.102] - 2026-11-20
 
 - A Hearth server now uses far less processor time. With nobody on, Hearth's own work fell from about a third of one CPU core to about 1%, and while the world is paused it is close to zero.
